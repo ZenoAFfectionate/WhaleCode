@@ -1,9 +1,18 @@
-openai>=1.0.0,<2.0.0
-requests>=2.25.0,<3.0.0
-python-dotenv>=0.19.0,<2.0.0
-pydantic>=2.0.0,<3.0.0
-numpy>=2.0.0,<3.0.0
-networkx>=2.6.0,<4.0.0
+# Core dependencies
+openai>=1.0.0
+pydantic>=2.0.0
+python-dotenv>=0.19.0
 tiktoken>=0.5.0
 pyyaml>=6.0.0
-duckduckgo-search>=7.0.0
+requests>=2.25.0
+
+# CLI interface
+rich>=13.0.0
+prompt-toolkit>=3.0.0
+
+# Web search (used by WebSearchTool, optional but recommended)
+ddgs>=7.0.0
+
+# Optional: provider-specific SDKs (install only if you use the provider)
+# anthropic>=0.40.0        # For Anthropic Claude models
+# google-generativeai>=0.3 # For Google Gemini models

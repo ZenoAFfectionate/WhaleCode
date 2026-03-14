@@ -2,6 +2,8 @@
 
 Whale Code is a from-scratch implementation of an autonomous coding agent that operates inside a local repository. It follows the **ReAct (Reasoning + Acting)** paradigm, powered by OpenAI-compatible function calling, and ships with a full suite of atomized programming tools, a multi-layer context management engine, and a persistent task scheduling system. The goal is to replicate — and deeply understand — the core architecture behind tools like Claude Code, Cursor Agent, and similar AI coding assistants.
 
+![Whale Code Key Design](asserts/key_design.png)
+
 ## Table of Contents
 - [Quick Start](#quick-start)
 - [Architecture Overview](#architecture-overview)
@@ -25,12 +27,18 @@ Whale Code is a from-scratch implementation of an autonomous coding agent that o
 ### Installation
 
 ```bash
-git clone xxx
+git clone https://github.com/ZenoAFfectionate/Coding_Agent.git
 cd WhaleCode
 
+# Create and activate a conda virtual environment
+conda create -n agent python=3.12 -y
+conda activate agent
+
+# Install dependencies
 pip install -r requirements.txt
 
-# Edit .env with your API key
+# Configure your API key
+cp .env.example .env   # then edit .env with your key
 ```
 
 ### Running the Agent
@@ -80,39 +88,7 @@ The CLI provides an interactive loop where you can issue coding tasks:
 
 ## Architecture Overview
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                        run_cli.py                        │
-│                   (Interactive CLI Loop)                  │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│                       CodeAgent                          │
-│           (ReActAgent → Agent base class)                │
-│                                                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ System      │  │ History      │  │ Tool           │  │
-│  │ Prompt      │  │ Manager      │  │ Registry       │  │
-│  └─────────────┘  └──────────────┘  └───────┬────────┘  │
-│                                             │            │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────▼────────┐  │
-│  │ Token       │  │ Context      │  │ Atomized       │  │
-│  │ Counter     │  │ Compactor    │  │ Tools (12+)    │  │
-│  └─────────────┘  └──────────────┘  └────────────────┘  │
-│                                                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ Trace       │  │ Session      │  │ Circuit        │  │
-│  │ Logger      │  │ Store        │  │ Breaker        │  │
-│  └─────────────┘  └──────────────┘  └────────────────┘  │
-└──────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│                 HelloAgentsLLM Adapter                   │
-│          (OpenAI / Anthropic / Local vLLM)               │
-└──────────────────────────────────────────────────────────┘
-```
+![Whale Code CLI Architecture](asserts/architecture.png)
 
 The agent follows a strict **Think → Act → Observe → Re-think** loop implemented through the ReAct pattern. Every reasoning step, tool invocation, and observation is tracked, compressed, and persisted.
 
@@ -279,10 +255,10 @@ If the model tries to run `grep pattern .` or `cat file.py` as a standalone comm
 | | `task_create` | Create a persistent task with dependency graph |
 | | `task_update` | Update task status/fields/dependencies |
 | | `task_list` / `task_get` | Query task status |
-| **Interaction** | `AskUser` | Ask the user a question (main agent only, disabled in sub-agents) |
 | **Web** | `WebSearch` | Search the web via DuckDuckGo |
 | | `WebFetch` | Fetch and extract readable text from a URL |
 | **Knowledge** | `Skill` | Load domain-specific skills on demand |
+| **Interaction** | `AskUser` | Ask the user a question (main agent only, disabled in sub-agents) |
 
 ### Tool Response Protocol
 

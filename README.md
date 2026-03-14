@@ -1,200 +1,376 @@
-# HelloAgents
+# Whale Code — A Production-Grade Coding Agent Framework
 
-> 🤖 生产级多智能体框架 - 工具响应协议、上下文工程、会话持久化、子代理机制等16项核心能力
+Whale Code is a from-scratch implementation of an autonomous coding agent that operates inside a local repository. It follows the **ReAct (Reasoning + Acting)** paradigm, powered by OpenAI-compatible function calling, and ships with a full suite of atomized programming tools, a multi-layer context management engine, and a persistent task scheduling system. The goal is to replicate — and deeply understand — the core architecture behind tools like Claude Code, Cursor Agent, and similar AI coding assistants.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-
-HelloAgents 是一个基于 OpenAI 原生 API 构建的生产级多智能体框架，集成了工具响应协议（ToolResponse）、上下文工程（HistoryManager/TokenCounter）、会话持久化（SessionStore）、子代理机制（TaskTool）、乐观锁（文件编辑）、熔断器（CircuitBreaker）、Skills 知识外化、TodoWrite 进度管理、DevLog 决策记录、流式输出（SSE）、异步生命周期、可观测性（TraceLogger）、日志系统（四种范式）、LLM/Agent 基类重构等 16 项核心能力，为构建复杂智能体应用提供完整的工程化支持。
-
-## 📌 版本说明
-
-> **重要提示**：本仓库目前维护两个版本
-
-- **📚 学习版本（推荐初学者）**：[learn_version 分支](https://github.com/jjyaoao/HelloAgents/tree/learn_version)
-  与 [Datawhale Hello-Agents 教程](https://github.com/datawhalechina/hello-agents) 正文完全对应的稳定版本，适合跟随教程学习使用。
-
-- **🚀 开发版本（当前分支）**：持续迭代中的最新代码(V1.0.0)，包含新功能和改进，部分实现可能与教程内容存在差异。如需学习教程，请切换到 `learn_version` 分支。
-
-- **📦 历史版本**：[Releases 页面](https://github.com/jjyaoao/HelloAgents/releases)
-  提供从 v0.1.1 到 v0.2.9 的所有版本，每个版本对应教程的特定章节，可根据学习进度选择对应版本。
-
-- **🐹 Golang 开发版本**：[HelloAgents-go](https://github.com/chaojixinren/HelloAgents-go)
-  社区贡献的HelloAgents 的 Go 语言重实现版本，适合 Go 语言开发者使用。
-
-## 🚀 快速开始
-
-### 安装
-
-```bash
-pip install hello-agents
-```
-
-### 基本使用
-
-```python
-from hello_agents import ReActAgent, HelloAgentsLLM, ToolRegistry
-from hello_agents.tools.builtin import ReadTool, WriteTool, TodoWriteTool
-
-llm = HelloAgentsLLM()
-registry = ToolRegistry()
-registry.register_tool(ReadTool())
-registry.register_tool(WriteTool())
-registry.register_tool(TodoWriteTool())
-
-agent = ReActAgent("assistant", llm, tool_registry=registry)
-agent.run("分析项目结构并生成报告")
-```
-
-### 环境配置
-
-创建 `.env` 文件：
-```bash
-LLM_MODEL_ID=your-model-name
-LLM_API_KEY=your-api-key-here
-LLM_BASE_URL=your-api-base-url
-```
-
-```python
-# 自动检测provider
-llm = HelloAgentsLLM()  # 框架自动检测为modelscope
-print(f"检测到的provider: {llm.provider}")
-```
-
-> 💡 **智能检测**: 框架会根据API密钥格式和Base URL自动选择合适的provider
-
-### 支持的LLM提供商
-
-框架基于 **3 种适配器** 支持所有主流 LLM 服务：
-
-#### 1. OpenAI 兼容适配器（默认）
-
-支持所有提供 OpenAI 兼容接口的服务：
-
-| 提供商类型   | 示例服务                               | 配置示例                             |
-| ------------ | -------------------------------------- | ------------------------------------ |
-| **云端 API** | OpenAI、DeepSeek、Qwen、Kimi、智谱 GLM | `LLM_BASE_URL=api.deepseek.com`      |
-| **本地推理** | vLLM、Ollama、SGLang                   | `LLM_BASE_URL=http://localhost:8000` |
-| **其他兼容** | 任何 OpenAI 格式接口                   | `LLM_BASE_URL=your-endpoint`         |
-
-#### 2. Anthropic 适配器
-
-| 提供商     | 检测条件                        | 配置示例                                 |
-| ---------- | ------------------------------- | ---------------------------------------- |
-| **Claude** | `base_url` 包含 `anthropic.com` | `LLM_BASE_URL=https://api.anthropic.com` |
-
-#### 3. Gemini 适配器
-
-| 提供商            | 检测条件                                                 | 配置示例                                                 |
-| ----------------- | -------------------------------------------------------- | -------------------------------------------------------- |
-| **Google Gemini** | `base_url` 包含 `googleapis.com` 或 `generativelanguage` | `LLM_BASE_URL=https://generativelanguage.googleapis.com` |
-
-> 💡 **自动适配**：框架根据 `base_url` 自动选择适配器，无需手动指定。
-
-## 🏗️ 项目结构
-
-```
-hello-agents/
-├── hello_agents/              # 主包
-│   ├── core/                  # 核心组件
-│   │   ├── llm.py             # LLM 基类与配置
-│   │   ├── llm_adapters.py    # 三种适配器（OpenAI/Anthropic/Gemini）
-│   │   ├── agent.py           # Agent 基类（Function Calling 架构）
-│   │   ├── session_store.py   # 会话持久化
-│   │   ├── lifecycle.py       # 异步生命周期
-│   │   └── streaming.py       # SSE 流式输出
-│   ├── agents/                # Agent 实现
-│   │   ├── simple_agent.py    # SimpleAgent
-│   │   ├── react_agent.py     # ReActAgent
-│   │   ├── reflection_agent.py # ReflectionAgent
-│   │   └── plan_solve_agent.py # PlanAndSolveAgent
-│   ├── tools/                 # 工具系统
-│   │   ├── registry.py        # 工具注册表
-│   │   ├── response.py        # ToolResponse 协议
-│   │   ├── circuit_breaker.py # 熔断器
-│   │   ├── tool_filter.py     # 工具过滤（子代理机制）
-│   │   └── builtin/           # 内置工具
-│   │       ├── file_tools.py  # 文件工具（乐观锁）
-│   │       ├── task_tool.py   # 子代理工具
-│   │       ├── todowrite_tool.py # 进度管理
-│   │       ├── devlog_tool.py # 决策日志
-│   │       └── skill_tool.py  # Skills 知识外化
-│   ├── context/               # 上下文工程
-│   │   ├── history.py         # HistoryManager
-│   │   ├── token_counter.py   # TokenCounter
-│   │   ├── truncator.py       # ObservationTruncator
-│   │   └── builder.py         # ContextBuilder
-│   ├── observability/         # 可观测性
-│   │   └── trace_logger.py    # TraceLogger
-│   └── skills/                # Skills 系统
-│       └── loader.py          # SkillLoader
-├── docs/                      # 文档
-├── examples/                  # 示例代码
-└── tests/                     # 测试用例
-```
-
-## 🤝 贡献
-
-欢迎贡献代码！请遵循以下步骤：
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
-## 📄 许可证
-
-本项目采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-**许可证要点**：
-- ✅ **署名** (Attribution): 使用时需要注明原作者
-- ✅ **相同方式共享** (ShareAlike): 修改后的作品需使用相同许可证
-- ⚠️ **非商业性使用** (NonCommercial): 不得用于商业目的
-
-如需商业使用，请联系项目维护者获取授权。
-
-## 🙏 致谢
-
-- 感谢 [Datawhale](https://github.com/datawhalechina) 提供的优秀开源教程
-- 感谢 [Hello-Agents 教程](https://github.com/datawhalechina/hello-agents) 的所有贡献者
-- 感谢所有为智能体技术发展做出贡献的研究者和开发者
-
-## 📚 文档资源
-
-详细了解 HelloAgents v1.0.0 的 16 项核心能力：
-
-### 基础设施
-- **[工具响应协议](./docs/tool-response-protocol.md)** - ToolResponse 统一返回格式
-- **[上下文工程](./docs/context-engineering-guide.md)** - HistoryManager/TokenCounter/Truncator
-
-### 核心能力
-- **[可观测性](./docs/observability-guide.md)** - TraceLogger 追踪系统
-- **[熔断器](./docs/circuit-breaker-guide.md)** - CircuitBreaker 容错机制
-- **[会话持久化](./docs/session-persistence-guide.md)** - SessionStore 会话管理
-
-### 增强能力
-- **[子代理机制](./docs/subagent-guide.md)** - TaskTool 与 ToolFilter
-- **[Skills 知识外化](./docs/skills-usage-guide.md)** - 技能系统使用指南
-- **[乐观锁](./docs/file_tools.md)** - 文件编辑工具的并发控制
-- **[TodoWrite 进度管理](./docs/todowrite-usage-guide.md)** - 任务进度追踪
-
-### 辅助功能
-- **[DevLog 决策日志](./docs/devlog-guide.md)** - 开发决策记录
-- **[异步生命周期](./docs/async-agent-guide.md)** - 异步 Agent 实现
-
-### 核心架构
-- **[流式输出](./docs/streaming-sse-guide.md)** - SSE 流式响应
-- **[Function Calling 架构](./docs/function-calling-architecture.md)** - LLM/Agent 基类重构
-- **[日志系统](./docs/logging-system-guide.md)** - 四种日志范式
-
-### 扩展能力
-- **[自定义工具扩展](./docs/custom_tools_guide.md)** - 三种工具实现方式（函数式/标准类/可展开）
+## Table of Contents
+- [Quick Start](#quick-start)
+- [Architecture Overview](#architecture-overview)
+- [CodeAgent Implementation Details](#codeagent-implementation-details)
+- [Context Management](#context-management)
+- [Atomized Tool System](#atomized-tool-system)
+  - [Why Atomized Tools Instead of Bash?](#why-atomized-tools-instead-of-bash)
+  - [Tool List](#tool-list)
+  - [Tool Response Protocol](#tool-response-protocol)
+  - [Circuit Breaker](#circuit-breaker)
+- [Task System](#task-system)
+  - [Persistent Task Graph (TaskTool)](#persistent-task-graph-tasktool)
+  - [Lightweight Progress Tracking (TodoWrite)](#lightweight-progress-tracking-todowrite)
+  - [Background Execution (BackgroundTool)](#background-execution-backgroundtool)
+- [License](#license)
 
 ---
 
-<div align="center">
+## Quick Start
 
-**HelloAgents** - 让智能体开发变得简单而强大 🚀
-</div>
+### Installation
 
+```bash
+git clone xxx
+cd WhaleCode
+
+pip install -r requirements.txt
+
+# Edit .env with your API key
+```
+
+### Running the Agent
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+    --port 8000 \
+    --gpu-memory-utilization 0.90 \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+   --language-model-only \
+    --tool-call-parser qwen3_coder
+```
+
+```bash
+python run_cli.py --workspace /working/space
+```
+
+The CLI provides an interactive loop where you can issue coding tasks:
+
+```
+> Read the main entry point and summarize its structure
+> Find all TODO comments in the codebase
+> Add error handling to the data processing pipeline
+```
+
+![Whale Code CLI Demo](asserts/cli-demo.png)
+
+### Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show the help message with all available commands |
+| `/info` `/model` | Display runtime info: workspace path, model, base URL, temperature, trace status, tool count |
+| `/tools` | List all registered tools with their descriptions |
+| `/pwd` | Print the current working directory |
+| `/cd <path>` | Change the agent's working directory (must stay within workspace root) |
+| `/history [n]` | Show conversation history; optional `n` limits to the last N entries |
+| `/log` | Open all terminal output in a scrollable pager (`less`/`more`) |
+| `/clear` | Clear the in-memory conversation history |
+| `/save [name]` | Save the current session snapshot (default name: `session-latest`) |
+| `/load [path\|name]` | Load a previously saved session by file path or name |
+| `/sessions` | List all saved session files with metadata (steps, tokens, timestamps) |
+| `/compact [focus]` | Manually trigger context compaction; optional `focus` guides the summary |
+
+---
+
+## Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                        run_cli.py                        │
+│                   (Interactive CLI Loop)                  │
+└──────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                       CodeAgent                          │
+│           (ReActAgent → Agent base class)                │
+│                                                          │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ System      │  │ History      │  │ Tool           │  │
+│  │ Prompt      │  │ Manager      │  │ Registry       │  │
+│  └─────────────┘  └──────────────┘  └───────┬────────┘  │
+│                                             │            │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────▼────────┐  │
+│  │ Token       │  │ Context      │  │ Atomized       │  │
+│  │ Counter     │  │ Compactor    │  │ Tools (12+)    │  │
+│  └─────────────┘  └──────────────┘  └────────────────┘  │
+│                                                          │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ Trace       │  │ Session      │  │ Circuit        │  │
+│  │ Logger      │  │ Store        │  │ Breaker        │  │
+│  └─────────────┘  └──────────────┘  └────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                 HelloAgentsLLM Adapter                   │
+│          (OpenAI / Anthropic / Local vLLM)               │
+└──────────────────────────────────────────────────────────┘
+```
+
+The agent follows a strict **Think → Act → Observe → Re-think** loop implemented through the ReAct pattern. Every reasoning step, tool invocation, and observation is tracked, compressed, and persisted.
+
+---
+
+## CodeAgent Implementation Details
+
+**Source**: `code/agents/code_agent.py`
+
+`CodeAgent` is the top-level agent class, built by extending the inheritance chain:
+
+```
+Agent (base) → ReActAgent (function-calling ReAct loop) → CodeAgent (coding-specialized)
+```
+
+### Key Design Decisions
+
+1. **Workspace Sandboxing**: The agent is initialized with a `project_root` and `working_dir`. Every file operation is validated to stay within the workspace root, preventing accidental access to system files.
+
+2. **OpenAI Function Calling (not text-parsing)**: Unlike text-based ReAct implementations that rely on regex to parse `Action: ...` from model output, `CodeAgent` uses native function calling. The model's `tool_calls` are structured JSON, achieving a **99%+ parse success rate** with zero regex.
+
+3. **Tool Auto-Registration**: On initialization, `register_default_tools()` instantiates and registers 12+ atomic tools, each bound to the workspace root:
+
+   ```python
+   def register_default_tools(self, enable_task_tool=True):
+       self.tool_registry.register_tool(ReadTool(...))
+       self.tool_registry.register_tool(WriteTool(...))
+       self.tool_registry.register_tool(EditTool(...))
+       self.tool_registry.register_tool(GlobTool(...))
+       self.tool_registry.register_tool(GrepTool(...))
+       self.tool_registry.register_tool(BashTool(...))
+       self.tool_registry.register_tool(BackgroundTool(...))
+       # ... and more
+   ```
+
+4. **Background Notification Injection**: Before each model call, `_before_model_call()` drains completed background task notifications and injects them as `<background-results>` messages, so the model is aware of async build/test results.
+
+5. **Sub-Agent Creation**: `_create_subagent()` spawns an isolated `CodeAgent` with its own `ToolRegistry`, separate history, and `interactive=False` (disabling `AskUser`). This enables context-isolated delegated work.
+
+6. **Manual Context Compaction**: The `compact()` method exposes a public API for on-demand context compression, reconstructing messages from history, running the compactor, and replacing the stored history.
+
+---
+
+## Context Management
+
+Context management is the core engineering challenge of a long-running coding agent. Whale Code implements a **multi-layer context engineering system** with five dedicated components.
+
+### 1. HistoryManager (`code/context/history.py`)
+
+An append-only message store with round-based compression:
+
+- **Append-only writes** — cache-friendly, no in-place edits.
+- **Round boundary detection** — identifies `user → assistant/tool*` round boundaries to determine compression granularity.
+- **Compression** — replaces old rounds with a summary message while retaining the most recent `min_retain_rounds` complete rounds.
+- **Serialization** — `to_dict()` / `load_from_dict()` for session persistence.
+
+### 2. TokenCounter (`code/context/token_counter.py`)
+
+Local token estimation without API calls:
+
+- **tiktoken integration** — uses the `cl100k_base` encoding for accurate counts.
+- **Caching** — `role:content` cache key avoids re-encoding identical messages.
+- **Incremental counting** — `_history_token_count` is updated on every `add_message()` call, never re-scanning full history.
+- **Graceful degradation** — falls back to `len(text) // 4` when tiktoken is unavailable.
+
+### 3. ContextCompactor (`code/context/compactor.py`)
+
+A three-layer compression engine adapted for OpenAI function-calling message format:
+
+| Layer | Trigger | Strategy |
+|-------|---------|----------|
+| **Layer 1: micro_compact** | Every turn | Scans `tool` role messages from newest to oldest; keeps the N most recent tool results intact, replaces older ones with `[Previous tool result: {name} — truncated]` |
+| **Layer 2: auto_compact** | Token threshold exceeded | Saves the full transcript to a JSONL file, calls the LLM to generate a structured summary, rebuilds messages as `[system] + [summary] + [ack]` |
+| **Layer 3: manual_compact** | User-triggered | Same as Layer 2, but accepts an optional `focus` parameter to guide the summary (e.g. "focus on the authentication module") |
+
+The compactor builds a `tool_call_id → tool_name` mapping to produce meaningful truncation labels, and serializes messages with per-message truncation (2000 chars max) before feeding them to the summary LLM.
+
+### 4. ObservationTruncator (`code/context/truncator.py`)
+
+Handles tool output that is too large to fit in context:
+
+- **Multi-directional truncation** — `head` (keep first N lines), `tail` (keep last N lines), or `head_tail` (keep both ends with a gap marker).
+- **Dual limits** — enforces both `max_lines` (default 2000) and `max_bytes` (default 50KB).
+- **Full output persistence** — saves the complete untruncated output as a JSON file in `tool-output/`, so the agent can reference it later if needed.
+
+### 5. ContextBuilder (`code/context/builder.py`)
+
+A **GSSC (Gather-Select-Structure-Compress)** pipeline for structured context assembly:
+
+1. **Gather** — collects context packets from multiple sources (system instructions, conversation history, additional data).
+2. **Select** — scores packets using `0.7 × relevance + 0.3 × recency` with exponential time decay, filters by `min_relevance` threshold, and fills within the token budget.
+3. **Structure** — organizes selected packets into a template: `[Role & Policies] → [Task] → [State] → [Evidence] → [Context] → [Output]`.
+4. **Compress** — if the structured result exceeds the token budget, truncates by paragraph boundaries.
+
+---
+
+## Atomized Tool System
+
+### Why Atomized Tools Instead of Bash?
+
+A naive approach would give the agent a single `Bash` tool and let it run `cat`, `grep`, `sed`, etc. for all operations. Whale Code intentionally **splits file and search operations into dedicated, atomic tools**. Here's why:
+
+#### 1. Workspace Sandboxing
+
+Every atomic tool (Read, Write, Edit, Glob, Grep) uses `resolve_path()` to validate that the target path stays within the `project_root`. The Bash tool cannot enforce this for arbitrary shell commands.
+
+```python
+# Every tool validates paths against the workspace root
+target = resolve_path(self.project_root, self.working_dir, raw_path)
+# Raises ValueError if the path escapes the workspace
+```
+
+#### 2. Optimistic Locking for Concurrent Safety
+
+`ReadTool` returns `expected_mtime_ms` and `expected_size_bytes` metadata with every file read. `WriteTool` and `EditTool` accept these values back and check them before writing — if the file has been modified externally since it was last read, the write is rejected. This prevents the agent from silently overwriting human edits. A raw `Bash` + `sed`/`echo` pipeline has no such protection.
+
+#### 3. Structured Response Protocol
+
+Every tool returns a `ToolResponse` object with a three-state status (`SUCCESS | PARTIAL | ERROR`), structured `data` payload, `error_info` with error codes, and `stats` with timing information. This gives the agent machine-readable feedback instead of parsing unstructured stdout/stderr.
+
+```python
+class ToolResponse:
+    status: ToolStatus        # SUCCESS / PARTIAL / ERROR
+    text: str                 # Human/LLM-readable text
+    data: Dict[str, Any]      # Structured payload
+    error_info: Dict          # Error code + message
+    stats: Dict               # Timing, token counts
+```
+
+#### 4. Circuit Breaker Protection
+
+The `ToolRegistry` wraps every tool call with a `CircuitBreaker`. If a tool fails 3 consecutive times, it is automatically disabled for 5 minutes. This prevents infinite retry loops where the agent keeps calling a broken tool. Bash-only architectures have no such guardrail.
+
+#### 5. Context Efficiency
+
+Atomic tools produce compact, well-formatted output. `GlobTool` returns sorted file paths. `GrepTool` returns `file:line: content` entries. `ReadTool` returns numbered lines with metadata headers. Raw shell output from `find`, `grep -r`, or `cat` is often verbose, includes color codes, and wastes context tokens.
+
+#### 6. The Bash Tool Actively Redirects
+
+The `BashTool` itself enforces this philosophy. It maintains a `PREFER_SPECIALIZED_TOOLS` blocklist:
+
+```python
+PREFER_SPECIALIZED_TOOLS = {"ls", "cat", "grep", "rg", "find", "head", "tail"}
+```
+
+If the model tries to run `grep pattern .` or `cat file.py` as a standalone command, Bash returns an error saying "Use the dedicated tools instead." However, piped usage like `git log | grep fix` is allowed, since `grep` is not the segment leader.
+
+### Tool List
+
+| Category | Tool | Description |
+|----------|------|-------------|
+| **File Discovery** | `Glob` | Find files by glob pattern (`**/*.py`, `src/**/*.ts`) with `fnmatch` + directory pruning |
+| | `Grep` | Regex code search using ripgrep (with Python fallback) |
+| | `LS` | List directory contents |
+| | `Read` | Read file content with metadata for optimistic locking |
+| **File Modification** | `Write` | Full-file rewrite with atomic write + optimistic locking + dry-run mode |
+| | `Edit` | Single-snippet surgical replacement with conflict detection + backup |
+| | `MultiEdit` | Batch multiple independent edits in one file atomically |
+| **Execution** | `Bash` | Shell commands with command policy validation (blocks interactive/destructive/privileged commands) |
+| | `background_run` | Start long-running commands asynchronously |
+| | `background_check` | Inspect background task status and output |
+| | `background_cancel` | Cancel a running background task |
+| **Planning** | `TodoWrite` | Lightweight declarative progress tracking |
+| | `task_create` | Create a persistent task with dependency graph |
+| | `task_update` | Update task status/fields/dependencies |
+| | `task_list` / `task_get` | Query task status |
+| **Interaction** | `AskUser` | Ask the user a question (main agent only, disabled in sub-agents) |
+| **Web** | `WebSearch` | Search the web via DuckDuckGo |
+| | `WebFetch` | Fetch and extract readable text from a URL |
+| **Knowledge** | `Skill` | Load domain-specific skills on demand |
+
+### Tool Response Protocol
+
+All tools return `ToolResponse` with a three-state status:
+
+- **`SUCCESS`** — task completed as expected.
+- **`PARTIAL`** — result is usable but degraded (output truncated, search limit reached, non-zero exit code).
+- **`ERROR`** — no valid result; includes a structured error code (e.g. `NOT_FOUND`, `ACCESS_DENIED`, `TIMEOUT`, `CIRCUIT_OPEN`).
+
+### Circuit Breaker
+
+```
+Closed (normal) ──[3 consecutive failures]──► Open (disabled)
+      ▲                                           │
+      └───────────[5 min timeout]─────────────────┘
+```
+
+The circuit breaker tracks per-tool failure counts. When a tool hits the threshold, it's automatically disabled for 5 minutes. This prevents the agent from burning tokens on a broken tool.
+
+---
+
+## Task System
+
+Whale Code implements three complementary mechanisms for multi-task scheduling, each serving a different purpose:
+
+### Persistent Task Graph (TaskTool)
+
+**Source**: `code/tools/builtin/task_tool.py`
+
+A **file-per-task** persistent graph that survives context compression. This is the core mechanism for complex, multi-step work.
+
+**Storage**: Each task is stored as an individual JSON file under `memory/tasks/task_{id}.json`.
+
+**Data Model**:
+
+```json
+{
+  "id": 1,
+  "subject": "Implement user authentication",
+  "description": "Add JWT-based auth to the API endpoints",
+  "status": "in_progress",
+  "blockedBy": [2],
+  "blocks": [3, 4],
+  "owner": "code-agent"
+}
+```
+
+**Key Features**:
+
+1. **Dependency Graph** — Tasks can declare `blockedBy` (prerequisites) and `blocks` (dependents) relationships. When a task is completed, its ID is automatically removed from all other tasks' `blockedBy` lists, unblocking dependent work.
+
+2. **Bidirectional Edge Maintenance** — Adding `blockedBy: [2]` to task 1 automatically adds `blocks: [1]` to task 2.
+
+3. **Context-Compression Resilience** — Because tasks are stored as files on disk (not in conversation history), they survive context compaction. Even after the conversation is summarized, the agent can query `task_list` to recall pending work.
+
+4. **Expandable Tool Pattern** — `TaskTool` is registered as an `expandable=True` tool that auto-expands into 4 independent sub-tools via the `@tool_action` decorator:
+   - `task_create` — Create a task with optional `blocked_by` dependencies.
+   - `task_update` — Update status (`pending` → `in_progress` → `completed`), subject, description, owner, or dependencies.
+   - `task_list` — List tasks with optional status filter.
+   - `task_get` — Get full details of one task.
+
+### Lightweight Progress Tracking (TodoWrite)
+
+**Source**: `code/tools/builtin/todowrite_tool.py`
+
+A **declarative, in-session** progress tracker for lightweight task management:
+
+- **Declarative Override** — each call submits the full todo list; no incremental add/remove.
+- **Single-Thread Enforcement** — at most 1 task can be `in_progress` at any time; the tool rejects lists with multiple active tasks.
+- **Auto-Recap Generation** — generates a compact status line (e.g. `[2/5] In progress: xxx. Pending: yyy; zzz.`) for context efficiency.
+- **Persistent Snapshots** — todo states are saved as timestamped JSON files under `memory/todos/`.
+
+### Background Execution (BackgroundTool)
+
+**Source**: `code/tools/builtin/background.py`
+
+Enables **non-blocking parallel execution** of long-running commands:
+
+1. **`background_run`** — spawns a shell command in a daemon thread. Returns immediately with a task ID so the agent can continue reasoning.
+
+2. **Notification Injection** — The `BackgroundManager` maintains a notification queue. Before each model call, `CodeAgent._before_model_call()` drains completed notifications and injects them as `<background-results>` messages. The model learns about build/test outcomes without polling.
+
+3. **Task Integration** — Background tasks can be linked to persistent tasks via `task_id`. If `complete_task_on_success=True`, the background manager automatically marks the linked task as `completed` when the command exits with code 0.
+
+4. **Lifecycle Management** — `background_check` inspects status/output, `background_cancel` sends SIGTERM. Records are persisted as JSON files under `memory/background/` and survive process restarts (interrupted tasks are marked as `interrupted`).
+
+---
+
+## License
+
+This project is licensed under [CC-BY-NC-SA-4.0](LICENSE).

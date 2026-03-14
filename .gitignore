@@ -161,3 +161,8 @@ cython_debug/
 .obsidian
 .pytest_cache
 .venv
+
+/memory/
+/docs/
+/data/
+/tests/

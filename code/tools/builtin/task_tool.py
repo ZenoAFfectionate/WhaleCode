@@ -28,8 +28,6 @@ class TaskManager:
         self.dir = Path(tasks_dir).expanduser().resolve()
         self.dir.mkdir(parents=True, exist_ok=True)
 
-    # -- CRUD ---------------------------------------------------------
-
     def create(self, subject: str, description: str = "") -> dict:
         task = {
             "id": self._next_id(),
@@ -106,8 +104,6 @@ class TaskManager:
                 continue
             tasks.append(task)
         return tasks
-
-    # -- Internals ----------------------------------------------------
 
     def _load(self, task_id: int) -> dict:
         path = self.dir / f"task_{task_id}.json"

@@ -22,10 +22,6 @@ from ..errors import ToolErrorCode
 from ..response import ToolResponse
 
 
-# ---------------------------------------------------------------------------
-# HTML text extractor (stdlib only, no extra dependencies)
-# ---------------------------------------------------------------------------
-
 class _HTMLTextExtractor(HTMLParser):
     """Extract readable text from HTML using the stdlib parser."""
 
@@ -98,10 +94,6 @@ def _html_to_text(html: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
     return extractor.get_text()
 
-
-# ---------------------------------------------------------------------------
-# WebSearchTool
-# ---------------------------------------------------------------------------
 
 class WebSearchTool(Tool):
     """Search the web using DuckDuckGo.
@@ -216,10 +208,6 @@ class WebSearchTool(Tool):
             data={"query": query, "results": cleaned, "count": len(cleaned)},
         )
 
-
-# ---------------------------------------------------------------------------
-# WebFetchTool
-# ---------------------------------------------------------------------------
 
 class WebFetchTool(Tool):
     """Fetch and extract readable text content from a web URL."""

@@ -67,7 +67,7 @@ class ReActAgent(Agent):
             name: Agent 名称
             llm: LLM 实例
             tool_registry: 工具注册表（可选）
-            system_prompt: 系统提示词（可选，默认使用 DEFAULT_REACT_SYSTEM_PROMPT）
+            system_prompt: 系统提示词（可选）
             config: 配置对象
             max_steps: 最大执行步数
         """
@@ -306,6 +306,8 @@ class ReActAgent(Agent):
         total_tokens = 0
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        no_tool_call_retries = 0
+        max_no_tool_call_retries = 2
 
         # 记录用户消息
         if self.trace_logger:
@@ -382,6 +384,25 @@ class ReActAgent(Agent):
             # 处理工具调用
             tool_calls = response_message.tool_calls
             if not tool_calls:
+                # 模型未返回工具调用。如果是第一步（尚未做任何工作），
+                # 可能是模型 tool-calling 不稳定导致的，注入提示后重试。
+                if current_step == 1 and no_tool_call_retries < max_no_tool_call_retries:
+                    no_tool_call_retries += 1
+                    # 将模型的文本回复加入上下文，再追加一条提醒
+                    if response_message.content:
+                        messages.append({
+                            "role": "assistant",
+                            "content": response_message.content,
+                        })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You have access to tools — please use them to complete the task. "
+                            "Do not respond with text only. Call a tool now."
+                        ),
+                    })
+                    continue
+
                 # 没有工具调用，直接返回文本响应
                 final_answer = response_message.content or "Sorry, I cannot answer this question."
                 self._render_direct_response(final_answer)
@@ -666,7 +687,6 @@ class ReActAgent(Agent):
                 "finished": False
             }
 
-    # ==================== 异步方法 ====================
 
     async def arun(
         self,
@@ -714,6 +734,8 @@ class ReActAgent(Agent):
 
             current_step = 0
             total_tokens = 0
+            no_tool_call_retries = 0
+            max_no_tool_call_retries = 2
 
             # 记录用户消息
             if self.trace_logger:
@@ -787,6 +809,23 @@ class ReActAgent(Agent):
                 # 处理工具调用
                 tool_calls = response_message.tool_calls
                 if not tool_calls:
+                    # 重试机制：第一步未调用工具时，注入提示后重试
+                    if current_step == 1 and no_tool_call_retries < max_no_tool_call_retries:
+                        no_tool_call_retries += 1
+                        if response_message.content:
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_message.content,
+                            })
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You have access to tools — please use them to complete the task. "
+                                "Do not respond with text only. Call a tool now."
+                            ),
+                        })
+                        continue
+
                     # 没有工具调用，直接返回
                     final_answer = response_message.content or "Sorry, I cannot answer this question."
                     self._render_direct_response(final_answer)

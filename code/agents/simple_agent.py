@@ -1,6 +1,4 @@
-"""简单Agent实现 - 基于 Function Calling"""
-
-from typing import Optional, Iterator, TYPE_CHECKING, List, Dict, Any, AsyncGenerator
+from typing import Optional, Iterator, TYPE_CHECKING, List, Dict, AsyncGenerator
 import json
 
 from ..core.agent import Agent
@@ -14,12 +12,12 @@ if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
 
 class SimpleAgent(Agent):
-    """简单的对话Agent，支持可选的工具调用
+    """Simple conversational Agent, supporting optional tool calling
 
-    特性：
-    - 纯对话模式（无工具）
-    - Function Calling 工具调用（可选）
-    - 自动多轮工具调用
+    Features:
+    - Pure conversation mode (no tools)
+    - Function Calling tool invocation (optional)
+    - Automatic multi-turn tool invocation
     """
 
     def __init__(
@@ -33,18 +31,18 @@ class SimpleAgent(Agent):
         max_tool_iterations: int = 3
     ):
         """
-        初始化SimpleAgent
+        Initialize SimpleAgent
 
         Args:
-            name: Agent名称
-            llm: LLM实例
-            system_prompt: 系统提示词
-            config: 配置对象
-            tool_registry: 工具注册表（可选，如果提供则启用工具调用）
-            enable_tool_calling: 是否启用工具调用（只有在提供tool_registry时生效）
-            max_tool_iterations: 最大工具调用迭代次数
+            name: Agent name
+            llm: LLM instance
+            system_prompt: System prompt words
+            config: Configuration object
+            tool_registry: Tool registry (optional, if provided, tool calling is enabled)
+            enable_tool_calling: Whether to enable tool calling (only effective when tool_registry is provided)
+            max_tool_iterations: Maximum number of tool calling iterations
         """
-        # 传递 tool_registry 到基类
+        # Pass tool_registry to the base class
         super().__init__(
             name,
             llm,
@@ -57,21 +55,21 @@ class SimpleAgent(Agent):
 
     def run(self, input_text: str, **kwargs) -> str:
         """
-        运行 SimpleAgent（基于 Function Calling）
+        Run SimpleAgent (based on Function Calling)
 
         Args:
-            input_text: 用户输入
-            **kwargs: 其他参数
+            input_text: User input
+            **kwargs: Additional parameters
 
         Returns:
-            最终回复
+            Final response
         """
         from datetime import datetime
         from hello_agents.observability import TraceLogger
 
         session_start_time = datetime.now()
 
-        # 为每次 run 创建新的 TraceLogger（避免多轮对话时文件已关闭的问题）
+        # Create a new TraceLogger for each run (avoids issues with closed files during multi-turn dialogues)
         trace_logger = None
         if self.config.trace_enabled:
             trace_logger = TraceLogger(
@@ -87,22 +85,22 @@ class SimpleAgent(Agent):
                 }
             )
 
-        # 构建消息列表
+        # Build the message list
         messages = self._build_messages(input_text)
 
-        # 记录用户消息
+        # Log user message
         if trace_logger:
             trace_logger.log_event(
                 "message_written",
                 {"role": "user", "content": input_text}
             )
 
-        # 如果没有启用工具调用，直接返回 LLM 响应
+        # If tool calling is not enabled, return the LLM response directly
         if not self.enable_tool_calling or not self.tool_registry:
             llm_response = self.llm.invoke(messages, **kwargs)
             response_text = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-            # 保存到历史记录
+            # Save to history
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(response_text, "assistant"))
 
@@ -122,7 +120,7 @@ class SimpleAgent(Agent):
 
             return response_text
 
-        # 启用工具调用模式
+        # Enable tool calling mode
         tool_schemas = self._build_tool_schemas()
 
         current_iteration = 0
@@ -131,7 +129,7 @@ class SimpleAgent(Agent):
         while current_iteration < self.max_tool_iterations:
             current_iteration += 1
 
-            # 调用 LLM（Function Calling）
+            # Call LLM (Function Calling)
             try:
                 response = self.llm.invoke_with_tools(
                     messages=messages,
@@ -140,7 +138,7 @@ class SimpleAgent(Agent):
                     **kwargs
                 )
             except Exception as e:
-                print(f"❌ LLM 调用失败: {e}")
+                print(f"❌ LLM call failed: {e}")
                 if trace_logger:
                     trace_logger.log_event(
                         "error",
@@ -149,10 +147,10 @@ class SimpleAgent(Agent):
                     )
                 break
 
-            # 获取响应消息
+            # Get the response message
             response_message = response.choices[0].message
 
-            # 记录模型输出
+            # Log model output
             if trace_logger:
                 usage = response.usage
                 trace_logger.log_event(
@@ -169,14 +167,14 @@ class SimpleAgent(Agent):
                     step=current_iteration
                 )
 
-            # 处理工具调用
+            # Process tool calls
             tool_calls = response_message.tool_calls
             if not tool_calls:
-                # 没有工具调用，直接返回文本响应
-                final_response = response_message.content or "抱歉，我无法回答这个问题。"
+                # No tool calls, return the text response directly
+                final_response = response_message.content or "Sorry, I cannot answer this question."
                 break
 
-            # 将助手消息添加到历史
+            # Add the assistant message to history
             messages.append({
                 "role": "assistant",
                 "content": response_message.content,
@@ -193,7 +191,7 @@ class SimpleAgent(Agent):
                 ]
             })
 
-            # 执行所有工具调用
+            # Execute all tool calls
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 tool_call_id = tool_call.id
@@ -201,15 +199,15 @@ class SimpleAgent(Agent):
                 try:
                     arguments = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
-                    print(f"❌ 工具参数解析失败: {e}")
+                    print(f"❌ Tool argument parsing failed: {e}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": f"错误：参数格式不正确 - {str(e)}"
+                        "content": f"Error: Incorrect argument format - {str(e)}"
                     })
                     continue
 
-                # 记录工具调用
+                # Log tool call
                 if trace_logger:
                     trace_logger.log_event(
                         "tool_call",
@@ -221,10 +219,10 @@ class SimpleAgent(Agent):
                         step=current_iteration
                     )
 
-                # 执行工具（复用基类方法）
+                # Execute tool (reuse base class method)
                 result = self._execute_tool_call(tool_name, arguments)
 
-                # 记录工具结果
+                # Log tool result
                 if trace_logger:
                     trace_logger.log_event(
                         "tool_result",
@@ -236,19 +234,19 @@ class SimpleAgent(Agent):
                         step=current_iteration
                     )
 
-                # 添加工具结果到消息
+                # Add tool result to messages
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": result
                 })
 
-        # 如果超过最大迭代次数，获取最后一次回答
+        # If the maximum number of iterations is exceeded, get the last answer
         if current_iteration >= self.max_tool_iterations and not final_response:
             llm_response = self.llm.invoke(messages, **kwargs)
             final_response = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-        # 保存到历史记录
+        # Save to history
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(final_response, "assistant"))
 
@@ -268,24 +266,24 @@ class SimpleAgent(Agent):
         return final_response
 
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """构建消息列表"""
+        """Build the message list"""
         messages = []
 
-        # 添加系统提示词
+        # Add system prompt
         if self.system_prompt:
             messages.append({
                 "role": "system",
                 "content": self.system_prompt
             })
 
-        # 添加历史消息
+        # Add historical messages
         for msg in self._history:
             messages.append({
                 "role": msg.role,
                 "content": msg.content
             })
 
-        # 添加用户问题
+        # Add user question
         messages.append({
             "role": "user",
             "content": input_text
@@ -295,51 +293,51 @@ class SimpleAgent(Agent):
 
     def add_tool(self, tool, auto_expand: bool = True) -> None:
         """
-        添加工具到Agent（便利方法）
+        Add a tool to the Agent (convenience method)
 
         Args:
-            tool: Tool对象
-            auto_expand: 是否自动展开可展开的工具（默认True）
+            tool: Tool object
+            auto_expand: Whether to automatically expand expandable tools (default is True)
 
-        如果工具是可展开的（expandable=True），会自动展开为多个独立工具
+        If the tool is expandable (expandable=True), it will automatically expand into multiple independent tools.
         """
         if not self.tool_registry:
             from ..tools.registry import ToolRegistry
             self.tool_registry = ToolRegistry()
             self.enable_tool_calling = True
 
-        # 直接使用 ToolRegistry 的 register_tool 方法
-        # ToolRegistry 会自动处理工具展开
+        # Use ToolRegistry's register_tool method directly
+        # ToolRegistry will automatically handle tool expansion
         self.tool_registry.register_tool(tool, auto_expand=auto_expand)
 
     def remove_tool(self, tool_name: str) -> bool:
-        """移除工具（便利方法）"""
+        """Remove a tool (convenience method)"""
         if self.tool_registry:
             return self.tool_registry.unregister_tool(tool_name)
         return False
 
     def list_tools(self) -> list:
-        """列出所有可用工具"""
+        """List all available tools"""
         if self.tool_registry:
             return self.tool_registry.list_tools()
         return []
 
     def has_tools(self) -> bool:
-        """检查是否有可用工具"""
+        """Check if there are available tools"""
         return self.enable_tool_calling and self.tool_registry is not None
 
     def stream_run(self, input_text: str, **kwargs) -> Iterator[str]:
         """
-        流式运行Agent
+        Run the Agent in streaming mode
         
         Args:
-            input_text: 用户输入
-            **kwargs: 其他参数
+            input_text: User input
+            **kwargs: Additional parameters
             
         Yields:
-            Agent响应片段
+            Agent response chunks
         """
-        # 构建消息列表
+        # Build the message list
         messages = []
         
         if self.system_prompt:
@@ -350,13 +348,13 @@ class SimpleAgent(Agent):
         
         messages.append({"role": "user", "content": input_text})
         
-        # 流式调用LLM
+        # Stream call to LLM
         full_response = ""
         for chunk in self.llm.stream_invoke(messages, **kwargs):
             full_response += chunk
             yield chunk
         
-        # 保存完整对话到历史记录
+        # Save the complete conversation to history
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(full_response, "assistant"))
 
@@ -369,21 +367,21 @@ class SimpleAgent(Agent):
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """
-        SimpleAgent 真正的流式执行
+        True streaming execution of SimpleAgent
 
-        实时返回 LLM 输出的每个文本块
+        Returns each text chunk of the LLM output in real-time
 
         Args:
-            input_text: 用户输入
-            on_start: 开始钩子
-            on_finish: 完成钩子
-            on_error: 错误钩子
-            **kwargs: 其他参数
+            input_text: User input
+            on_start: Start hook
+            on_finish: Finish hook
+            on_error: Error hook
+            **kwargs: Additional parameters
 
         Yields:
-            StreamEvent: 流式事件
+            StreamEvent: Streaming events
         """
-        # 发送开始事件
+        # Send start event
         yield StreamEvent.create(
             StreamEventType.AGENT_START,
             self.name,
@@ -391,7 +389,7 @@ class SimpleAgent(Agent):
         )
 
         try:
-            # 构建消息列表
+            # Build the message list
             messages = []
 
             if self.system_prompt:
@@ -402,31 +400,31 @@ class SimpleAgent(Agent):
 
             messages.append({"role": "user", "content": input_text})
 
-            # LLM 流式调用
+            # LLM stream call
             full_response = ""
             async for chunk in self.llm.astream_invoke(messages, **kwargs):
                 full_response += chunk
 
-                # 发送 LLM 输出块
+                # Send LLM output chunk
                 yield StreamEvent.create(
                     StreamEventType.LLM_CHUNK,
                     self.name,
                     chunk=chunk
                 )
 
-            # 发送完成事件
+            # Send finish event
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
                 result=full_response
             )
 
-            # 保存到历史
+            # Save to history
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(full_response, "assistant"))
 
         except Exception as e:
-            # 发送错误事件
+            # Send error event
             yield StreamEvent.create(
                 StreamEventType.ERROR,
                 self.name,

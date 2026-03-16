@@ -1,10 +1,10 @@
-"""ObservationTruncator - 工具输出截断器
+"""ObservationTruncator - Tool Output Truncator
 
-职责：
-- 统一截断工具输出（避免每个工具自己实现）
-- 支持多种截断方向（head/tail/head_tail）
-- 返回 ToolResponse.partial() 状态
-- 保存完整输出到文件
+Responsibilities:
+- Unify tool output truncation (avoiding each tool implementing it individually)
+- Support multiple truncation directions (head/tail/head_tail)
+- Return ToolResponse.partial() status
+- Save full output to file
 """
 
 import os
@@ -16,14 +16,14 @@ from pathlib import Path
 
 
 class ObservationTruncator:
-    """工具输出截断器
+    """Tool Output Truncator
     
-    特性：
-    - 多方向截断（head/tail/head_tail）
-    - 自动保存完整输出
-    - 返回标准 ToolResponse.partial() 响应
+    Features:
+    - Multi-directional truncation (head/tail/head_tail)
+    - Automatically save full output
+    - Return standard ToolResponse.partial() response
     
-    用法示例：
+    Usage Example:
     ```python
     truncator = ObservationTruncator(
         max_lines=2000,
@@ -31,18 +31,18 @@ class ObservationTruncator:
         truncate_direction="head"
     )
     
-    # 截断工具输出
+    # Truncate tool output
     result = truncator.truncate(
         tool_name="search",
         output=long_output,
         metadata={"query": "test"}
     )
     
-    # result 是一个字典，包含：
+    # result is a dictionary containing:
     # - truncated: bool
-    # - preview: str (截断后的预览)
-    # - full_output_path: str (完整输出路径)
-    # - stats: dict (统计信息)
+    # - preview: str (truncated preview)
+    # - full_output_path: str (full output path)
+    # - stats: dict (statistics)
     ```
     """
     
@@ -53,20 +53,20 @@ class ObservationTruncator:
         truncate_direction: str = "head",
         output_dir: str = "memory/tool-output"
     ):
-        """初始化截断器
+        """Initialize the truncator
         
         Args:
-            max_lines: 最大保留行数
-            max_bytes: 最大保留字节数
-            truncate_direction: 截断方向 (head/tail/head_tail)
-            output_dir: 完整输出保存目录
+            max_lines: Maximum number of lines to keep
+            max_bytes: Maximum number of bytes to keep
+            truncate_direction: Truncation direction (head/tail/head_tail)
+            output_dir: Directory to save the full output
         """
         self.max_lines = max_lines
         self.max_bytes = max_bytes
         self.truncate_direction = truncate_direction
         self.output_dir = output_dir
         
-        # 确保输出目录存在
+        # Ensure the output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
     
     def truncate(
@@ -75,27 +75,27 @@ class ObservationTruncator:
         output: str,
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """截断工具输出
+        """Truncate tool output
         
         Args:
-            tool_name: 工具名称
-            output: 原始输出
-            metadata: 元数据（可选）
+            tool_name: Tool name
+            output: Original output
+            metadata: Metadata (optional)
         
         Returns:
-            截断结果字典，包含：
-            - truncated: bool - 是否被截断
-            - preview: str - 预览内容
-            - full_output_path: str - 完整输出路径（如果被截断）
-            - stats: dict - 统计信息
+            Truncation result dictionary, containing:
+            - truncated: bool - Whether it was truncated
+            - preview: str - Preview content
+            - full_output_path: str - Full output path (if truncated)
+            - stats: dict - Statistics
         """
         start = time.time()
         lines = output.splitlines()
         bytes_size = len(output.encode('utf-8'))
         
-        # 检查是否需要截断
+        # Check if truncation is needed
         if len(lines) <= self.max_lines and bytes_size <= self.max_bytes:
-            # 无需截断
+            # No truncation needed
             return {
                 "truncated": False,
                 "preview": output,
@@ -107,12 +107,12 @@ class ObservationTruncator:
                 }
             }
         
-        # 需要截断
+        # Truncation needed
         truncated_lines = self._truncate_lines(lines)
         preview = "\n".join(truncated_lines)
         truncated_bytes = len(preview.encode('utf-8'))
         
-        # 保存完整输出
+        # Save full output
         output_path = self._save_full_output(tool_name, output, metadata)
         
         return {
@@ -130,13 +130,13 @@ class ObservationTruncator:
         }
     
     def _truncate_lines(self, lines: list) -> list:
-        """根据方向截断行
+        """Truncate lines based on direction
         
         Args:
-            lines: 原始行列表
+            lines: Original list of lines
         
         Returns:
-            截断后的行列表
+            Truncated list of lines
         """
         if self.truncate_direction == "head":
             return lines[:self.max_lines]
@@ -144,9 +144,9 @@ class ObservationTruncator:
             return lines[-self.max_lines:]
         elif self.truncate_direction == "head_tail":
             half = self.max_lines // 2
-            return lines[:half] + ["...(中间省略)..."] + lines[-half:]
+            return lines[:half] + ["...(middle omitted)..."] + lines[-half:]
         else:
-            # 默认 head
+            # Default to head
             return lines[:self.max_lines]
     
     def _save_full_output(
@@ -155,15 +155,15 @@ class ObservationTruncator:
         output: str,
         metadata: Optional[Dict[str, Any]] = None
     ) -> str:
-        """保存完整输出到文件
+        """Save full output to a file
         
         Args:
-            tool_name: 工具名称
-            output: 完整输出
-            metadata: 元数据
+            tool_name: Tool name
+            output: Full output
+            metadata: Metadata
         
         Returns:
-            保存的文件路径
+            Saved file path
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"tool_{timestamp}_{tool_name}.json"
@@ -180,4 +180,3 @@ class ObservationTruncator:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         return filepath
-

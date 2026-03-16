@@ -1,9 +1,9 @@
-"""Skills 加载器
+"""Skills Loader
 
-实现渐进式披露机制：
-- Layer 1: Metadata（启动时加载，~100 tokens/skill）
-- Layer 2: SKILL.md body（按需加载，~2000+ tokens）
-- Layer 3: Resources（可选，按需）
+Implements a progressive disclosure mechanism:
+- Layer 1: Metadata (loaded at startup, ~100 tokens/skill)
+- Layer 2: SKILL.md body (loaded on demand, ~2000+ tokens)
+- Layer 3: Resources (optional, on demand)
 """
 
 from pathlib import Path
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Skill:
-    """技能数据类"""
+    """Skill data class"""
     name: str
     description: str
     body: str
@@ -24,7 +24,7 @@ class Skill:
 
     @property
     def scripts(self) -> List[Path]:
-        """获取 scripts/ 目录下的所有文件"""
+        """Get all files under the scripts/ directory"""
         scripts_dir = self.dir / "scripts"
         if not scripts_dir.exists():
             return []
@@ -32,7 +32,7 @@ class Skill:
 
     @property
     def examples(self) -> List[Path]:
-        """获取 examples/ 目录下的所有文件"""
+        """Get all files under the examples/ directory"""
         examples_dir = self.dir / "examples"
         if not examples_dir.exists():
             return []
@@ -40,7 +40,7 @@ class Skill:
 
     @property
     def references(self) -> List[Path]:
-        """获取 references/ 目录下的所有文件"""
+        """Get all files under the references/ directory"""
         references_dir = self.dir / "references"
         if not references_dir.exists():
             return []
@@ -49,43 +49,43 @@ class Skill:
 
 class SkillLoader:
     """
-    技能加载器
+    Skill Loader
 
-    特性：
-    - 启动时仅加载元数据
-    - 按需加载完整技能
-    - 扫描 skills/ 目录
-    - 支持热重载
+    Features:
+    - Only load metadata at startup
+    - Load full skill on demand
+    - Scan skills/ directory
+    - Support hot reload
 
-    使用示例：
+    Usage Example:
         >>> loader = SkillLoader(skills_dir=Path("skills"))
-        >>> # 获取所有技能描述
+        >>> # Get all skill descriptions
         >>> descriptions = loader.get_descriptions()
-        >>> # 按需加载完整技能
+        >>> # Load full skill on demand
         >>> skill = loader.get_skill("pdf")
         >>> print(skill.body)
     """
 
     def __init__(self, skills_dir: Path):
-        """初始化技能加载器
+        """Initialize the skill loader
 
         Args:
-            skills_dir: 技能目录路径
+            skills_dir: Path to the skills directory
         """
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
 
-        # 完整技能缓存
+        # Full skill cache
         self.skills_cache: Dict[str, Skill] = {}
 
-        # 仅元数据缓存（启动时加载）
+        # Metadata only cache (loaded at startup)
         self.metadata_cache: Dict[str, Dict] = {}
 
-        # 启动时扫描并加载元数据
+        # Scan and load metadata at startup
         self._scan_skills()
 
     def _scan_skills(self):
-        """扫描 skills/ 目录，加载元数据"""
+        """Scan the skills/ directory and load metadata"""
         for skill_dir in self.skills_dir.iterdir():
             if not skill_dir.is_dir():
                 continue
@@ -94,7 +94,7 @@ class SkillLoader:
             if not skill_md.exists():
                 continue
 
-            # 只读取 frontmatter（元数据）
+            # Only read frontmatter (metadata)
             metadata = self._parse_frontmatter_only(skill_md)
             if not metadata:
                 continue
@@ -108,20 +108,20 @@ class SkillLoader:
             }
 
     def _parse_frontmatter_only(self, path: Path) -> Optional[Dict]:
-        """仅解析 YAML frontmatter
+        """Only parse YAML frontmatter
 
         Args:
-            path: SKILL.md 文件路径
+            path: Path to the SKILL.md file
 
         Returns:
-            解析后的元数据字典，如果解析失败则返回 None
+            Parsed metadata dictionary, or None if parsing fails
         """
         try:
             content = path.read_text(encoding='utf-8')
         except Exception:
             return None
 
-        # 匹配 --- 分隔符之间的内容
+        # Match content between --- separators
         match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
 
         if not match:
@@ -129,26 +129,26 @@ class SkillLoader:
 
         yaml_str = match.group(1)
 
-        # 解析 YAML
+        # Parse YAML
         try:
             metadata = yaml.safe_load(yaml_str) or {}
         except yaml.YAMLError:
             return None
 
-        # 验证必需字段
+        # Validate required fields
         if "name" not in metadata or "description" not in metadata:
             return None
 
         return metadata
 
     def get_descriptions(self) -> str:
-        """获取所有技能的元数据描述（用于系统提示词）
+        """Get metadata descriptions of all skills (used for system prompts)
 
         Returns:
-            格式化的技能描述列表
+            Formatted list of skill descriptions
         """
         if not self.metadata_cache:
-            return "（暂无可用技能）"
+            return "(No skills available)"
 
         return "\n".join(
             f"- {name}: {skill['description']}"
@@ -157,31 +157,31 @@ class SkillLoader:
 
     def get_skill(self, name: str) -> Optional[Skill]:
         """
-        按需加载完整技能
+        Load full skill on demand
 
         Args:
-            name: 技能名称
+            name: Skill name
 
         Returns:
-            Skill 对象，如果不存在则返回 None
+            Skill object, or None if it does not exist
         """
-        # 检查缓存
+        # Check cache
         if name in self.skills_cache:
             return self.skills_cache[name]
 
-        # 检查元数据
+        # Check metadata
         if name not in self.metadata_cache:
             return None
 
         metadata = self.metadata_cache[name]
 
-        # 读取完整内容
+        # Read full content
         try:
             content = metadata["path"].read_text(encoding='utf-8')
         except Exception:
             return None
 
-        # 提取 frontmatter 和 body
+        # Extract frontmatter and body
         match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)$', content, re.DOTALL)
 
         if not match:
@@ -189,13 +189,13 @@ class SkillLoader:
 
         frontmatter, body = match.groups()
 
-        # 解析 frontmatter（验证一致性）
+        # Parse frontmatter (validate consistency)
         try:
             parsed_metadata = yaml.safe_load(frontmatter) or {}
         except yaml.YAMLError:
             return None
 
-        # 创建 Skill 对象
+        # Create Skill object
         skill = Skill(
             name=parsed_metadata.get("name", name),
             description=parsed_metadata.get("description", ""),
@@ -204,22 +204,21 @@ class SkillLoader:
             dir=metadata["dir"]
         )
 
-        # 缓存
+        # Cache
         self.skills_cache[name] = skill
 
         return skill
 
     def list_skills(self) -> List[str]:
-        """列出所有可用技能
+        """List all available skills
 
         Returns:
-            技能名称列表
+            List of skill names
         """
         return list(self.metadata_cache.keys())
 
     def reload(self):
-        """重新扫描技能目录（热重载）"""
+        """Rescan the skills directory (hot reload)"""
         self.skills_cache.clear()
         self.metadata_cache.clear()
         self._scan_skills()
-

@@ -1,6 +1,6 @@
-"""工具过滤器
+"""Tool Filter
 
-用于子代理机制，控制不同类型的 Agent 可以访问哪些工具。
+Used for the sub-agent mechanism to control which tools different types of Agents can access.
 """
 
 from abc import ABC, abstractmethod
@@ -8,46 +8,46 @@ from typing import List, Set, Optional
 
 
 class ToolFilter(ABC):
-    """工具过滤器基类
+    """Tool Filter Base Class
     
-    用于在子代理运行时限制可用工具集合。
+    Used to restrict the set of available tools when a sub-agent is running.
     """
     
     @abstractmethod
     def filter(self, all_tools: List[str]) -> List[str]:
-        """过滤工具列表
+        """Filter the list of tools
         
         Args:
-            all_tools: 所有可用工具名称列表
+            all_tools: List of all available tool names
             
         Returns:
-            过滤后的工具名称列表
+            Filtered list of tool names
         """
         pass
     
     @abstractmethod
     def is_allowed(self, tool_name: str) -> bool:
-        """检查单个工具是否允许
+        """Check if a single tool is allowed
         
         Args:
-            tool_name: 工具名称
+            tool_name: Tool name
             
         Returns:
-            是否允许使用该工具
+            Whether the tool is allowed to be used
         """
         pass
 
 
 class ReadOnlyFilter(ToolFilter):
-    """只读工具过滤器
+    """Read-Only Tool Filter
     
-    只允许使用只读工具，适用于：
-    - explore（探索代码库）
-    - plan（规划任务）
-    - summary（归纳信息）
+    Only allows the use of read-only tools, suitable for:
+    - explore (exploring the codebase)
+    - plan (planning tasks)
+    - summary (summarizing information)
     """
     
-    # 只读工具白名单
+    # Read-only tool whitelist
     READONLY_TOOLS: Set[str] = {
         "Read", "ReadTool",
         "LS", "LSTool",
@@ -57,32 +57,32 @@ class ReadOnlyFilter(ToolFilter):
     }
     
     def __init__(self, additional_allowed: Optional[List[str]] = None):
-        """初始化只读过滤器
+        """Initialize the read-only filter
         
         Args:
-            additional_allowed: 额外允许的工具名称列表
+            additional_allowed: List of additionally allowed tool names
         """
         self.allowed_tools = self.READONLY_TOOLS.copy()
         if additional_allowed:
             self.allowed_tools.update(additional_allowed)
     
     def filter(self, all_tools: List[str]) -> List[str]:
-        """只保留只读工具"""
+        """Keep only read-only tools"""
         return [tool for tool in all_tools if self.is_allowed(tool)]
     
     def is_allowed(self, tool_name: str) -> bool:
-        """检查是否为只读工具"""
+        """Check if it is a read-only tool"""
         return tool_name in self.allowed_tools
 
 
 class FullAccessFilter(ToolFilter):
-    """完全访问过滤器
+    """Full Access Filter
     
-    允许使用所有工具（除了明确禁止的危险工具），适用于：
-    - code（代码实现）
+    Allows the use of all tools (except explicitly denied dangerous tools), suitable for:
+    - code (code implementation)
     """
     
-    # 危险工具黑名单
+    # Dangerous tool blacklist
     DENIED_TOOLS: Set[str] = {
         "Bash", "BashTool",
         "Terminal", "TerminalTool",
@@ -90,28 +90,28 @@ class FullAccessFilter(ToolFilter):
     }
     
     def __init__(self, additional_denied: Optional[List[str]] = None):
-        """初始化完全访问过滤器
+        """Initialize the full access filter
         
         Args:
-            additional_denied: 额外禁止的工具名称列表
+            additional_denied: List of additionally denied tool names
         """
         self.denied_tools = self.DENIED_TOOLS.copy()
         if additional_denied:
             self.denied_tools.update(additional_denied)
     
     def filter(self, all_tools: List[str]) -> List[str]:
-        """排除危险工具"""
+        """Exclude dangerous tools"""
         return [tool for tool in all_tools if self.is_allowed(tool)]
     
     def is_allowed(self, tool_name: str) -> bool:
-        """检查是否允许（不在黑名单中）"""
+        """Check if allowed (not in the blacklist)"""
         return tool_name not in self.denied_tools
 
 
 class CustomFilter(ToolFilter):
-    """自定义工具过滤器
+    """Custom Tool Filter
     
-    用户可以明确指定允许或禁止的工具列表。
+    Users can explicitly specify a list of allowed or denied tools.
     """
     
     def __init__(
@@ -120,12 +120,12 @@ class CustomFilter(ToolFilter):
         denied: Optional[List[str]] = None,
         mode: str = "whitelist"
     ):
-        """初始化自定义过滤器
+        """Initialize the custom filter
         
         Args:
-            allowed: 允许的工具名称列表（白名单模式）
-            denied: 禁止的工具名称列表（黑名单模式）
-            mode: 过滤模式，"whitelist"（白名单）或 "blacklist"（黑名单）
+            allowed: List of allowed tool names (whitelist mode)
+            denied: List of denied tool names (blacklist mode)
+            mode: Filter mode, "whitelist" or "blacklist"
         """
         self.allowed = set(allowed) if allowed else set()
         self.denied = set(denied) if denied else set()
@@ -135,13 +135,12 @@ class CustomFilter(ToolFilter):
             raise ValueError(f"Invalid mode: {mode}. Must be 'whitelist' or 'blacklist'")
     
     def filter(self, all_tools: List[str]) -> List[str]:
-        """根据模式过滤工具"""
+        """Filter tools based on the mode"""
         return [tool for tool in all_tools if self.is_allowed(tool)]
     
     def is_allowed(self, tool_name: str) -> bool:
-        """检查是否允许"""
+        """Check if allowed"""
         if self.mode == "whitelist":
             return tool_name in self.allowed
         else:  # blacklist
             return tool_name not in self.denied
-

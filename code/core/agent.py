@@ -341,11 +341,11 @@ class Agent(ABC):
         """压缩历史
 
         默认使用简单摘要策略
-        如果启用 enable_smart_compression，子类可以重写此方法调用 LLM 生成智能摘要
+        如果启用 compact_enabled，子类可以重写此方法调用 LLM 生成智能摘要
         """
         history = self.history_manager.get_history()
 
-        if self.config.enable_smart_compression:
+        if self.config.compact_enabled:
             # 智能摘要（需要子类实现）
             summary = self._generate_smart_summary(history)
         else:
@@ -423,17 +423,15 @@ class Agent(ABC):
 
 请用简洁的中文输出，每部分不超过 3 行。"""
 
-        # 3. 调用轻量 LLM（节省成本）
+        # 3. 调用主 LLM 生成摘要
         try:
-            summary_llm = self._get_summary_llm()
-
             messages = [
                 {"role": "system", "content": "你是一个专业的对话摘要助手，擅长提取关键信息。"},
                 {"role": "user", "content": summary_prompt}
             ]
 
             # 非流式调用，快速获取结果
-            summary = summary_llm.invoke(
+            summary = self.llm.invoke(
                 messages,
                 temperature=self.config.summary_temperature,
                 max_tokens=self.config.summary_max_tokens
@@ -468,28 +466,14 @@ class Agent(ABC):
         return "\n\n".join(formatted_lines)
 
     def _get_summary_llm(self):
-        """获取摘要专用 LLM（轻量模型）
+        """获取摘要用 LLM
 
-        使用独立的轻量 LLM 实例，节省成本
+        直接复用主 Agent LLM，避免额外的外部 API 依赖。
 
         Returns:
             HelloAgentsLLM 实例
         """
-        if not hasattr(self, '_summary_llm'):
-            from ..core.llm import HelloAgentsLLM
-
-            # 使用配置中的轻量模型
-            provider = self.config.summary_llm_provider
-            model = self.config.summary_llm_model
-
-            self._summary_llm = HelloAgentsLLM(
-                provider=provider,
-                model=model,
-                temperature=self.config.summary_temperature,
-                max_tokens=self.config.summary_max_tokens
-            )
-
-        return self._summary_llm
+        return self.llm
 
     def __str__(self) -> str:
         return f"Agent(name={self.name}, model={self.llm.model})"

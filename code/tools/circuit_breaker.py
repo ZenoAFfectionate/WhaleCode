@@ -1,22 +1,22 @@
-"""熔断器机制 - 防止工具连续失败导致的死循环"""
+"""Circuit Breaker Mechanism - Prevents infinite loops caused by continuous tool failures"""
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from collections import defaultdict
 from .response import ToolResponse, ToolStatus
 
 
 class CircuitBreaker:
     """
-    工具熔断器
+    Tool Circuit Breaker
 
-    特性：
-    - 连续失败自动禁用工具
-    - 超时自动恢复
-    - 基于 ToolResponse 协议判断错误
+    Features:
+    - Automatically disables tools upon continuous failures
+    - Automatically recovers after timeout
+    - Judges errors based on the ToolResponse protocol
 
-    状态机：
-    Closed (正常) → Open (熔断) → Closed (恢复)
+    State Machine:
+    Closed (Normal) → Open (Tripped) → Closed (Recovered)
     """
 
     def __init__(
@@ -26,45 +26,45 @@ class CircuitBreaker:
         enabled: bool = True
     ):
         """
-        初始化熔断器
+        Initialize the circuit breaker
 
         Args:
-            failure_threshold: 连续失败多少次后熔断（默认 3）
-            recovery_timeout: 熔断后恢复时间（秒，默认 300）
-            enabled: 是否启用熔断器（默认 True）
+            failure_threshold: Number of consecutive failures before tripping (default 3)
+            recovery_timeout: Recovery time in seconds after tripping (default 300)
+            enabled: Whether to enable the circuit breaker (default True)
         """
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.enabled = enabled
 
-        # 失败计数（每个工具）
+        # Failure counts (per tool)
         self.failure_counts: Dict[str, int] = defaultdict(int)
 
-        # 熔断开启时间
+        # Timestamps when the circuit was opened (tripped)
         self.open_timestamps: Dict[str, float] = {}
 
     def is_open(self, tool_name: str) -> bool:
         """
-        检查工具是否被熔断
+        Check if the tool's circuit breaker is open (tripped)
 
         Args:
-            tool_name: 工具名称
+            tool_name: Tool name
 
         Returns:
-            True: 工具被禁用
-            False: 工具可用
+            True: Tool is disabled
+            False: Tool is available
         """
         if not self.enabled:
             return False
 
-        # 检查是否在熔断列表
+        # Check if it is in the tripped list
         if tool_name not in self.open_timestamps:
             return False
 
-        # 检查是否可以恢复
+        # Check if it can be recovered
         open_time = self.open_timestamps[tool_name]
         if time.time() - open_time > self.recovery_timeout:
-            # 自动恢复
+            # Automatic recovery
             self.close(tool_name)
             return False
 
@@ -72,16 +72,16 @@ class CircuitBreaker:
 
     def record_result(self, tool_name: str, response: ToolResponse):
         """
-        记录工具执行结果
+        Record the tool execution result
 
         Args:
-            tool_name: 工具名称
-            response: 工具响应对象
+            tool_name: Tool name
+            response: Tool response object
         """
         if not self.enabled:
             return
 
-        # 判断是否是错误
+        # Check if it is an error
         is_error = response.status == ToolStatus.ERROR
 
         if is_error:
@@ -90,47 +90,47 @@ class CircuitBreaker:
             self._on_success(tool_name)
 
     def _on_failure(self, tool_name: str):
-        """处理失败"""
-        # 增加失败计数
+        """Handle failure"""
+        # Increment failure count
         self.failure_counts[tool_name] += 1
 
-        # 检查是否达到阈值
+        # Check if the threshold is reached
         if self.failure_counts[tool_name] >= self.failure_threshold:
             self.open_timestamps[tool_name] = time.time()
-            print(f"🔴 Circuit Breaker: 工具 '{tool_name}' 已熔断（连续 {self.failure_counts[tool_name]} 次失败）")
+            print(f"🔴 Circuit Breaker: Tool '{tool_name}' tripped ({self.failure_counts[tool_name]} consecutive failures)")
 
     def _on_success(self, tool_name: str):
-        """处理成功"""
-        # 重置失败计数
+        """Handle success"""
+        # Reset failure count
         self.failure_counts[tool_name] = 0
 
     def open(self, tool_name: str):
-        """手动开启熔断"""
+        """Manually trip the circuit breaker"""
         if not self.enabled:
             return
 
         self.open_timestamps[tool_name] = time.time()
-        print(f"🔴 Circuit Breaker: 工具 '{tool_name}' 已手动熔断")
+        print(f"🔴 Circuit Breaker: Tool '{tool_name}' manually tripped")
 
     def close(self, tool_name: str):
-        """关闭熔断，恢复工具"""
+        """Close the circuit breaker, recovering the tool"""
         self.failure_counts[tool_name] = 0
         self.open_timestamps.pop(tool_name, None)
-        print(f"🟢 Circuit Breaker: 工具 '{tool_name}' 已恢复")
+        print(f"🟢 Circuit Breaker: Tool '{tool_name}' recovered")
 
     def get_status(self, tool_name: str) -> Dict[str, Any]:
         """
-        获取工具的熔断状态
+        Get the circuit breaker status of a tool
 
         Args:
-            tool_name: 工具名称
+            tool_name: Tool name
 
         Returns:
-            状态字典，包含：
+            Status dictionary containing:
             - state: "open" | "closed"
-            - failure_count: 失败次数
-            - open_since: 熔断开始时间（仅 open 状态）
-            - recover_in_seconds: 恢复倒计时（仅 open 状态）
+            - failure_count: Number of failures
+            - open_since: Time when tripped (only for open state)
+            - recover_in_seconds: Countdown to recovery (only for open state)
         """
         is_open = tool_name in self.open_timestamps
 
@@ -153,16 +153,15 @@ class CircuitBreaker:
 
     def get_all_status(self) -> Dict[str, Dict]:
         """
-        获取所有工具的熔断状态
+        Get the circuit breaker status of all tools
 
         Returns:
-            工具名称 -> 状态字典
+            Tool name -> Status dictionary
         """
-        # 收集所有已知的工具名
+        # Collect all known tool names
         all_tools = set(self.failure_counts.keys()) | set(self.open_timestamps.keys())
 
         return {
             tool_name: self.get_status(tool_name)
             for tool_name in all_tools
         }
-

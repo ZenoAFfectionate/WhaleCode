@@ -1,4 +1,4 @@
-"""工具注册表 - HelloAgents原生工具系统"""
+"""Tool Registry - HelloAgents Native Tool System"""
 
 from typing import Optional, Any, Callable, Dict
 import time
@@ -7,14 +7,15 @@ from .response import ToolResponse, ToolStatus
 from .errors import ToolErrorCode
 from .circuit_breaker import CircuitBreaker
 
+
 class ToolRegistry:
     """
-    HelloAgents工具注册表
+    HelloAgents Tool Registry
 
-    提供工具的注册、管理和执行功能。
-    支持两种工具注册方式：
-    1. Tool对象注册（推荐）
-    2. 函数直接注册（简便）
+    Provides tool registration, management, and execution functionalities.
+    Supports two tool registration methods:
+    1. Tool object registration (Recommended)
+    2. Direct function registration (Simple)
     """
 
     def __init__(self, circuit_breaker: Optional[CircuitBreaker] = None, verbose: bool = True):
@@ -22,10 +23,10 @@ class ToolRegistry:
         self._functions: dict[str, dict[str, Any]] = {}
         self.verbose = verbose
 
-        # 文件元数据缓存（用于乐观锁机制）
+        # File metadata cache (used for optimistic locking mechanism)
         self.read_metadata_cache: Dict[str, Dict[str, Any]] = {}
 
-        # 熔断器（默认启用）
+        # Circuit breaker (enabled by default)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
 
     def _emit(self, message: str) -> None:
@@ -34,30 +35,30 @@ class ToolRegistry:
 
     def register_tool(self, tool: Tool, auto_expand: bool = True):
         """
-        注册Tool对象
+        Register a Tool object
 
         Args:
-            tool: Tool实例
-            auto_expand: 是否自动展开可展开的工具（默认True）
+            tool: Tool instance
+            auto_expand: Whether to automatically expand expandable tools (default is True)
         """
-        # 检查工具是否可展开
+        # Check if the tool is expandable
         if auto_expand and hasattr(tool, 'expandable') and tool.expandable:
             expanded_tools = tool.get_expanded_tools()
             if expanded_tools:
-                # 注册所有展开的子工具
+                # Register all expanded sub-tools
                 for sub_tool in expanded_tools:
                     if sub_tool.name in self._tools:
-                        self._emit(f"⚠️ 警告：工具 '{sub_tool.name}' 已存在，将被覆盖。")
+                        self._emit(f"⚠️ Warning: Tool '{sub_tool.name}' already exists and will be overwritten.")
                     self._tools[sub_tool.name] = sub_tool
-                self._emit(f"✅ 工具 '{tool.name}' 已展开为 {len(expanded_tools)} 个独立工具")
+                self._emit(f"✅ Tool '{tool.name}' has been expanded into {len(expanded_tools)} independent tools.")
                 return
 
-        # 普通工具或不展开的工具
+        # Normal tool or non-expanded tool
         if tool.name in self._tools:
-            self._emit(f"⚠️ 警告：工具 '{tool.name}' 已存在，将被覆盖。")
+            self._emit(f"⚠️ Warning: Tool '{tool.name}' already exists and will be overwritten.")
 
         self._tools[tool.name] = tool
-        self._emit(f"✅ 工具 '{tool.name}' 已注册。")
+        self._emit(f"✅ Tool '{tool.name}' has been registered.")
 
     def register_function(
         self,
@@ -66,127 +67,127 @@ class ToolRegistry:
         description: Optional[str] = None
     ):
         """
-        直接注册函数作为工具（简便方式）
+        Directly register a function as a tool (simple method)
 
-        支持两种调用方式：
-        1. 传统方式：register_function(name, description, func)
-        2. 新方式：register_function(func, name=None, description=None)
-           - 自动从函数名和 docstring 提取信息
+        Supports two calling methods:
+        1. Traditional method: register_function(name, description, func)
+        2. New method: register_function(func, name=None, description=None)
+           - Automatically extracts info from function name and docstring
 
         Args:
-            func: 工具函数
-            name: 工具名称（可选，默认使用函数名）
-            description: 工具描述（可选，默认使用函数 docstring）
+            func: Tool function
+            name: Tool name (optional, defaults to function name)
+            description: Tool description (optional, defaults to function docstring)
 
-        使用示例:
+        Usage Example:
             >>> def my_tool(input: str) -> str:
-            ...     '''这是我的工具'''
-            ...     return f"处理: {input}"
+            ...     '''This is my tool'''
+            ...     return f"Processing: {input}"
             >>> registry.register_function(my_tool)
-            >>> # 或者指定名称和描述
-            >>> registry.register_function(my_tool, name="custom_name", description="自定义描述")
+            >>> # Or specify name and description
+            >>> registry.register_function(my_tool, name="custom_name", description="Custom description")
         """
-        # 兼容旧的调用方式：register_function(name, description, func)
+        # Compatible with old calling method: register_function(name, description, func)
         if isinstance(func, str) and callable(description):
-            # 旧方式：第一个参数是 name，第二个是 description，第三个是 func
+            # Old method: first parameter is name, second is description, third is func
             name, description, func = func, name, description
 
-        # 自动提取名称
+        # Automatically extract name
         if name is None:
             name = func.__name__
 
-        # 自动提取描述
+        # Automatically extract description
         if description is None:
             import inspect
             doc = inspect.getdoc(func)
             if doc:
-                # 提取第一行作为描述
+                # Extract the first line as description
                 description = doc.split('\n')[0].strip()
             else:
-                description = f"执行 {name}"
+                description = f"Execute {name}"
 
         if name in self._functions:
-            self._emit(f"⚠️ 警告：工具 '{name}' 已存在，将被覆盖。")
+            self._emit(f"⚠️ Warning: Tool '{name}' already exists and will be overwritten.")
 
         self._functions[name] = {
             "description": description,
             "func": func
         }
-        self._emit(f"✅ 函数工具 '{name}' 已注册。")
+        self._emit(f"✅ Function tool '{name}' has been registered.")
 
     def unregister(self, name: str):
-        """注销工具"""
+        """Unregister tool"""
         if name in self._tools:
             del self._tools[name]
-            self._emit(f"🗑️ 工具 '{name}' 已注销。")
+            self._emit(f"🗑️ Tool '{name}' has been unregistered.")
         elif name in self._functions:
             del self._functions[name]
-            self._emit(f"🗑️ 工具 '{name}' 已注销。")
+            self._emit(f"🗑️ Tool '{name}' has been unregistered.")
         else:
-            self._emit(f"⚠️ 工具 '{name}' 不存在。")
+            self._emit(f"⚠️ Tool '{name}' does not exist.")
 
     def get_tool(self, name: str) -> Optional[Tool]:
-        """获取Tool对象"""
+        """Get Tool object"""
         return self._tools.get(name)
 
     def get_function(self, name: str) -> Optional[Callable]:
-        """获取工具函数"""
+        """Get tool function"""
         func_info = self._functions.get(name)
         return func_info["func"] if func_info else None
 
     def execute_tool(self, name: str, input_text: str) -> ToolResponse:
         """
-        执行工具，返回 ToolResponse 对象（带熔断器保护）
+        Execute tool, returning a ToolResponse object (with circuit breaker protection)
 
         Args:
-            name: 工具名称
-            input_text: 输入参数
+            name: Tool name
+            input_text: Input parameters
 
         Returns:
-            ToolResponse: 标准化的工具响应对象
+            ToolResponse: Standardized tool response object
         """
-        # 检查熔断器
+        # Check circuit breaker
         if self.circuit_breaker.is_open(name):
             status = self.circuit_breaker.get_status(name)
             return ToolResponse.error(
                 code=ToolErrorCode.CIRCUIT_OPEN,
-                message=f"工具 '{name}' 当前被禁用，由于连续失败。{status['recover_in_seconds']} 秒后可用。",
+                message=f"Tool '{name}' is currently disabled due to consecutive failures. Available in {status['recover_in_seconds']} seconds.",
                 context={
                     "tool_name": name,
                     "circuit_status": status
                 }
             )
 
-        # 执行工具
+        # Execute tool
         response = None
 
-        # 优先查找Tool对象（新协议）
+        # Prioritize finding Tool object (new protocol)
         if name in self._tools:
             tool = self._tools[name]
             try:
-                # 解析参数（支持 JSON 字符串或字典）
+                # Parse parameters (supports JSON string or dictionary)
                 import json
                 if isinstance(input_text, str):
                     try:
                         parameters = json.loads(input_text)
                     except json.JSONDecodeError:
-                        # 如果不是 JSON，作为普通字符串处理
+                        # If not JSON, treat as a normal string
                         parameters = {"input": input_text}
                 elif isinstance(input_text, dict):
                     parameters = input_text
                 else:
                     parameters = {"input": str(input_text)}
 
-                # 使用 run_with_timing 自动添加时间统计
+                # Use run_with_timing to automatically add time statistics
                 response = tool.run_with_timing(parameters)
             except Exception as e:
                 response = ToolResponse.error(
                     code=ToolErrorCode.EXECUTION_ERROR,
-                    message=f"执行工具 '{name}' 时发生异常: {str(e)}",
+                    message=f"Exception occurred while executing tool '{name}': {str(e)}",
                     context={"tool_name": name, "input": input_text}
                 )
 
-        # 查找函数工具（自动包装为新协议）
+        # Find function tool (automatically wrap to new protocol)
         elif name in self._functions:
             func = self._functions[name]["func"]
             start_time = time.time()
@@ -195,7 +196,7 @@ class ToolRegistry:
                 result = func(input_text)
                 elapsed_ms = int((time.time() - start_time) * 1000)
 
-                # 包装为 ToolResponse
+                # Wrap as ToolResponse
                 response = ToolResponse.success(
                     text=str(result),
                     data={"output": result},
@@ -206,91 +207,91 @@ class ToolRegistry:
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 response = ToolResponse.error(
                     code=ToolErrorCode.EXECUTION_ERROR,
-                    message=f"函数执行失败: {str(e)}",
+                    message=f"Function execution failed: {str(e)}",
                     stats={"time_ms": elapsed_ms},
                     context={"tool_name": name, "input": input_text}
                 )
 
-        # 工具不存在
+        # Tool does not exist
         else:
             response = ToolResponse.error(
                 code=ToolErrorCode.NOT_FOUND,
-                message=f"未找到名为 '{name}' 的工具",
+                message=f"Tool named '{name}' not found",
                 context={"tool_name": name}
             )
 
-        # 记录熔断器结果
+        # Record circuit breaker result
         self.circuit_breaker.record_result(name, response)
 
         return response
 
     def get_tools_description(self) -> str:
         """
-        获取所有可用工具的格式化描述字符串
+        Get formatted description string of all available tools
 
         Returns:
-            工具描述字符串，用于构建提示词
+            Tool description string, used for building prompts
         """
         descriptions = []
 
-        # Tool对象描述
+        # Tool object descriptions
         for tool in self._tools.values():
             descriptions.append(f"- {tool.name}: {tool.description}")
 
-        # 函数工具描述
+        # Function tool descriptions
         for name, info in self._functions.items():
             descriptions.append(f"- {name}: {info['description']}")
 
-        return "\n".join(descriptions) if descriptions else "暂无可用工具"
+        return "\n".join(descriptions) if descriptions else "No available tools at the moment"
 
     def list_tools(self) -> list[str]:
-        """列出所有工具名称"""
+        """List all tool names"""
         return list(self._tools.keys()) + list(self._functions.keys())
 
     def get_all_tools(self) -> list[Tool]:
-        """获取所有Tool对象"""
+        """Get all Tool objects"""
         return list(self._tools.values())
 
     def clear(self):
-        """清空所有工具"""
+        """Clear all tools"""
         self._tools.clear()
         self._functions.clear()
-        print("🧹 所有工具已清空。")
+        print("🧹 All tools have been cleared.")
 
-    # ==================== 乐观锁机制支持 ====================
+    # ==================== Optimistic Locking Mechanism Support ====================
 
     def cache_read_metadata(self, file_path: str, metadata: Dict[str, Any]):
-        """缓存 Read 工具获取的文件元数据
+        """Cache file metadata obtained by the Read tool
 
         Args:
-            file_path: 文件路径（相对于 project_root）
-            metadata: 文件元数据字典，包含：
-                - file_mtime_ms: 文件修改时间（毫秒时间戳）
-                - file_size_bytes: 文件大小（字节）
+            file_path: File path (relative to project_root)
+            metadata: File metadata dictionary, containing:
+                - file_mtime_ms: File modification time (millisecond timestamp)
+                - file_size_bytes: File size (bytes)
         """
         self.read_metadata_cache[file_path] = metadata
 
     def get_read_metadata(self, file_path: str) -> Optional[Dict[str, Any]]:
-        """获取缓存的文件元数据
+        """Get cached file metadata
 
         Args:
-            file_path: 文件路径
+            file_path: File path
 
         Returns:
-            文件元数据字典，如果不存在则返回 None
+            File metadata dictionary, or None if it does not exist
         """
         return self.read_metadata_cache.get(file_path)
 
     def clear_read_cache(self, file_path: Optional[str] = None):
-        """清空文件元数据缓存
+        """Clear file metadata cache
 
         Args:
-            file_path: 指定文件路径，如果为 None 则清空所有缓存
+            file_path: Specific file path, if None then clear all cache
         """
         if file_path:
             self.read_metadata_cache.pop(file_path, None)
         else:
             self.read_metadata_cache.clear()
 
-# 全局工具注册表
+# Global tool registry
 global_registry = ToolRegistry()

@@ -48,13 +48,8 @@ class BashTool(Tool):
         "poweroff",
         "halt",
     }
-    PREFER_SPECIALIZED_TOOLS: Set[str] = {"ls", "cat", "grep", "rg", "find", "head", "tail"}
-    NETWORK_COMMANDS: Set[str] = {
-        "pnpm",
-        "yarn",
-        "apt",
-        "brew",
-    }
+    PREFER_SPECIALIZED_TOOLS: Set[str] = {"ls", "grep", "rg", "find"}
+    NETWORK_COMMANDS: Set[str] = {"pnpm", "yarn", "apt", "brew"}
 
     def __init__(
         self,
@@ -227,17 +222,31 @@ class BashTool(Tool):
 
     @staticmethod
     def _extract_segment_leaders(command: str) -> List[str]:
-        """Return the leading command name of each pipeline/chain segment."""
-        segments = re.split(r"\|\||&&|[|;]", command)
+        """Return the leading command of each chain segment (ignoring piped commands).
+
+        Split by ``&&``, ``||``, ``;`` to get chain segments, then take only
+        the first command in each segment (before any ``|``).  This means:
+
+        - ``grep pattern *.py``       → ``['grep']``  (blocked)
+        - ``git log | grep fix``      → ``['git']``   (allowed)
+        - ``pytest | head -100``      → ``['pytest']`` (allowed)
+        - ``cat f.py && head f.py``   → ``['cat', 'head']`` (both blocked)
+        """
+        # Step 1: split by chain operators (&&, ||, ;) — NOT by pipe |
+        chain_segments = re.split(r"\|\||&&|;", command)
         leaders: List[str] = []
-        for segment in segments:
+        for segment in chain_segments:
             segment = segment.strip()
             if not segment:
                 continue
+            # Step 2: split by pipe | and take only the FIRST part
+            first_pipe = segment.split("|")[0].strip()
+            if not first_pipe:
+                continue
             try:
-                seg_tokens = shlex.split(segment, posix=True)
+                seg_tokens = shlex.split(first_pipe, posix=True)
             except ValueError:
-                seg_tokens = re.findall(r"[a-zA-Z0-9_./+-]+", segment)
+                seg_tokens = re.findall(r"[a-zA-Z0-9_./+-]+", first_pipe)
             if seg_tokens:
                 leaders.append(Path(seg_tokens[0]).name)
         return leaders

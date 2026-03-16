@@ -1,4 +1,4 @@
-"""Reflection Agent实现 - 自我反思与迭代优化的智能体"""
+"""Reflection Agent Implementation - An agent for self-reflection and iterative optimization"""
 
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, AsyncGenerator
 import json
@@ -16,28 +16,28 @@ if TYPE_CHECKING:
 
 class Memory:
     """
-    简单的短期记忆模块，用于存储智能体的行动与反思轨迹。
+    A simple short-term memory module for storing the agent's actions and reflection trajectory.
     """
     def __init__(self):
         self.records: List[Dict[str, Any]] = []
 
     def add_record(self, record_type: str, content: str):
-        """向记忆中添加一条新记录"""
+        """Add a new record to memory"""
         self.records.append({"type": record_type, "content": content})
-        print(f"📝 记忆已更新，新增一条 '{record_type}' 记录。")
+        print(f"📝 Memory updated, added a new '{record_type}' record.")
 
     def get_trajectory(self) -> str:
-        """将所有记忆记录格式化为一个连贯的字符串文本"""
+        """Format all memory records into a coherent string text"""
         trajectory = ""
         for record in self.records:
             if record['type'] == 'execution':
-                trajectory += f"--- 上一轮尝试 (代码) ---\n{record['content']}\n\n"
+                trajectory += f"--- Previous Attempt (Code) ---\n{record['content']}\n\n"
             elif record['type'] == 'reflection':
-                trajectory += f"--- 评审员反馈 ---\n{record['content']}\n\n"
+                trajectory += f"--- Reviewer Feedback ---\n{record['content']}\n\n"
         return trajectory.strip()
 
     def get_last_execution(self) -> str:
-        """获取最近一次的执行结果"""
+        """Get the result of the most recent execution"""
         for record in reversed(self.records):
             if record['type'] == 'execution':
                 return record['content']
@@ -45,18 +45,18 @@ class Memory:
 
 class ReflectionAgent(Agent):
     """
-    Reflection Agent - 自我反思与迭代优化的智能体
+    Reflection Agent - An agent for self-reflection and iterative optimization
 
-    这个Agent能够：
-    1. 执行初始任务
-    2. 对结果进行自我反思
-    3. 根据反思结果进行优化
-    4. 迭代改进直到满意
-    5. 支持工具调用（可选）
+    This Agent can:
+    1. Execute the initial task
+    2. Self-reflect on the results
+    3. Optimize based on the reflection
+    4. Iteratively improve until satisfactory
+    5. Support tool calling (optional)
 
-    特别适合代码生成、文档写作、分析报告等需要迭代优化的任务。
+    Particularly suitable for tasks requiring iterative optimization like code generation, document writing, analytical reports, etc.
 
-    使用标准 Function Calling 格式，通过 system_prompt 定义角色和行为。
+    Uses standard Function Calling format, defining roles and behaviors through the system_prompt.
     """
 
     def __init__(
@@ -71,28 +71,28 @@ class ReflectionAgent(Agent):
         max_tool_iterations: int = 3
     ):
         """
-        初始化ReflectionAgent
+        Initialize ReflectionAgent
 
         Args:
-            name: Agent名称
-            llm: LLM实例
-            system_prompt: 系统提示词（定义角色和反思策略）
-            config: 配置对象
-            max_iterations: 最大迭代次数
-            tool_registry: 工具注册表（可选）
-            enable_tool_calling: 是否启用工具调用
-            max_tool_iterations: 最大工具调用迭代次数
+            name: Agent name
+            llm: LLM instance
+            system_prompt: System prompt (defines role and reflection strategy)
+            config: Configuration object
+            max_iterations: Maximum number of iterations
+            tool_registry: Tool registry (optional)
+            enable_tool_calling: Whether to enable tool calling
+            max_tool_iterations: Maximum tool calling iterations
         """
-        # 默认 system_prompt
-        default_system_prompt = """你是一个具有自我反思能力的AI助手。你的工作流程是：
-1. 首先尝试完成用户的任务
-2. 然后反思你的回答，找出可能的问题或改进空间
-3. 根据反思结果优化你的回答
-4. 如果回答已经很好，在反思时回复"无需改进"
+        # Default system_prompt
+        default_system_prompt = """You are an AI assistant with self-reflection capabilities. Your workflow is:
+1. First, attempt to complete the user's task.
+2. Then, reflect on your answer to identify potential issues or room for improvement.
+3. Optimize your answer based on the reflection results.
+4. If the answer is already excellent, reply "no need for improvement" during reflection.
 
-请始终保持批判性思维，追求更高质量的输出。"""
+Please always maintain critical thinking and strive for higher quality output."""
 
-        # 传递 tool_registry 到基类
+        # Pass tool_registry to base class
         super().__init__(
             name,
             llm,
@@ -107,115 +107,115 @@ class ReflectionAgent(Agent):
 
     def run(self, input_text: str, **kwargs) -> str:
         """
-        运行Reflection Agent
+        Run the Reflection Agent
 
         Args:
-            input_text: 任务描述
-            **kwargs: 其他参数
+            input_text: Task description
+            **kwargs: Additional parameters
 
         Returns:
-            最终优化后的结果
+            The final optimized result
         """
-        print(f"\n🤖 {self.name} 开始处理任务: {input_text}")
+        print(f"\n🤖 {self.name} started processing task: {input_text}")
 
-        # 重置记忆
+        # Reset memory
         self.memory = Memory()
 
-        # 1. 初始执行
-        print("\n--- 正在进行初始尝试 ---")
+        # 1. Initial execution
+        print("\n--- Making initial attempt ---")
         initial_result = self._execute_task(input_text, **kwargs)
         self.memory.add_record("execution", initial_result)
 
-        # 2. 迭代循环：反思与优化
+        # 2. Iteration loop: reflection and optimization
         for i in range(self.max_iterations):
-            print(f"\n--- 第 {i+1}/{self.max_iterations} 轮迭代 ---")
+            print(f"\n--- Iteration {i+1}/{self.max_iterations} ---")
 
-            # a. 反思
-            print("\n-> 正在进行反思...")
+            # a. Reflection
+            print("\n-> Reflecting...")
             last_result = self.memory.get_last_execution()
             feedback = self._reflect_on_result(input_text, last_result, **kwargs)
             self.memory.add_record("reflection", feedback)
 
-            # b. 检查是否需要停止
-            if "无需改进" in feedback or "no need for improvement" in feedback.lower():
-                print("\n✅ 反思认为结果已无需改进，任务完成。")
+            # b. Check if stopping is needed
+            if "no need for improvement" in feedback.lower():
+                print("\n✅ Reflection indicates no need for improvement, task completed.")
                 break
 
-            # c. 优化
-            print("\n-> 正在进行优化...")
+            # c. Optimization
+            print("\n-> Optimizing...")
             refined_result = self._refine_result(input_text, last_result, feedback, **kwargs)
             self.memory.add_record("execution", refined_result)
 
         final_result = self.memory.get_last_execution()
-        print(f"\n--- 任务完成 ---\n最终结果:\n{final_result}")
+        print(f"\n--- Task Completed ---\nFinal Result:\n{final_result}")
 
-        # 保存到历史记录
+        # Save to history
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(final_result, "assistant"))
 
         return final_result
 
     def _execute_task(self, task: str, **kwargs) -> str:
-        """执行初始任务"""
+        """Execute the initial task"""
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"请完成以下任务：\n\n{task}"}
+            {"role": "user", "content": f"Please complete the following task:\n\n{task}"}
         ]
         return self._get_llm_response(messages, **kwargs)
 
     def _reflect_on_result(self, task: str, result: str, **kwargs) -> str:
-        """对结果进行反思"""
+        """Reflect on the result"""
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"""请仔细审查以下回答，并找出可能的问题或改进空间：
+            {"role": "user", "content": f"""Please carefully review the following answer and identify potential issues or areas for improvement:
 
-# 原始任务:
+# Original Task:
 {task}
 
-# 当前回答:
+# Current Answer:
 {result}
 
-请分析这个回答的质量，指出不足之处，并提出具体的改进建议。
-如果回答已经很好，请回答"无需改进"。"""}
+Please analyze the quality of this answer, point out shortcomings, and provide specific suggestions for improvement.
+If the answer is already excellent, please reply "no need for improvement"."""}
         ]
         return self._get_llm_response(messages, **kwargs)
 
     def _refine_result(self, task: str, last_attempt: str, feedback: str, **kwargs) -> str:
-        """根据反馈优化结果"""
+        """Optimize the result based on feedback"""
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"""请根据反馈意见改进你的回答：
+            {"role": "user", "content": f"""Please improve your answer based on the feedback:
 
-# 原始任务:
+# Original Task:
 {task}
 
-# 上一轮回答:
+# Previous Answer:
 {last_attempt}
 
-# 反馈意见:
+# Feedback:
 {feedback}
 
-请提供一个改进后的回答。"""}
+Please provide an improved answer."""}
         ]
         return self._get_llm_response(messages, **kwargs)
 
     def _get_llm_response(self, messages: List[Dict[str, str]], **kwargs) -> str:
         """
-        调用LLM并获取完整响应（支持 Function Calling）
+        Call the LLM and get the full response (supports Function Calling)
 
         Args:
-            messages: 消息列表
-            **kwargs: 其他参数
+            messages: List of messages
+            **kwargs: Additional parameters
 
         Returns:
-            LLM响应文本
+            LLM response text
         """
-        # 如果没有启用工具调用，直接返回
+        # If tool calling is not enabled, return directly
         if not self.enable_tool_calling or not self.tool_registry:
             llm_response = self.llm.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-        # 启用工具调用模式
+        # Enable tool calling mode
         tool_schemas = self._build_tool_schemas()
         current_iteration = 0
 
@@ -230,18 +230,18 @@ class ReflectionAgent(Agent):
                     **kwargs
                 )
             except Exception as e:
-                print(f"❌ LLM 调用失败: {e}")
+                print(f"❌ LLM call failed: {e}")
                 break
 
             response_message = response.choices[0].message
 
-            # 处理工具调用
+            # Process tool calls
             tool_calls = response_message.tool_calls
             if not tool_calls:
-                # 没有工具调用，返回文本响应
+                # No tool calls, return text response
                 return response_message.content or ""
 
-            # 将助手消息添加到历史
+            # Add assistant message to history
             messages.append({
                 "role": "assistant",
                 "content": response_message.content,
@@ -258,7 +258,7 @@ class ReflectionAgent(Agent):
                 ]
             })
 
-            # 执行所有工具调用
+            # Execute all tool calls
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 tool_call_id = tool_call.id
@@ -266,25 +266,25 @@ class ReflectionAgent(Agent):
                 try:
                     arguments = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
-                    print(f"❌ 工具参数解析失败: {e}")
+                    print(f"❌ Tool argument parsing failed: {e}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": f"错误：参数格式不正确 - {str(e)}"
+                        "content": f"Error: Incorrect argument format - {str(e)}"
                     })
                     continue
 
-                # 执行工具（复用基类方法）
+                # Execute tool (reuse base class method)
                 result = self._execute_tool_call(tool_name, arguments)
 
-                # 添加工具结果到消息
+                # Add tool result to messages
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": result
                 })
 
-        # 如果超过最大迭代次数，获取最后一次回答
+        # If max iterations exceeded, get the last answer
         if current_iteration >= self.max_tool_iterations:
             llm_response = self.llm.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
@@ -300,24 +300,24 @@ class ReflectionAgent(Agent):
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """
-        ReflectionAgent 真正的流式执行
+        True streaming execution of ReflectionAgent
 
-        实时返回：
-        - 初始执行阶段的 LLM 输出
-        - 反思阶段的思考过程
-        - 优化阶段的 LLM 输出
+        Returns in real-time:
+        - LLM output during the initial execution phase
+        - Thought process during the reflection phase
+        - LLM output during the optimization phase
 
         Args:
-            input_text: 用户输入
-            on_start: 开始钩子
-            on_finish: 完成钩子
-            on_error: 错误钩子
-            **kwargs: 其他参数
+            input_text: User input
+            on_start: Start hook
+            on_finish: Finish hook
+            on_error: Error hook
+            **kwargs: Additional parameters
 
         Yields:
-            StreamEvent: 流式事件
+            StreamEvent: Streaming events
         """
-        # 发送开始事件
+        # Send start event
         yield StreamEvent.create(
             StreamEventType.AGENT_START,
             self.name,
@@ -325,12 +325,12 @@ class ReflectionAgent(Agent):
         )
 
         try:
-            # 阶段 1：初始执行
+            # Phase 1: Initial execution
             yield StreamEvent.create(
                 StreamEventType.STEP_START,
                 self.name,
                 phase="initial_execution",
-                description="生成初始回答"
+                description="Generate initial answer"
             )
 
             messages = []
@@ -342,7 +342,7 @@ class ReflectionAgent(Agent):
 
             messages.append({"role": "user", "content": input_text})
 
-            # 流式获取初始回答
+            # Stream initial answer
             initial_response = ""
             async for chunk in self.llm.astream_invoke(messages, **kwargs):
                 initial_response += chunk
@@ -360,17 +360,17 @@ class ReflectionAgent(Agent):
                 result=initial_response
             )
 
-            # 阶段 2：反思与优化循环
+            # Phase 2: Reflection and optimization loop
             current_response = initial_response
 
             for iteration in range(self.max_iterations):
-                # 反思阶段
+                # Reflection phase
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
                     self.name,
                     phase="reflection",
                     iteration=iteration + 1,
-                    description=f"第 {iteration + 1} 次反思"
+                    description=f"Reflection {iteration + 1}"
                 )
 
                 reflection_prompt = self._build_reflection_prompt(input_text, current_response)
@@ -395,13 +395,13 @@ class ReflectionAgent(Agent):
                     reflection=reflection
                 )
 
-                # 优化阶段
+                # Optimization phase
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
                     self.name,
                     phase="refinement",
                     iteration=iteration + 1,
-                    description=f"第 {iteration + 1} 次优化"
+                    description=f"Optimization {iteration + 1}"
                 )
 
                 refinement_prompt = self._build_refinement_prompt(
@@ -432,7 +432,7 @@ class ReflectionAgent(Agent):
 
                 current_response = refined_response
 
-            # 发送完成事件
+            # Send finish event
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
@@ -440,12 +440,12 @@ class ReflectionAgent(Agent):
                 total_iterations=self.max_iterations
             )
 
-            # 保存到历史
+            # Save to history
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(current_response, "assistant"))
 
         except Exception as e:
-            # 发送错误事件
+            # Send error event
             yield StreamEvent.create(
                 StreamEventType.ERROR,
                 self.name,

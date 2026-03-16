@@ -18,6 +18,11 @@ Whale Code is a from-scratch implementation of an autonomous coding agent that o
   - [Persistent Task Graph (TaskTool)](#persistent-task-graph-tasktool)
   - [Lightweight Progress Tracking (TodoWrite)](#lightweight-progress-tracking-todowrite)
   - [Background Execution (BackgroundTool)](#background-execution-backgroundtool)
+- [Benchmarks](#benchmarks)
+  - [Supported Benchmarks](#supported-benchmarks)
+  - [Quick Start](#quick-start-1)
+  - [CLI Options](#cli-options)
+  - [Output Format](#output-format)
 - [License](#license)
 
 ---
@@ -344,6 +349,56 @@ Enables **non-blocking parallel execution** of long-running commands:
 3. **Task Integration** — Background tasks can be linked to persistent tasks via `task_id`. If `complete_task_on_success=True`, the background manager automatically marks the linked task as `completed` when the command exits with code 0.
 
 4. **Lifecycle Management** — `background_check` inspects status/output, `background_cancel` sends SIGTERM. Records are persisted as JSON files under `memory/background/` and survive process restarts (interrupted tasks are marked as `interrupted`).
+
+---
+
+## Benchmarks
+
+Whale Code includes a built-in benchmark suite to evaluate the coding agent on five standard datasets. All benchmarks use `CodeAgent` with its full tool set (Read, Write, Edit, Bash, Glob, Grep, etc.) — web-related tools are disabled during evaluation to ensure fair, reproducible results.
+
+**Source**: `code/benchmark/`
+
+### Supported Benchmarks
+
+| Benchmark | Dataset | Tasks | Metric | Description |
+|-----------|---------|-------|--------|-------------|
+| **HumanEval+** | `data/HEVP/` | 164 | pass@1 | Function-generation tasks with 80× more tests than original HumanEval |
+| **MBPP+** | `data/MBPP/` | 378 | pass@1 | Crowd-sourced Python programming problems |
+| **ClassEval** | `data/CLEV/` | 100 | pass@1 | Class-level code generation requiring multi-method implementation |
+| **AIME** | `data/AIME/` | — | accuracy | Math competition problems solved via agent-written Python programs |
+| **SWE-bench Verified** | `data/SWEV/` | 500 | resolve rate | Real GitHub issues requiring multi-file codebase navigation and editing |
+
+> **Note on SWE-bench**: SWE-bench uses a **two-phase evaluation**:
+> 1. **Phase 1 — Agent inference** (`run_swev.sh`): The agent reads the issue, navigates the repo, and produces a patch (git diff). Results are saved as a predictions JSONL file.
+> 2. **Phase 2 — Docker evaluation** (`run_swev_eval.sh`): The predictions are fed to the [official SWE-bench Docker harness](https://github.com/SWE-bench/SWE-bench) which applies each patch in an isolated container with the correct Python version and dependencies, then runs the test suite to grade the fix.
+
+### Quick Start
+
+> **Prerequisite**: The LLM backend must be running (e.g. vLLM, or set the API key in `.env`).
+
+```bash
+bash scripts/run_clev.sh  # run ClassEval benchmark
+bash scripts/run_hevp.sh  # run HumanEval benchmark
+bash scripts/run_mbpp.sh  # run MBPP benchmark
+bash scripts/run_aime.sh  # run AIME benchmark
+
+# run SWEV benchmark and evaluation
+bash scripts/run_swev.sh  # (Phase 1: agent inference)
+
+bash scripts/run_swev_eval.sh data/_results/swev_predictions_<timestamp>.jsonl
+```
+
+### Result
+
+> Model: **Qwen3.5-35B-A3B-FP8** (vLLM, local)
+
+| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
+|-----------|------:|-------:|----------:|---------:|------|
+| **HumanEval+** | 164 | 144 | **87.8%** | 9.1s | 2026-03-15 |
+| **MBPP+** | 378 | 341 | **90.2%** | 34.1s | 2026-03-15 |
+| **ClassEval** | 100 | 24 | 24.0% | 23.5s | 2026-03-15 |
+| **AIME** | 30 | 6 | 20.0% | 480.0s | 2026-03-15 |
+| **SWE-bench Verified** | 500 | — | — | — | — |
 
 ---
 

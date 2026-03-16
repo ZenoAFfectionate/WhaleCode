@@ -1,50 +1,50 @@
-"""工具错误码定义
+"""Tool Error Code Definitions
 
-标准化的工具错误码，用于统一错误处理和追踪。
+Standardized tool error codes for unified error handling and tracking.
 """
 
 
 class ToolErrorCode:
-    """工具错误码枚举
+    """Tool Error Code Enumeration
     
-    定义了所有工具可能返回的标准错误码，便于：
-    - Agent 层统一处理错误
-    - 熔断器机制识别失败类型
-    - 可观测性系统追踪错误
-    - 用户友好的错误提示
+    Defines standard error codes that tools may return, facilitating:
+    - Unified error handling at the Agent layer
+    - Circuit breaker mechanism identifying failure types
+    - Observability system tracking errors
+    - User-friendly error messages
     """
     
-    # 资源相关错误
-    NOT_FOUND = "NOT_FOUND"                    # 资源不存在（文件、工具等）
-    ACCESS_DENIED = "ACCESS_DENIED"            # 访问被拒绝
-    PERMISSION_DENIED = "PERMISSION_DENIED"    # 权限不足
-    IS_DIRECTORY = "IS_DIRECTORY"              # 期望文件但得到目录
-    BINARY_FILE = "BINARY_FILE"                # 二进制文件无法处理
+    # Resource-related errors
+    NOT_FOUND = "NOT_FOUND"                    # Resource does not exist (file, tool, etc.)
+    ACCESS_DENIED = "ACCESS_DENIED"            # Access denied
+    PERMISSION_DENIED = "PERMISSION_DENIED"    # Insufficient permissions
+    IS_DIRECTORY = "IS_DIRECTORY"              # Expected file but got directory
+    BINARY_FILE = "BINARY_FILE"                # Binary file cannot be processed
     
-    # 参数相关错误
-    INVALID_PARAM = "INVALID_PARAM"            # 参数无效或缺失
-    INVALID_FORMAT = "INVALID_FORMAT"          # 格式错误
+    # Parameter-related errors
+    INVALID_PARAM = "INVALID_PARAM"            # Invalid or missing parameters
+    INVALID_FORMAT = "INVALID_FORMAT"          # Format error
     
-    # 执行相关错误
-    EXECUTION_ERROR = "EXECUTION_ERROR"        # 执行过程中发生错误
-    TIMEOUT = "TIMEOUT"                        # 执行超时
-    INTERNAL_ERROR = "INTERNAL_ERROR"          # 内部错误
+    # Execution-related errors
+    EXECUTION_ERROR = "EXECUTION_ERROR"        # Error occurred during execution
+    TIMEOUT = "TIMEOUT"                        # Execution timeout
+    INTERNAL_ERROR = "INTERNAL_ERROR"          # Internal error
     
-    # 状态相关错误
-    CONFLICT = "CONFLICT"                      # 冲突（如乐观锁冲突）
-    CIRCUIT_OPEN = "CIRCUIT_OPEN"              # 熔断器开启，拒绝执行
+    # Status-related errors
+    CONFLICT = "CONFLICT"                      # Conflict (e.g., optimistic locking conflict)
+    CIRCUIT_OPEN = "CIRCUIT_OPEN"              # Circuit breaker is open, execution rejected
     
-    # 交互相关错误
-    ASK_USER_UNAVAILABLE = "ASK_USER_UNAVAILABLE"  # 用户交互不可用（如子代理中）
+    # Interaction-related errors
+    ASK_USER_UNAVAILABLE = "ASK_USER_UNAVAILABLE"  # User interaction unavailable (e.g., in a sub-agent)
 
-    # 网络相关错误
-    NETWORK_ERROR = "NETWORK_ERROR"            # 网络请求失败
-    API_ERROR = "API_ERROR"                    # API 调用失败
-    RATE_LIMIT = "RATE_LIMIT"                  # 速率限制
+    # Network-related errors
+    NETWORK_ERROR = "NETWORK_ERROR"            # Network request failed
+    API_ERROR = "API_ERROR"                    # API call failed
+    RATE_LIMIT = "RATE_LIMIT"                  # Rate limit
     
     @classmethod
     def get_all_codes(cls) -> list[str]:
-        """获取所有错误码"""
+        """Get all error codes"""
         return [
             value for name, value in vars(cls).items()
             if not name.startswith('_') and isinstance(value, str)
@@ -52,6 +52,5 @@ class ToolErrorCode:
     
     @classmethod
     def is_valid_code(cls, code: str) -> bool:
-        """检查是否是有效的错误码"""
+        """Check if it is a valid error code"""
         return code in cls.get_all_codes()
-

@@ -1,43 +1,43 @@
-"""HistoryManager - 历史消息管理器
+"""HistoryManager - Historical Message Manager
 
-职责：
-- 消息追加（只追加，不编辑，缓存友好）
-- 历史压缩（生成 summary + 保留最近轮次）
-- 会话序列化/反序列化
-- 轮次边界检测
+Responsibilities:
+- Append messages (append-only, no editing, cache-friendly)
+- Compress history (generate summary + retain recent rounds)
+- Session serialization/deserialization
+- Round boundary detection
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from datetime import datetime
 from ..core.message import Message
 
 
 class HistoryManager:
-    """历史管理器
+    """History Manager
     
-    特性：
-    - 只追加，不编辑（缓存友好）
-    - 自动压缩历史（summary + 保留最近轮次）
-    - 支持会话保存/加载
+    Features:
+    - Append-only, no editing (cache-friendly)
+    - Automatically compress history (summary + retain recent rounds)
+    - Support session saving/loading
     
-    用法示例：
+    Usage Example:
     ```python
     manager = HistoryManager(min_retain_rounds=10)
     
-    # 追加消息
+    # Append messages
     manager.append(Message("hello", "user"))
     manager.append(Message("hi", "assistant"))
     
-    # 获取历史
+    # Get history
     history = manager.get_history()
     
-    # 压缩历史
-    manager.compress("这是前面对话的摘要")
+    # Compress history
+    manager.compress("This is the summary of the previous conversation")
     
-    # 序列化
+    # Serialize
     data = manager.to_dict()
     
-    # 反序列化
+    # Deserialize
     manager.load_from_dict(data)
     ```
     """
@@ -47,50 +47,50 @@ class HistoryManager:
         min_retain_rounds: int = 10,
         compression_threshold: float = 0.8
     ):
-        """初始化历史管理器
+        """Initialize the history manager
         
         Args:
-            min_retain_rounds: 压缩时保留的最小完整轮次数
-            compression_threshold: 压缩阈值（暂未使用，预留）
+            min_retain_rounds: Minimum number of complete rounds to retain when compressing
+            compression_threshold: Compression threshold (currently unused, reserved for future use)
         """
         self._history: List[Message] = []
         self.min_retain_rounds = min_retain_rounds
         self.compression_threshold = compression_threshold
     
     def append(self, message: Message) -> None:
-        """追加消息（只追加，不编辑）
+        """Append a message (append-only, no editing)
         
         Args:
-            message: 要追加的消息
+            message: The message to append
         """
         self._history.append(message)
     
     def get_history(self) -> List[Message]:
-        """获取历史副本
+        """Get a copy of the history
         
         Returns:
-            历史消息列表的副本
+            A copy of the list of historical messages
         """
         return self._history.copy()
     
     def clear(self) -> None:
-        """清空历史"""
+        """Clear history"""
         self._history.clear()
     
     def estimate_rounds(self) -> int:
-        """预估完整轮次数
+        """Estimate the number of complete rounds
         
-        一轮定义：1 user 消息 + N 条 assistant/tool/summary 消息
+        Definition of a round: 1 user message + N assistant/tool/summary messages
         
         Returns:
-            完整轮次数
+            Number of complete rounds
         """
         rounds = 0
         i = 0
         while i < len(self._history):
             if self._history[i].role == "user":
                 rounds += 1
-                # 跳过这一轮的后续消息
+                # Skip subsequent messages in this round
                 i += 1
                 while i < len(self._history) and self._history[i].role != "user":
                     i += 1
@@ -99,10 +99,10 @@ class HistoryManager:
         return rounds
     
     def find_round_boundaries(self) -> List[int]:
-        """查找每轮的起始索引
+        """Find the starting index of each round
         
         Returns:
-            每轮起始索引列表，例如 [0, 3, 7, 10]
+            List of starting indices for each round, e.g., [0, 3, 7, 10]
         """
         boundaries = []
         for i, msg in enumerate(self._history):
@@ -111,43 +111,43 @@ class HistoryManager:
         return boundaries
     
     def compress(self, summary: str) -> None:
-        """压缩历史
+        """Compress history
         
-        将旧历史替换为 summary 消息，保留最近 N 轮完整对话
+        Replace old history with a summary message, retaining the most recent N complete rounds of conversation
         
         Args:
-            summary: 历史摘要文本
+            summary: History summary text
         """
-        # 检查是否有足够的轮次需要压缩
+        # Check if there are enough rounds to require compression
         rounds = self.estimate_rounds()
         if rounds <= self.min_retain_rounds:
             return
         
-        # 找到所有轮次边界
+        # Find all round boundaries
         boundaries = self.find_round_boundaries()
         
-        # 计算要保留的起始位置（保留最近 min_retain_rounds 轮）
+        # Calculate the starting position to retain (retain the most recent min_retain_rounds rounds)
         if len(boundaries) > self.min_retain_rounds:
             keep_from_index = boundaries[-self.min_retain_rounds]
         else:
-            # 不足最小轮次，不压缩
+            # Less than the minimum number of rounds, do not compress
             return
         
-        # 生成 summary 消息
+        # Generate summary message
         summary_msg = Message(
             content=f"## Archived Session Summary\n{summary}",
             role="summary",
             metadata={"compressed_at": datetime.now().isoformat()}
         )
         
-        # 替换历史：summary + 保留的最近轮次
+        # Replace history: summary + retained recent rounds
         self._history = [summary_msg] + self._history[keep_from_index:]
     
     def to_dict(self) -> Dict[str, Any]:
-        """序列化为字典（用于会话保存）
+        """Serialize to a dictionary (for session saving)
         
         Returns:
-            包含历史和元数据的字典
+            Dictionary containing history and metadata
         """
         return {
             "history": [msg.to_dict() for msg in self._history],
@@ -156,13 +156,12 @@ class HistoryManager:
         }
     
     def load_from_dict(self, data: Dict[str, Any]) -> None:
-        """从字典加载（用于会话恢复）
+        """Load from dictionary (for session recovery)
         
         Args:
-            data: 序列化的历史数据
+            data: Serialized historical data
         """
         self._history = [
             Message.from_dict(msg_data)
             for msg_data in data.get("history", [])
         ]
-

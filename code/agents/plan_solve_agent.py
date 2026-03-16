@@ -1,5 +1,3 @@
-"""Plan and Solve Agent实现 - 分解规划与逐步执行的智能体"""
-
 import json
 from typing import Optional, List, Dict, TYPE_CHECKING, Any, AsyncGenerator
 
@@ -13,40 +11,41 @@ from ..core.lifecycle import LifecycleHook
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
 
+
 class Planner:
-    """规划器 - 负责将复杂问题分解为简单步骤（使用 Function Calling）"""
+    """Planner - Responsible for breaking down complex problems into simple steps (using Function Calling)"""
 
     def __init__(self, llm_client: HelloAgentsLLM, system_prompt: Optional[str] = None):
         self.llm_client = llm_client
-        self.system_prompt = system_prompt or """你是一个顶级的AI规划专家。你的任务是将用户提出的复杂问题分解成一个由多个简单步骤组成的行动计划。
-请确保计划中的每个步骤都是一个独立的、可执行的子任务，并且严格按照逻辑顺序排列。"""
+        self.system_prompt = system_prompt or """You are a top-tier AI planning expert. Your task is to break down complex user problems into an action plan consisting of multiple simple steps.
+Please ensure each step in the plan is an independent, executable subtask, and strictly arranged in logical order."""
 
     def plan(self, question: str, **kwargs) -> List[str]:
         """
-        生成执行计划（使用 Function Calling）
+        Generate execution plan (using Function Calling)
 
         Args:
-            question: 要解决的问题
-            **kwargs: LLM调用参数
+            question: The problem to solve
+            **kwargs: LLM invocation parameters
 
         Returns:
-            步骤列表
+            List of steps
         """
-        print("--- 正在生成计划 ---")
+        print("--- Generating plan ---")
 
-        # 定义计划生成工具
+        # Define plan generation tool
         plan_tool = {
             "type": "function",
             "function": {
                 "name": "generate_plan",
-                "description": "生成解决问题的分步计划",
+                "description": "Generate a step-by-step plan to solve the problem",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "steps": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "按顺序排列的执行步骤列表"
+                            "description": "A sequentially ordered list of execution steps"
                         }
                     },
                     "required": ["steps"]
@@ -56,7 +55,7 @@ class Planner:
 
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"请为以下问题生成详细的执行计划：\n\n{question}"}
+            {"role": "user", "content": f"Please generate a detailed execution plan for the following problem:\n\n{question}"}
         ]
 
         try:
@@ -69,27 +68,27 @@ class Planner:
 
             response_message = response.choices[0].message
 
-            # 提取工具调用结果
+            # Extract tool call results
             if response_message.tool_calls:
                 tool_call = response_message.tool_calls[0]
                 arguments = json.loads(tool_call.function.arguments)
                 plan = arguments.get("steps", [])
 
-                print(f"✅ 计划已生成:")
+                print(f"✅ Plan generated:")
                 for i, step in enumerate(plan, 1):
                     print(f"  {i}. {step}")
 
                 return plan
             else:
-                print("❌ 模型未返回计划工具调用")
+                print("❌ Model did not return a plan tool call")
                 return []
 
         except Exception as e:
-            print(f"❌ 生成计划时发生错误: {e}")
+            print(f"❌ Error occurred while generating plan: {e}")
             return []
 
 class Executor:
-    """执行器 - 负责按计划逐步执行（支持 Function Calling）"""
+    """Executor - Responsible for executing step-by-step according to the plan (supports Function Calling)"""
 
     def __init__(
         self,
@@ -100,88 +99,88 @@ class Executor:
         max_tool_iterations: int = 3
     ):
         self.llm_client = llm_client
-        self.system_prompt = system_prompt or """你是一位顶级的AI执行专家。你的任务是严格按照给定的计划，一步步地解决问题。
-请专注于解决当前步骤，并输出该步骤的最终答案。"""
+        self.system_prompt = system_prompt or """You are a top-tier AI execution expert. Your task is to strictly follow the given plan and solve the problem step by step.
+Please focus on solving the current step and output the final answer for that step."""
         self.tool_registry = tool_registry
         self.enable_tool_calling = enable_tool_calling and tool_registry is not None
         self.max_tool_iterations = max_tool_iterations
 
     def execute(self, question: str, plan: List[str], **kwargs) -> str:
         """
-        按计划执行任务（支持 Function Calling）
+        Execute tasks according to the plan (supports Function Calling)
 
         Args:
-            question: 原始问题
-            plan: 执行计划
-            **kwargs: LLM调用参数
+            question: Original problem
+            plan: Execution plan
+            **kwargs: LLM invocation parameters
 
         Returns:
-            最终答案
+            Final answer
         """
         history = []
         final_answer = ""
 
-        print("\n--- 正在执行计划 ---")
+        print("\n--- Executing plan ---")
         for i, step in enumerate(plan, 1):
-            print(f"\n-> 正在执行步骤 {i}/{len(plan)}: {step}")
+            print(f"\n-> Executing step {i}/{len(plan)}: {step}")
 
-            # 构建上下文消息
-            context = f"""# 原始问题:
+            # Build context message
+            context = f"""# Original Problem:
 {question}
 
-# 完整计划:
+# Complete Plan:
 {self._format_plan(plan)}
 
-# 历史步骤与结果:
-{self._format_history(history) if history else "无"}
+# Historical Steps and Results:
+{self._format_history(history) if history else "None"}
 
-# 当前步骤:
+# Current Step:
 {step}
 
-请执行当前步骤并给出结果。"""
+Please execute the current step and provide the result."""
 
-            # 执行单个步骤（支持工具调用）
+            # Execute a single step (supports tool calling)
             response_text = self._execute_step(context, **kwargs)
 
             history.append({"step": step, "result": response_text})
             final_answer = response_text
-            print(f"✅ 步骤 {i} 已完成，结果: {final_answer}")
+            print(f"✅ Step {i} completed, result: {final_answer}")
 
         return final_answer
 
     def _format_plan(self, plan: List[str]) -> str:
-        """格式化计划列表"""
+        """Format plan list"""
         return "\n".join([f"{i}. {step}" for i, step in enumerate(plan, 1)])
 
     def _format_history(self, history: List[Dict[str, str]]) -> str:
-        """格式化历史记录"""
-        return "\n\n".join([f"步骤 {i}: {h['step']}\n结果: {h['result']}"
+        """Format history records"""
+        return "\n\n".join([f"Step {i}: {h['step']}\nResult: {h['result']}"
                            for i, h in enumerate(history, 1)])
 
     def _execute_step(self, context: str, **kwargs) -> str:
         """
-        执行单个步骤（支持 Function Calling）
+        Execute a single step (supports Function Calling)
 
         Args:
-            context: 上下文信息
-            **kwargs: 其他参数
+            context: Context information
+            **kwargs: Additional parameters
 
         Returns:
-            步骤执行结果
+            Step execution result
         """
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": context}
         ]
 
-        # 如果没有启用工具调用，直接返回
+        # If tool calling is not enabled, return directly
         if not self.enable_tool_calling or not self.tool_registry:
             llm_response = self.llm_client.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-        # 启用工具调用模式
+        # Enable tool calling mode
         from .simple_agent import SimpleAgent
-        # 临时创建一个 SimpleAgent 实例来复用工具调用逻辑
+        # Temporarily create a SimpleAgent instance to reuse tool calling logic
         temp_agent = SimpleAgent(
             name="temp_executor",
             llm=self.llm_client,
@@ -202,18 +201,18 @@ class Executor:
                     **kwargs
                 )
             except Exception as e:
-                print(f"❌ LLM 调用失败: {e}")
+                print(f"❌ LLM call failed: {e}")
                 break
 
             response_message = response.choices[0].message
 
-            # 处理工具调用
+            # Process tool calls
             tool_calls = response_message.tool_calls
             if not tool_calls:
-                # 没有工具调用，返回文本响应
+                # No tool calls, return text response
                 return response_message.content or ""
 
-            # 将助手消息添加到历史
+            # Add assistant message to history
             messages.append({
                 "role": "assistant",
                 "content": response_message.content,
@@ -230,7 +229,7 @@ class Executor:
                 ]
             })
 
-            # 执行所有工具调用
+            # Execute all tool calls
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 tool_call_id = tool_call.id
@@ -238,25 +237,25 @@ class Executor:
                 try:
                     arguments = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
-                    print(f"❌ 工具参数解析失败: {e}")
+                    print(f"❌ Tool argument parsing failed: {e}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": f"错误：参数格式不正确 - {str(e)}"
+                        "content": f"Error: Incorrect argument format - {str(e)}"
                     })
                     continue
 
-                # 执行工具（复用基类方法）
+                # Execute tool (reuse base class method)
                 result = temp_agent._execute_tool_call(tool_name, arguments)
 
-                # 添加工具结果到消息
+                # Add tool result to messages
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": result
                 })
 
-        # 如果超过最大迭代次数，获取最后一次回答
+        # If max iterations exceeded, get the last answer
         if current_iteration >= self.max_tool_iterations:
             llm_response = self.llm_client.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
@@ -265,16 +264,16 @@ class Executor:
 
 class PlanSolveAgent(Agent):
     """
-    Plan and Solve Agent - 分解规划与逐步执行的智能体
+    Plan and Solve Agent - An agent for decomposition planning and step-by-step execution
 
-    这个Agent能够：
-    1. 将复杂问题分解为简单步骤（使用 Function Calling）
-    2. 按照计划逐步执行
-    3. 维护执行历史和上下文
-    4. 得出最终答案
-    5. 支持工具调用（可选）
+    This Agent can:
+    1. Break down complex problems into simple steps (using Function Calling)
+    2. Execute step-by-step according to the plan
+    3. Maintain execution history and context
+    4. Derive the final answer
+    5. Support tool calling (optional)
 
-    特别适合多步骤推理、数学问题、复杂分析等任务。
+    Particularly suitable for tasks like multi-step reasoning, math problems, complex analysis, etc.
     """
 
     def __init__(
@@ -290,20 +289,20 @@ class PlanSolveAgent(Agent):
         max_tool_iterations: int = 3
     ):
         """
-        初始化PlanSolveAgent
+        Initialize PlanSolveAgent
 
         Args:
-            name: Agent名称
-            llm: LLM实例
-            system_prompt: 系统提示词（Agent级别）
-            config: 配置对象
-            planner_prompt: 规划器的系统提示词（可选）
-            executor_prompt: 执行器的系统提示词（可选）
-            tool_registry: 工具注册表（可选）
-            enable_tool_calling: 是否启用工具调用
-            max_tool_iterations: 最大工具调用迭代次数
+            name: Agent name
+            llm: LLM instance
+            system_prompt: System prompt (Agent level)
+            config: Configuration object
+            planner_prompt: Planner's system prompt (optional)
+            executor_prompt: Executor's system prompt (optional)
+            tool_registry: Tool registry (optional)
+            enable_tool_calling: Whether to enable tool calling
+            max_tool_iterations: Maximum tool calling iterations
         """
-        # 传递 tool_registry 到基类
+        # Pass tool_registry to base class
         super().__init__(
             name,
             llm,
@@ -323,34 +322,34 @@ class PlanSolveAgent(Agent):
     
     def run(self, input_text: str, **kwargs) -> str:
         """
-        运行Plan and Solve Agent
+        Run Plan and Solve Agent
         
         Args:
-            input_text: 要解决的问题
-            **kwargs: 其他参数
+            input_text: The problem to solve
+            **kwargs: Additional parameters
             
         Returns:
-            最终答案
+            Final answer
         """
-        print(f"\n🤖 {self.name} 开始处理问题: {input_text}")
+        print(f"\n🤖 {self.name} started processing the problem: {input_text}")
         
-        # 1. 生成计划
+        # 1. Generate plan
         plan = self.planner.plan(input_text, **kwargs)
         if not plan:
-            final_answer = "无法生成有效的行动计划，任务终止。"
-            print(f"\n--- 任务终止 ---\n{final_answer}")
+            final_answer = "Unable to generate a valid action plan, task terminated."
+            print(f"\n--- Task Terminated ---\n{final_answer}")
             
-            # 保存到历史记录
+            # Save to history
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(final_answer, "assistant"))
             
             return final_answer
         
-        # 2. 执行计划
+        # 2. Execute plan
         final_answer = self.executor.execute(input_text, plan, **kwargs)
-        print(f"\n--- 任务完成 ---\n最终答案: {final_answer}")
+        print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
         
-        # 保存到历史记录
+        # Save to history
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(final_answer, "assistant"))
 
@@ -365,23 +364,23 @@ class PlanSolveAgent(Agent):
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """
-        PlanAgent 真正的流式执行
+        True streaming execution of PlanAgent
 
-        实时返回：
-        - 规划阶段的计划生成
-        - 执行阶段的每个步骤输出
+        Returns in real-time:
+        - Plan generation during the planning phase
+        - Each step's output during the execution phase
 
         Args:
-            input_text: 用户输入
-            on_start: 开始钩子
-            on_finish: 完成钩子
-            on_error: 错误钩子
-            **kwargs: 其他参数
+            input_text: User input
+            on_start: Start hook
+            on_finish: Finish hook
+            on_error: Error hook
+            **kwargs: Additional parameters
 
         Yields:
-            StreamEvent: 流式事件
+            StreamEvent: Streaming events
         """
-        # 发送开始事件
+        # Send start event
         yield StreamEvent.create(
             StreamEventType.AGENT_START,
             self.name,
@@ -389,21 +388,21 @@ class PlanSolveAgent(Agent):
         )
 
         try:
-            # 阶段 1：规划
+            # Phase 1: Planning
             yield StreamEvent.create(
                 StreamEventType.STEP_START,
                 self.name,
                 phase="planning",
-                description="生成执行计划"
+                description="Generate execution plan"
             )
 
-            print(f"\n🤖 {self.name} 开始处理问题: {input_text}")
+            print(f"\n🤖 {self.name} started processing the problem: {input_text}")
 
-            # 生成计划（同步方法，暂时保持）
+            # Generate plan (synchronous method, kept for now)
             plan = self.planner.plan(input_text, **kwargs)
 
             if not plan:
-                error_msg = "无法生成有效的行动计划，任务终止。"
+                error_msg = "Unable to generate a valid action plan, task terminated."
 
                 yield StreamEvent.create(
                     StreamEventType.ERROR,
@@ -430,13 +429,13 @@ class PlanSolveAgent(Agent):
                 total_steps=len(plan)
             )
 
-            # 阶段 2：执行计划
+            # Phase 2: Execute plan
             step_results = []
 
             for i, step_description in enumerate(plan):
                 step_num = i + 1
 
-                # 步骤开始
+                # Step start
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
                     self.name,
@@ -446,30 +445,30 @@ class PlanSolveAgent(Agent):
                     description=step_description
                 )
 
-                print(f"\n--- 步骤 {step_num}/{len(plan)} ---")
+                print(f"\n--- Step {step_num}/{len(plan)} ---")
                 print(f"📋 {step_description}")
 
-                # 构建执行提示
+                # Build execution prompt
                 context = "\n".join([
-                    f"步骤 {j+1}: {plan[j]} -> {step_results[j]}"
+                    f"Step {j+1}: {plan[j]} -> {step_results[j]}"
                     for j in range(len(step_results))
                 ])
 
-                prompt = f"""原始问题: {input_text}
+                prompt = f"""Original Problem: {input_text}
 
-完整计划:
+Complete Plan:
 {chr(10).join([f"{j+1}. {s}" for j, s in enumerate(plan)])}
 
-已完成的步骤:
-{context if context else "无"}
+Completed Steps:
+{context if context else "None"}
 
-当前步骤: {step_description}
+Current Step: {step_description}
 
-请执行当前步骤并给出结果。"""
+Please execute the current step and provide the result."""
 
                 messages = [{"role": "user", "content": prompt}]
 
-                # 流式执行步骤
+                # Stream execute step
                 step_result = ""
                 async for chunk in self.llm.astream_invoke(messages, **kwargs):
                     step_result += chunk
@@ -484,11 +483,11 @@ class PlanSolveAgent(Agent):
 
                     print(chunk, end="", flush=True)
 
-                print()  # 换行
+                print()  # Newline
 
                 step_results.append(step_result)
 
-                # 步骤完成
+                # Step finish
                 yield StreamEvent.create(
                     StreamEventType.STEP_FINISH,
                     self.name,
@@ -497,20 +496,20 @@ class PlanSolveAgent(Agent):
                     result=step_result
                 )
 
-            # 生成最终答案
+            # Generate final answer
             yield StreamEvent.create(
                 StreamEventType.STEP_START,
                 self.name,
                 phase="final_answer",
-                description="生成最终答案"
+                description="Generate final answer"
             )
 
-            final_prompt = f"""原始问题: {input_text}
+            final_prompt = f"""Original Problem: {input_text}
 
-执行计划和结果:
+Execution Plan and Results:
 {chr(10).join([f"{i+1}. {plan[i]} -> {step_results[i]}" for i in range(len(plan))])}
 
-请基于以上步骤的执行结果，给出原始问题的最终答案。"""
+Please provide the final answer to the original problem based on the execution results of the steps above."""
 
             final_messages = [{"role": "user", "content": final_prompt}]
 
@@ -525,7 +524,7 @@ class PlanSolveAgent(Agent):
                     phase="final_answer"
                 )
 
-            # 发送完成事件
+            # Send finish event
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
@@ -533,14 +532,14 @@ class PlanSolveAgent(Agent):
                 total_steps=len(plan)
             )
 
-            print(f"\n--- 任务完成 ---\n最终答案: {final_answer}")
+            print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
 
-            # 保存到历史
+            # Save to history
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(final_answer, "assistant"))
 
         except Exception as e:
-            # 发送错误事件
+            # Send error event
             yield StreamEvent.create(
                 StreamEventType.ERROR,
                 self.name,

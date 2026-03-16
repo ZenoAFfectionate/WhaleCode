@@ -1,34 +1,32 @@
-"""工具基类"""
-
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Callable, get_type_hints
-from pydantic import BaseModel
-import inspect
 import re
 import time
+import inspect
 import asyncio
+from pydantic import BaseModel
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional, Callable, get_type_hints
 
 from .response import ToolResponse
 from .errors import ToolErrorCode
 
 
 def tool_action(name: str = None, description: str = None):
-    """装饰器：标记一个方法为可展开的工具 action
+    """Decorator: Mark a method as an expandable tool action
 
-    用法:
-        @tool_action("memory_add", "添加新记忆")
+    Usage:
+        @tool_action("memory_add", "Add new memory")
         def _add_memory(self, content: str, importance: float = 0.5) -> str:
-            '''添加记忆
+            '''Add memory
 
             Args:
-                content: 记忆内容
-                importance: 重要性分数
+                content: Memory content
+                importance: Importance score
             '''
             ...
 
     Args:
-        name: 工具名称（如果不提供，从方法名自动生成）
-        description: 工具描述（如果不提供，从 docstring 提取）
+        name: Tool name (if not provided, automatically generated from method name)
+        description: Tool description (if not provided, extracted from docstring)
     """
     def decorator(func: Callable):
         func._is_tool_action = True
@@ -39,7 +37,7 @@ def tool_action(name: str = None, description: str = None):
 
 
 class ToolParameter(BaseModel):
-    """工具参数定义"""
+    """Tool parameter definition"""
     name: str
     type: str
     description: str
@@ -48,29 +46,29 @@ class ToolParameter(BaseModel):
 
 
 class Tool(ABC):
-    """工具基类 - 新协议版本
+    """Tool Base Class - New Protocol Version
 
-    支持两种使用模式：
-    1. 普通模式：工具作为单一实体使用
-    2. 可展开模式：工具可以展开为多个独立的子工具（每个子工具对应一个功能）
+    Supports two usage modes:
+    1. Normal Mode: The tool is used as a single entity
+    2. Expandable Mode: The tool can be expanded into multiple independent sub-tools (each corresponding to a function)
 
-    展开模式支持两种实现方式：
-    - 手动定义子工具类（传统方式）
-    - 使用 @tool_action 装饰器自动生成（推荐）
+    Expandable mode supports two implementation methods:
+    - Manually defining sub-tool classes (traditional method)
+    - Automatically generating using the @tool_action decorator (recommended)
 
-    新协议特性：
-    - run() 方法返回 ToolResponse 对象（而非字符串）
-    - 提供 run_with_timing() 自动添加时间统计
-    - 支持结构化的状态、数据和错误信息
+    New protocol features:
+    - The run() method returns a ToolResponse object (instead of a string)
+    - Provides run_with_timing() to automatically add time statistics
+    - Supports structured status, data, and error information
     """
 
     def __init__(self, name: str, description: str, expandable: bool = False):
-        """初始化工具
+        """Initialize the tool
 
         Args:
-            name: 工具名称
-            description: 工具描述
-            expandable: 是否可展开为多个子工具
+            name: Tool name
+            description: Tool description
+            expandable: Whether it can be expanded into multiple sub-tools
         """
         self.name = name
         self.description = description
@@ -78,63 +76,63 @@ class Tool(ABC):
 
     @abstractmethod
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行工具，返回 ToolResponse 对象
+        """Execute the tool, returning a ToolResponse object
 
-        使用便捷方法创建响应：
+        Use convenient methods to create responses:
         - ToolResponse.success(text="...", data={...})
         - ToolResponse.partial(text="...", data={...})
         - ToolResponse.error(code="NOT_FOUND", message="...")
 
         Args:
-            parameters: 工具参数字典
+            parameters: Tool parameter dictionary
 
         Returns:
-            ToolResponse: 标准化的工具响应对象
+            ToolResponse: Standardized tool response object
         """
         pass
 
     @abstractmethod
     def get_parameters(self) -> List[ToolParameter]:
-        """获取工具参数定义"""
+        """Get tool parameter definitions"""
         pass
 
     def run_with_timing(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行工具并自动添加时间统计和上下文信息
+        """Execute the tool and automatically add time statistics and context information
 
-        这个方法会：
-        1. 记录执行开始时间
-        2. 调用 run() 方法
-        3. 计算执行时间并添加到 stats
-        4. 添加参数到 context
+        This method will:
+        1. Record the execution start time
+        2. Call the run() method
+        3. Calculate execution time and add to stats
+        4. Add parameters to context
 
         Args:
-            parameters: 工具参数字典
+            parameters: Tool parameter dictionary
 
         Returns:
-            ToolResponse: 包含时间统计的响应对象
+            ToolResponse: Response object containing time statistics
         """
         start_time = time.time()
 
         try:
             response = self.run(parameters)
         except Exception as e:
-            # 捕获未处理的异常，转换为错误响应
+            # Catch unhandled exceptions, convert to error response
             elapsed_ms = int((time.time() - start_time) * 1000)
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"工具执行时发生未处理的异常: {str(e)}",
+                message=f"Unhandled exception occurred during tool execution: {str(e)}",
                 stats={"time_ms": elapsed_ms},
                 context={"params_input": parameters, "tool_name": self.name}
             )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # 添加时间统计
+        # Add time statistics
         if response.stats is None:
             response.stats = {}
         response.stats["time_ms"] = elapsed_ms
 
-        # 添加上下文
+        # Add context
         if response.context is None:
             response.context = {}
         response.context["params_input"] = parameters
@@ -143,16 +141,16 @@ class Tool(ABC):
         return response
 
     async def arun(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """异步执行工具
+        """Asynchronously execute the tool
 
-        默认实现：在线程池中运行同步 run() 方法
-        子类可以重写此方法实现真正的异步执行
+        Default implementation: Run the synchronous run() method in a thread pool
+        Subclasses can override this method to implement true asynchronous execution
 
         Args:
-            parameters: 工具参数字典
+            parameters: Tool parameter dictionary
 
         Returns:
-            ToolResponse: 标准化的工具响应对象
+            ToolResponse: Standardized tool response object
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -161,13 +159,13 @@ class Tool(ABC):
         )
 
     async def arun_with_timing(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """异步执行工具并自动添加时间统计
+        """Asynchronously execute the tool and automatically add time statistics
 
         Args:
-            parameters: 工具参数字典
+            parameters: Tool parameter dictionary
 
         Returns:
-            ToolResponse: 包含时间统计的响应对象
+            ToolResponse: Response object containing time statistics
         """
         start_time = time.time()
 
@@ -177,19 +175,19 @@ class Tool(ABC):
             elapsed_ms = int((time.time() - start_time) * 1000)
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"工具执行时发生未处理的异常: {str(e)}",
+                message=f"Unhandled exception occurred during tool execution: {str(e)}",
                 stats={"time_ms": elapsed_ms},
                 context={"params_input": parameters, "tool_name": self.name}
             )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # 添加时间统计
+        # Add time statistics
         if response.stats is None:
             response.stats = {}
         response.stats["time_ms"] = elapsed_ms
 
-        # 添加上下文
+        # Add context
         if response.context is None:
             response.context = {}
         response.context["params_input"] = parameters
@@ -198,18 +196,18 @@ class Tool(ABC):
         return response
 
     def get_expanded_tools(self) -> Optional[List['Tool']]:
-        """获取展开后的子工具列表
+        """Get the list of expanded sub-tools
 
-        默认实现：自动从标记了 @tool_action 的方法生成子工具
-        子类可以重写此方法提供自定义的展开逻辑
+        Default implementation: Automatically generate sub-tools from methods marked with @tool_action
+        Subclasses can override this method to provide custom expansion logic
 
         Returns:
-            如果工具支持展开，返回子工具列表；否则返回 None
+            If the tool supports expansion, return the list of sub-tools; otherwise return None
         """
         if not self.expandable:
             return None
 
-        # 自动从装饰器标记的方法生成工具
+        # Automatically generate tools from methods marked by the decorator
         tools = []
         for name, method in inspect.getmembers(self, predicate=inspect.ismethod):
             if hasattr(method, '_is_tool_action'):
@@ -224,12 +222,12 @@ class Tool(ABC):
         return tools if tools else None
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
-        """验证参数"""
+        """Validate parameters"""
         required_params = [p.name for p in self.get_parameters() if p.required]
         return all(param in parameters for param in required_params)
 
     def to_dict(self) -> Dict[str, Any]:
-        """转换为字典格式"""
+        """Convert to dictionary format"""
         return {
             "name": self.name,
             "description": self.description,
@@ -237,37 +235,37 @@ class Tool(ABC):
         }
 
     def to_openai_schema(self) -> Dict[str, Any]:
-        """转换为 OpenAI function calling schema 格式
+        """Convert to OpenAI function calling schema format
 
-        用于 FunctionCallAgent，使工具能够被 OpenAI 原生 function calling 使用
+        Used for FunctionCallAgent, enabling the tool to be used by native OpenAI function calling
 
         Returns:
-            符合 OpenAI function calling 标准的 schema
+            Schema that complies with the OpenAI function calling standard
         """
         parameters = self.get_parameters()
 
-        # 构建 properties
+        # Build properties
         properties = {}
         required = []
 
         for param in parameters:
-            # 基础属性定义
+            # Basic property definition
             prop = {
                 "type": param.type,
                 "description": param.description
             }
 
-            # 如果有默认值，添加到描述中（OpenAI schema 不支持 default 字段）
+            # If there is a default value, add it to the description (OpenAI schema does not support the default field)
             if param.default is not None:
-                prop["description"] = f"{param.description} (默认: {param.default})"
+                prop["description"] = f"{param.description} (Default: {param.default})"
 
-            # 如果是数组类型，添加 items 定义
+            # If it is an array type, add items definition
             if param.type == "array":
-                prop["items"] = {"type": "string"}  # 默认字符串数组
+                prop["items"] = {"type": "string"}  # Default string array
 
             properties[param.name] = prop
 
-            # 收集必需参数
+            # Collect required parameters
             if param.required:
                 required.append(param.name)
 
@@ -292,57 +290,57 @@ class Tool(ABC):
 
 
 class AutoGeneratedTool(Tool):
-    """自动生成的工具 - 从方法签名和 docstring 自动提取参数"""
+    """Automatically generated tool - automatically extracts parameters from method signature and docstring"""
 
     def __init__(self, parent: Tool, method: Callable, name: str = None, description: str = None):
-        """初始化自动生成的工具
+        """Initialize automatically generated tool
 
         Args:
-            parent: 父工具实例
-            method: 被装饰的方法
-            name: 工具名称（如果为 None，从方法名生成）
-            description: 工具描述（如果为 None，从 docstring 提取）
+            parent: Parent tool instance
+            method: Decorated method
+            name: Tool name (if None, generate from method name)
+            description: Tool description (if None, extract from docstring)
         """
         self.parent = parent
         self.method = method
 
-        # 生成工具名称
+        # Generate tool name
         if name is None:
-            # 从方法名生成：_add_memory -> parent_name_add_memory
+            # Generate from method name: _add_memory -> parent_name_add_memory
             method_name = method.__name__.lstrip('_')
             name = f"{parent.name}_{method_name}"
 
-        # 提取描述
+        # Extract description
         if description is None:
             description = self._extract_description_from_docstring()
 
         super().__init__(name=name, description=description)
 
-        # 自动解析参数
+        # Automatically parse parameters
         self._parameters = self._parse_parameters()
 
     def _extract_description_from_docstring(self) -> str:
-        """从 docstring 提取描述"""
+        """Extract description from docstring"""
         doc = inspect.getdoc(self.method)
         if not doc:
-            return f"执行 {self.method.__name__}"
+            return f"Execute {self.method.__name__}"
 
-        # 提取第一行作为描述
+        # Extract the first line as description
         lines = doc.split('\n')
         for line in lines:
             line = line.strip()
             if line and not line.startswith('Args:') and not line.startswith('Returns:'):
                 return line
 
-        return f"执行 {self.method.__name__}"
+        return f"Execute {self.method.__name__}"
 
     def _parse_parameters(self) -> List[ToolParameter]:
-        """从方法签名和 docstring 自动提取参数"""
+        """Automatically extract parameters from method signature and docstring"""
         sig = inspect.signature(self.method)
         type_hints = get_type_hints(self.method)
         docstring = inspect.getdoc(self.method) or ""
 
-        # 从 docstring 解析参数描述
+        # Parse parameter descriptions from docstring
         param_descriptions = self._parse_param_descriptions(docstring)
 
         parameters = []
@@ -350,16 +348,16 @@ class AutoGeneratedTool(Tool):
             if param_name == 'self':
                 continue
 
-            # 获取类型
+            # Get type
             param_type_hint = type_hints.get(param_name, str)
             param_type = self._python_type_to_tool_type(param_type_hint)
 
-            # 判断是否必需
+            # Determine if required
             required = param.default == inspect.Parameter.empty
             default = None if required else param.default
 
-            # 获取描述
-            description = param_descriptions.get(param_name, f"参数 {param_name}")
+            # Get description
+            description = param_descriptions.get(param_name, f"Parameter {param_name}")
 
             parameters.append(ToolParameter(
                 name=param_name,
@@ -372,39 +370,39 @@ class AutoGeneratedTool(Tool):
         return parameters
 
     def _parse_param_descriptions(self, docstring: str) -> Dict[str, str]:
-        """从 docstring 解析参数描述
+        """Parse parameter descriptions from docstring
 
-        支持格式:
+        Supported format:
             Args:
-                param_name: 参数描述
-                another_param: 另一个参数描述
+                param_name: Parameter description
+                another_param: Another parameter description
         """
         descriptions = {}
 
-        # 查找 Args: 部分
+        # Find Args: section
         args_match = re.search(r'Args:\s*\n(.*?)(?:\n\s*\n|Returns:|$)', docstring, re.DOTALL)
         if not args_match:
             return descriptions
 
         args_section = args_match.group(1)
 
-        # 解析每个参数
-        # 匹配格式: param_name: 描述 或 param_name (type): 描述
+        # Parse each parameter
+        # Match format: param_name: description OR param_name (type): description
         param_pattern = r'^\s*(\w+)(?:\s*\([^)]+\))?\s*:\s*(.+?)(?=^\s*\w+\s*(?:\([^)]+\))?\s*:|$)'
         matches = re.finditer(param_pattern, args_section, re.MULTILINE | re.DOTALL)
 
         for match in matches:
             param_name = match.group(1).strip()
             param_desc = match.group(2).strip()
-            # 清理描述中的多余空白
+            # Clean up extra whitespace in description
             param_desc = re.sub(r'\s+', ' ', param_desc)
             descriptions[param_name] = param_desc
 
         return descriptions
 
     def _python_type_to_tool_type(self, py_type) -> str:
-        """将 Python 类型转换为工具类型字符串"""
-        # 处理泛型类型
+        """Convert Python type to tool type string"""
+        # Handle generic types
         origin = getattr(py_type, '__origin__', None)
         if origin is not None:
             if origin is list:
@@ -412,7 +410,7 @@ class AutoGeneratedTool(Tool):
             elif origin is dict:
                 return "object"
 
-        # 处理基本类型
+        # Handle basic types
         type_map = {
             str: "string",
             int: "integer",
@@ -425,23 +423,23 @@ class AutoGeneratedTool(Tool):
         return type_map.get(py_type, "string")
 
     def get_parameters(self) -> List[ToolParameter]:
-        """获取参数列表"""
+        """Get parameter list"""
         return self._parameters
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行方法，返回 ToolResponse 对象
+        """Execute method, return ToolResponse object
 
-        如果被装饰的方法返回字符串，自动包装为 success 响应
-        如果返回 ToolResponse，直接返回
+        If the decorated method returns a string, automatically wrap it in a success response
+        If it returns a ToolResponse, return directly
         """
         try:
             result = self.method(**parameters)
 
-            # 如果方法已经返回 ToolResponse，直接返回
+            # If the method already returns a ToolResponse, return directly
             if isinstance(result, ToolResponse):
                 return result
 
-            # 否则包装为 success 响应
+            # Otherwise wrap it in a success response
             return ToolResponse.success(
                 text=str(result),
                 data={"output": result}
@@ -449,5 +447,5 @@ class AutoGeneratedTool(Tool):
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.EXECUTION_ERROR,
-                message=f"方法执行失败: {str(e)}"
+                message=f"Method execution failed: {str(e)}"
             )

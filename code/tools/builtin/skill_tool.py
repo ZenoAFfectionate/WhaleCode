@@ -1,19 +1,19 @@
-"""Skill Tool - 技能工具
+"""Skill Tool
 
-允许 Agent 按需加载领域知识。
+Allows the Agent to load domain knowledge on demand.
 
-特性：
-- 渐进式披露：仅在需要时加载完整技能
-- 缓存友好：作为 tool_result 注入，不修改 system_prompt
-- 资源提示：自动列出可用的脚本、文档、示例等
-- 参数替换：支持 $ARGUMENTS 占位符
+Features:
+- Progressive disclosure: Load complete skills only when needed
+- Cache friendly: Injected as tool_result, does not modify system_prompt
+- Resource hints: Automatically lists available scripts, documents, examples, etc.
+- Parameter replacement: Supports $ARGUMENTS placeholder
 
-使用示例：
+Usage example:
     >>> from hello_agents.skills import SkillLoader
     >>> from hello_agents.tools.builtin.skill_tool import SkillTool
     >>> loader = SkillLoader(skills_dir=Path("skills"))
     >>> tool = SkillTool(skill_loader=loader)
-    >>> # Agent 调用
+    >>> # Agent call
     >>> response = tool.run({"skill": "pdf"})
 """
 
@@ -26,33 +26,33 @@ from ..errors import ToolErrorCode
 
 class SkillTool(Tool):
     """
-    技能工具
+    Skill Tool
 
-    允许模型按需加载领域知识。
+    Allows the model to load domain knowledge on demand.
     """
 
     def __init__(self, skill_loader: SkillLoader):
-        """初始化技能工具
+        """Initialize the skill tool
 
         Args:
-            skill_loader: 技能加载器实例
+            skill_loader: Skill loader instance
         """
-        # 生成动态描述
+        # Generate dynamic descriptions
         descriptions = skill_loader.get_descriptions()
 
         super().__init__(
             name="Skill",
-            description=f"""加载技能获取专业知识。
+            description=f"""Load skills to acquire professional knowledge.
 
-可用技能：
+Available skills:
 {descriptions}
 
-何时使用：
-- 任务明确匹配某个技能描述时，立即使用
-- 开始领域特定工作之前
-- 需要模型不具备的专业知识时
+When to use:
+- Use immediately when the task clearly matches a skill description
+- Before starting domain-specific work
+- When professional knowledge not possessed by the model is needed
 
-注意：加载技能后，请严格遵循技能说明来完成用户任务。""",
+Note: After loading a skill, please strictly follow the skill instructions to complete the user task.""",
             expandable=False
         )
         self.skill_loader = skill_loader
@@ -62,26 +62,26 @@ class SkillTool(Tool):
             ToolParameter(
                 name="skill",
                 type="string",
-                description="要加载的技能名称",
+                description="The name of the skill to load",
                 required=True
             ),
             ToolParameter(
                 name="args",
                 type="string",
-                description="可选参数，将替换 SKILL.md 中的 $ARGUMENTS 占位符",
+                description="Optional parameters, will replace the $ARGUMENTS placeholder in SKILL.md",
                 required=False,
                 default=""
             )
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行技能加载
+        """Execute skill loading
 
         Args:
-            parameters: 包含 skill 和可选 args 的参数字典
+            parameters: Parameter dictionary containing skill and optional args
 
         Returns:
-            ToolResponse: 包含完整技能内容的响应
+            ToolResponse: Response containing complete skill content
         """
         skill_name = parameters.get("skill", "")
         args = parameters.get("args", "")
@@ -89,38 +89,38 @@ class SkillTool(Tool):
         if not skill_name:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="必须指定技能名称",
+                message="Skill name must be specified",
                 context={"params_input": parameters}
             )
 
         try:
-            # 按需加载技能
+            # Load skills on demand
             skill = self.skill_loader.get_skill(skill_name)
 
             if not skill:
                 available = ", ".join(self.skill_loader.list_skills())
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"技能 '{skill_name}' 不存在。可用技能：{available}",
+                    message=f"Skill '{skill_name}' does not exist. Available skills: {available}",
                     context={"params_input": parameters, "available_skills": self.skill_loader.list_skills()}
                 )
 
-            # 替换 $ARGUMENTS 占位符
+            # Replace $ARGUMENTS placeholder
             content = skill.body.replace("$ARGUMENTS", args)
 
-            # 列出可用资源
+            # List available resources
             resources_hint = self._get_resources_hint(skill)
 
-            # 构造完整技能内容（缓存友好的注入方式）
+            # Construct complete skill content (cache-friendly injection method)
             full_content = f"""<skill-loaded name="{skill_name}">
 {content}
 {resources_hint}
 </skill-loaded>
 
-✅ 技能已加载：{skill.name}
-📝 描述：{skill.description}
+✅ Skill loaded: {skill.name}
+📝 Description: {skill.description}
 
-请严格遵循上述技能说明来完成用户任务。"""
+Please strictly follow the above skill instructions to complete the user task."""
 
             return ToolResponse.success(
                 text=full_content,
@@ -136,38 +136,37 @@ class SkillTool(Tool):
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"加载技能失败：{str(e)}",
+                message=f"Failed to load skill: {str(e)}",
                 context={"params_input": parameters, "error": str(e)}
             )
 
     def _get_resources_hint(self, skill) -> str:
-        """生成资源提示文本
+        """Generate resource hint text
 
         Args:
-            skill: Skill 对象
+            skill: Skill object
 
         Returns:
-            格式化的资源提示文本
+            Formatted resource hint text
         """
         resources = []
 
         for folder, label in [
-            ("scripts", "脚本"),
-            ("references", "参考文档"),
-            ("assets", "资源"),
-            ("examples", "示例")
+            ("scripts", "Scripts"),
+            ("references", "References"),
+            ("assets", "Assets"),
+            ("examples", "Examples")
         ]:
             folder_path = skill.dir / folder
             if folder_path.exists():
                 files = list(folder_path.glob("*"))
                 if files:
-                    file_list = ", ".join(f.name for f in files[:5])  # 最多显示 5 个
+                    file_list = ", ".join(f.name for f in files[:5])  # Show at most 5
                     if len(files) > 5:
-                        file_list += f" 等 {len(files)} 个文件"
-                    resources.append(f"  - {label}：{file_list}")
+                        file_list += f" and {len(files)} files in total"
+                    resources.append(f"  - {label}: {file_list}")
 
         if not resources:
             return ""
 
-        return "\n\n**可用资源**：\n" + "\n".join(resources)
-
+        return "\n\n**Available resources**: \n" + "\n".join(resources)

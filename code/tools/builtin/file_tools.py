@@ -1,28 +1,17 @@
-"""文件操作工具 - 支持乐观锁机制
+"""File Operation Tools - Supporting Optimistic Locking
 
-提供标准的文件读写编辑能力：
-- ReadTool: 读取文件 + 元数据缓存
-- WriteTool: 写入文件 + 冲突检测 + 原子写入
-- EditTool: 精确替换 + 冲突检测 + 备份
-- MultiEditTool: 批量替换 + 原子性保证
-
-使用示例：
-```python
-from hello_agents import ToolRegistry
-from hello_agents.tools.builtin import ReadTool, WriteTool, EditTool
-
-registry = ToolRegistry()
-registry.register_tool(ReadTool(project_root="./"))
-registry.register_tool(WriteTool(project_root="./"))
-registry.register_tool(EditTool(project_root="./"))
-```
+Provides standard file reading, writing, and editing capabilities:
+- ReadTool: Read file + Metadata caching
+- WriteTool: Write file + Conflict detection + Atomic write
+- EditTool: Precise replacement + Conflict detection + Backup
+- MultiEditTool: Batch replacement + Atomicity guarantee
 """
 
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
-from pathlib import Path
 import os
 import shutil
+from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
 from ..base import Tool, ToolParameter
 from ..response import ToolResponse
@@ -42,7 +31,7 @@ if TYPE_CHECKING:
 
 
 def _display_path(project_root: Path, full_path: Path) -> str:
-    """返回相对 project_root 的显示路径"""
+    """Returns a display path relative to the project_root."""
     try:
         rel = full_path.relative_to(project_root)
         text = str(rel).replace(os.sep, '/')
@@ -52,10 +41,10 @@ def _display_path(project_root: Path, full_path: Path) -> str:
 
 
 def _format_diff_section(diff_preview: str, diff_truncated: bool) -> str:
-    """格式化统一 diff 预览文本。"""
-    lines = ["", "统一 diff 预览:", diff_preview]
+    """Format unified diff preview text."""
+    lines = ["", "Unified diff preview:", diff_preview]
     if diff_truncated:
-        lines.append("[diff 预览已截断]")
+        lines.append("[diff preview truncated]")
     return '\n'.join(lines)
 
 
@@ -65,14 +54,14 @@ def _no_change_response(
     mtime_ms: int,
     size_bytes: int,
 ) -> ToolResponse:
-    """统一的无变化响应，便于 agent 继续推理。"""
+    """Unified no-change response to facilitate agent reasoning."""
     return ToolResponse.partial(
         text=(
             f"{action_text}: {rel_path}\n"
-            f"无实际文本变化。\n"
-            f"元数据: file_mtime_ms={mtime_ms}, file_size_bytes={size_bytes}, "
+            f"No actual textual changes.\n"
+            f"Metadata: file_mtime_ms={mtime_ms}, file_size_bytes={size_bytes}, "
             f"expected_mtime_ms={mtime_ms}, expected_size_bytes={size_bytes}\n"
-            f"统一 diff 预览:\n[no textual diff]"
+            f"Unified diff preview:\n[no textual diff]"
         ),
         data={
             "path": rel_path,
@@ -88,19 +77,19 @@ def _no_change_response(
 
 
 class ReadTool(Tool):
-    """文件读取工具
+    """File Read Tool
 
-    功能：
-    - 读取文件内容（支持 offset/limit）
-    - 列出目录内容（当 path 是目录时）
-    - 自动获取文件元数据（mtime, size）
-    - 缓存元数据到 ToolRegistry（用于乐观锁）
-    - 跨平台兼容（Windows/Linux）
+    Features:
+    - Read file content (supports offset/limit)
+    - List directory contents (when path is a directory)
+    - Automatically retrieve file metadata (mtime, size)
+    - Cache metadata in ToolRegistry (for optimistic locking)
+    - Cross-platform compatibility (Windows/Linux)
 
-    参数：
-    - path: 文件或目录路径（相对于 project_root）
-    - offset: 起始行号（可选，默认 0，仅文件有效）
-    - limit: 最大行数（可选，默认 2000，仅文件有效）
+    Parameters:
+    - path: File or directory path (relative to project_root)
+    - offset: Starting line number (optional, default 0, valid for files only)
+    - limit: Maximum number of lines (optional, default 2000, valid for files only)
     """
     
     def __init__(
@@ -156,7 +145,7 @@ class ReadTool(Tool):
         ]
     
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行文件读取或目录列表"""
+        """Execute file read or directory listing"""
         path = parameters.get("path")
         offset = parameters.get("offset", 0)
         limit = parameters.get("limit", 2000)
@@ -164,46 +153,46 @@ class ReadTool(Tool):
         if not path:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: path"
+                message="Missing required parameter: path"
             )
 
         if not isinstance(offset, int) or offset < 0:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="参数 offset 必须是大于等于 0 的整数"
+                message="Parameter offset must be an integer greater than or equal to 0"
             )
 
         if not isinstance(limit, int) or limit < 1:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="参数 limit 必须是大于等于 1 的整数"
+                message="Parameter limit must be an integer greater than or equal to 1"
             )
 
         try:
-            # 解析路径
+            # Resolve path
             full_path = self._resolve_path(path)
 
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"路径 '{path}' 不存在"
+                    message=f"Path '{path}' does not exist"
                 )
 
-            # 如果是目录，返回目录列表
+            # If it's a directory, return directory listing
             if full_path.is_dir():
                 return self._list_directory(_display_path(self.project_root, full_path), full_path)
 
             if is_binary_file(full_path):
                 return ToolResponse.error(
                     code=ToolErrorCode.BINARY_FILE,
-                    message=f"文件 '{path}' 是二进制文件，无法按文本读取"
+                    message=f"File '{path}' is a binary file and cannot be read as text"
                 )
 
-            # 读取文件（带编码回退）
+            # Read file (with encoding fallback)
             content, encoding = read_text_file(full_path)
             lines = content.splitlines()
 
-            # 应用 offset 和 limit
+            # Apply offset and limit
             total_lines = len(lines)
             if offset > 0:
                 lines = lines[offset:]
@@ -212,14 +201,14 @@ class ReadTool(Tool):
 
             selected_content = '\n'.join(lines)
 
-            # 获取文件元数据（用于乐观锁）
+            # Get file metadata (for optimistic locking)
             mtime = os.path.getmtime(full_path)
             size = os.path.getsize(full_path)
             file_mtime_ms = int(mtime * 1000)
             file_size_bytes = size
             rel_path = _display_path(self.project_root, full_path)
 
-            # 缓存元数据到 ToolRegistry
+            # Cache metadata to ToolRegistry
             if self.registry:
                 self.registry.cache_read_metadata(rel_path, {
                     "file_mtime_ms": file_mtime_ms,
@@ -232,11 +221,11 @@ class ReadTool(Tool):
                 numbered = "[empty file]"
 
             text_lines = [
-                f"文件: {rel_path}",
-                f"编码: {encoding}",
-                f"行范围: {offset + 1}-{offset + len(lines)} / {total_lines}",
+                f"File: {rel_path}",
+                f"Encoding: {encoding}",
+                f"Line range: {offset + 1}-{offset + len(lines)} / {total_lines}",
                 (
-                    f"元数据: file_mtime_ms={file_mtime_ms}, "
+                    f"Metadata: file_mtime_ms={file_mtime_ms}, "
                     f"file_size_bytes={file_size_bytes}, "
                     f"expected_mtime_ms={file_mtime_ms}, "
                     f"expected_size_bytes={file_size_bytes}"
@@ -263,35 +252,35 @@ class ReadTool(Tool):
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"路径 '{path}' 超出项目根目录，访问被拒绝"
+                message=f"Path '{path}' is outside the project root, access denied"
             )
         
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"无权限读取 '{path}'"
+                message=f"No permission to read '{path}'"
             )
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"读取文件失败：{str(e)}"
+                message=f"Failed to read file: {str(e)}"
             )
 
     def _list_directory(self, path: str, full_path: Path) -> ToolResponse:
-        """列出目录内容（兼容 Windows 和 Linux）"""
+        """List directory contents (Windows and Linux compatible)"""
         try:
             entries = []
             total_files = 0
             total_dirs = 0
 
-            # 获取目录下所有条目
+            # Get all entries in the directory
             for entry in sorted(full_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
                 try:
-                    # 获取条目信息
+                    # Get entry information
                     is_dir = entry.is_dir()
                     name = entry.name
 
-                    # 获取大小和修改时间
+                    # Get size and modification time
                     if is_dir:
                         size_str = "<DIR>"
                         total_dirs += 1
@@ -303,14 +292,14 @@ class ReadTool(Tool):
                         except:
                             size_str = "?"
 
-                    # 获取修改时间
+                    # Get modification time
                     try:
                         mtime = entry.stat().st_mtime
                         mtime_str = self._format_time(mtime)
                     except:
                         mtime_str = "?"
 
-                    # 使用正斜杠作为路径分隔符（跨平台兼容）
+                    # Use forward slash as path separator (cross-platform compatibility)
                     relative_path = str(entry.relative_to(self.project_root)).replace(os.sep, '/')
 
                     entries.append({
@@ -320,15 +309,15 @@ class ReadTool(Tool):
                         "mtime": mtime_str,
                         "path": relative_path
                     })
-                except Exception as e:
-                    # 跳过无法访问的条目
+                except Exception:
+                    # Skip inaccessible entries
                     continue
 
-            # 构建输出文本
+            # Construct output text
             if not entries:
-                text = f"目录 '{path}' 为空"
+                text = f"Directory '{path}' is empty"
             else:
-                lines = [f"目录 '{path}' 包含 {total_files} 个文件，{total_dirs} 个目录：\n"]
+                lines = [f"Directory '{path}' contains {total_files} files, {total_dirs} directories:\n"]
                 for entry in entries:
                     type_icon = "📁" if entry["type"] == "directory" else "📄"
                     lines.append(f"{type_icon} {entry['name']:<40} {entry['size']:>10} {entry['mtime']}")
@@ -347,16 +336,16 @@ class ReadTool(Tool):
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"无权访问目录 '{path}'"
+                message=f"No permission to access directory '{path}'"
             )
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"列出目录失败：{str(e)}"
+                message=f"Failed to list directory: {str(e)}"
             )
 
     def _format_size(self, size: int) -> str:
-        """格式化文件大小"""
+        """Format file size"""
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024.0:
                 return f"{size:.1f}{unit}"
@@ -364,21 +353,21 @@ class ReadTool(Tool):
         return f"{size:.1f}TB"
 
     def _format_time(self, timestamp: float) -> str:
-        """格式化时间戳（兼容 Windows 和 Linux）"""
+        """Format timestamp (Windows and Linux compatible)"""
         from datetime import datetime
         dt = datetime.fromtimestamp(timestamp)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     def _resolve_path(self, path: str) -> Path:
-        """解析相对路径（兼容 Windows 和 Linux）"""
-        # 统一路径分隔符：将反斜杠转换为正斜杠
+        """Resolve relative path (Windows and Linux compatible)"""
+        # Unify path separators: convert backslashes to forward slashes
         path = path.replace('\\', '/')
 
-        # 如果是绝对路径，直接使用
+        # If it's an absolute path, use it directly
         if os.path.isabs(path):
             full_path = Path(path).resolve()
         else:
-            # 否则相对于 working_dir
+            # Otherwise, relative to working_dir
             full_path = (self.working_dir / path).resolve()
 
         full_path.relative_to(self.project_root)
@@ -386,7 +375,7 @@ class ReadTool(Tool):
 
 
 class ListFilesTool(ReadTool):
-    """目录列表工具（兼容旧的 LS 工具命名）"""
+    """Directory listing tool (compatibility with legacy LS tool naming)"""
 
     def __init__(
         self,
@@ -419,34 +408,34 @@ class ListFilesTool(ReadTool):
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"路径 '{path}' 不存在"
+                    message=f"Path '{path}' does not exist"
                 )
             if not full_path.is_dir():
                 return ToolResponse.error(
                     code=ToolErrorCode.INVALID_PARAM,
-                    message=f"路径 '{path}' 不是目录"
+                    message=f"Path '{path}' is not a directory"
                 )
             return self._list_directory(_display_path(self.project_root, full_path), full_path)
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"路径 '{path}' 超出项目根目录，访问被拒绝"
+                message=f"Path '{path}' is outside the project root, access denied"
             )
 
 
 class WriteTool(Tool):
-    """文件写入工具
+    """File Write Tool
 
-    功能：
-    - 创建或覆盖文件
-    - 乐观锁冲突检测（如果文件已存在）
-    - 原子写入（临时文件 + rename）
-    - 自动备份原文件
+    Features:
+    - Create or overwrite a file
+    - Optimistic locking conflict detection (if file exists)
+    - Atomic write (temporary file + rename)
+    - Automatically back up the original file
 
-    参数：
-    - path: 文件路径
-    - content: 文件内容
-    - file_mtime_ms: 缓存的 mtime（可选，用于冲突检测）
+    Parameters:
+    - path: File path
+    - content: File content
+    - file_mtime_ms: Cached mtime (optional, for conflict detection)
     """
 
     def __init__(
@@ -509,7 +498,7 @@ class WriteTool(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行文件写入"""
+        """Execute file write"""
         path = parameters.get("path")
         content = parameters.get("content")
         cached_mtime = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
@@ -519,48 +508,48 @@ class WriteTool(Tool):
         if not path:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: path"
+                message="Missing required parameter: path"
             )
 
         if content is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: content"
+                message="Missing required parameter: content"
             )
 
         try:
-            # 解析路径
+            # Resolve path
             full_path = self._resolve_path(path)
             backup_path = None
             old_content = ""
             line_ending = "\n"
 
-            # 检查文件是否存在
+            # Check if file exists
             if full_path.exists():
                 if full_path.is_dir():
                     return ToolResponse.error(
                         code=ToolErrorCode.IS_DIRECTORY,
-                        message=f"路径 '{path}' 是目录，不能按文件写入"
+                        message=f"Path '{path}' is a directory, cannot write as a file"
                     )
                 if is_binary_file(full_path):
                     return ToolResponse.error(
                         code=ToolErrorCode.BINARY_FILE,
-                        message=f"文件 '{path}' 是二进制文件，拒绝按文本覆盖"
+                        message=f"File '{path}' is a binary file, refusing to overwrite as text"
                     )
 
-                # 获取当前文件元数据
+                # Get current file metadata
                 current_mtime = os.path.getmtime(full_path)
                 current_mtime_ms = int(current_mtime * 1000)
                 current_size = os.path.getsize(full_path)
                 old_content, _ = read_text_file(full_path)
                 line_ending = detect_line_ending(old_content)
 
-                # 检查乐观锁冲突
+                # Check optimistic locking conflict
                 if cached_mtime is not None:
                     if current_mtime_ms != cached_mtime:
                         return ToolResponse.error(
                             code=ToolErrorCode.CONFLICT,
-                            message=f"文件自上次读取后被修改。当前 mtime={current_mtime_ms}, 缓存 mtime={cached_mtime}",
+                            message=f"File modified since last read. Current mtime={current_mtime_ms}, cached mtime={cached_mtime}",
                             context={
                                 "current_mtime_ms": current_mtime_ms,
                                 "cached_mtime_ms": cached_mtime
@@ -569,32 +558,32 @@ class WriteTool(Tool):
                 if cached_size is not None and current_size != cached_size:
                     return ToolResponse.error(
                         code=ToolErrorCode.CONFLICT,
-                        message=f"文件自上次读取后大小已变化。当前 size={current_size}, 缓存 size={cached_size}",
+                        message=f"File size changed since last read. Current size={current_size}, cached size={cached_size}",
                         context={
                             "current_size_bytes": current_size,
                             "cached_size_bytes": cached_size
                         }
                     )
 
-                # 备份原文件
+                # Back up original file
                 if not dry_run:
                     backup_path = self._backup_file(full_path)
             else:
-                # 确保父目录存在
+                # Ensure parent directory exists
                 full_path.parent.mkdir(parents=True, exist_ok=True)
 
             rel_path = _display_path(self.project_root, full_path)
             normalized_content = normalize_line_endings(content, line_ending) if old_content else content
 
             if old_content == normalized_content:
-                existing_mtime = int(os.path.getmtime(full_path) * 1000) if full_path.exists() else 0
+                existing_mtime = int(os.getmtime(full_path) * 1000) if full_path.exists() else 0
                 existing_size = os.path.getsize(full_path) if full_path.exists() else len(normalized_content.encode('utf-8'))
-                return _no_change_response("写入检查完成", rel_path, existing_mtime, existing_size)
+                return _no_change_response("Write check complete", rel_path, existing_mtime, existing_size)
 
             diff_preview, diff_truncated = make_diff_preview(old_content, normalized_content, rel_path)
 
             if not dry_run:
-                # 原子写入
+                # Atomic write
                 atomic_write(full_path, normalized_content)
 
             size_bytes = len(normalized_content.encode('utf-8'))
@@ -606,8 +595,8 @@ class WriteTool(Tool):
             response_factory = ToolResponse.partial if dry_run else ToolResponse.success
             return response_factory(
                 text=(
-                    f"{'Dry run：将写入' if dry_run else '成功写入'} {rel_path} ({size_bytes} 字节)\n"
-                    f"元数据: file_mtime_ms={new_mtime_ms}, file_size_bytes={size_bytes}, "
+                    f"{'Dry run: Will write' if dry_run else 'Successfully wrote'} {rel_path} ({size_bytes} bytes)\n"
+                    f"Metadata: file_mtime_ms={new_mtime_ms}, file_size_bytes={size_bytes}, "
                     f"expected_mtime_ms={new_mtime_ms}, expected_size_bytes={size_bytes}"
                     + _format_diff_section(diff_preview, diff_truncated)
                 ),
@@ -629,22 +618,22 @@ class WriteTool(Tool):
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"路径 '{path}' 超出项目根目录，访问被拒绝"
+                message=f"Path '{path}' is outside the project root, access denied"
             )
 
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"无权限写入 '{path}'"
+                message=f"No permission to write '{path}'"
             )
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"写入文件失败：{str(e)}"
+                message=f"Failed to write file: {str(e)}"
             )
 
     def _backup_file(self, full_path: Path) -> Path:
-        """备份文件"""
+        """Back up file"""
         backup_dir = full_path.parent / ".backups"
         backup_dir.mkdir(exist_ok=True)
 
@@ -656,7 +645,7 @@ class WriteTool(Tool):
         return backup_path
 
     def _resolve_path(self, path: str) -> Path:
-        """解析相对路径"""
+        """Resolve relative path"""
         if os.path.isabs(path):
             full_path = Path(path).resolve()
         else:
@@ -666,18 +655,18 @@ class WriteTool(Tool):
 
 
 class EditTool(Tool):
-    """文件编辑工具
+    """File Edit Tool
 
-    功能：
-    - 精确替换文件内容（old_string 必须唯一匹配）
-    - 乐观锁冲突检测
-    - 自动备份原文件
+    Features:
+    - Precise replacement of file content (old_string must match uniquely)
+    - Optimistic locking conflict detection
+    - Automatically back up the original file
 
-    参数：
-    - path: 文件路径
-    - old_string: 要替换的内容
-    - new_string: 替换后的内容
-    - file_mtime_ms: 缓存的 mtime（可选）
+    Parameters:
+    - path: File path
+    - old_string: Content to be replaced
+    - new_string: Replacement content
+    - file_mtime_ms: Cached mtime (optional)
     """
 
     def __init__(
@@ -749,7 +738,7 @@ class EditTool(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行文件编辑"""
+        """Execute file edit"""
         path = parameters.get("path")
         old_string = parameters.get("old_string")
         new_string = parameters.get("new_string")
@@ -760,51 +749,51 @@ class EditTool(Tool):
         if not path:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: path"
+                message="Missing required parameter: path"
             )
 
         if old_string is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: old_string"
+                message="Missing required parameter: old_string"
             )
 
         if new_string is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: new_string"
+                message="Missing required parameter: new_string"
             )
 
         try:
-            # 解析路径
+            # Resolve path
             full_path = self._resolve_path(path)
 
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"文件 '{path}' 不存在"
+                    message=f"File '{path}' does not exist"
                 )
             if full_path.is_dir():
                 return ToolResponse.error(
                     code=ToolErrorCode.IS_DIRECTORY,
-                    message=f"路径 '{path}' 是目录，不能按文件编辑"
+                    message=f"Path '{path}' is a directory, cannot edit as a file"
                 )
             if is_binary_file(full_path):
                 return ToolResponse.error(
                     code=ToolErrorCode.BINARY_FILE,
-                    message=f"文件 '{path}' 是二进制文件，无法按文本编辑"
+                    message=f"File '{path}' is a binary file, cannot edit as text"
                 )
 
-            # 获取当前文件元数据
+            # Get current file metadata
             current_mtime = os.path.getmtime(full_path)
             current_mtime_ms = int(current_mtime * 1000)
             current_size = os.path.getsize(full_path)
 
-            # 检查乐观锁冲突
+            # Check optimistic locking conflict
             if cached_mtime is not None and current_mtime_ms != cached_mtime:
                 return ToolResponse.error(
                     code=ToolErrorCode.CONFLICT,
-                    message=f"文件自上次读取后被修改。当前 mtime={current_mtime_ms}, 缓存 mtime={cached_mtime}",
+                    message=f"File modified since last read. Current mtime={current_mtime_ms}, cached mtime={cached_mtime}",
                     context={
                         "current_mtime_ms": current_mtime_ms,
                         "cached_mtime_ms": cached_mtime
@@ -813,34 +802,34 @@ class EditTool(Tool):
             if cached_size is not None and current_size != cached_size:
                 return ToolResponse.error(
                     code=ToolErrorCode.CONFLICT,
-                    message=f"文件自上次读取后大小已变化。当前 size={current_size}, 缓存 size={cached_size}",
+                    message=f"File size changed since last read. Current size={current_size}, cached size={cached_size}",
                     context={
                         "current_size_bytes": current_size,
                         "cached_size_bytes": cached_size
                     }
                 )
 
-            # 读取文件内容
+            # Read file content
             content, _ = read_text_file(full_path)
             line_ending = detect_line_ending(content)
 
-            # 检查 old_string 是否唯一匹配
+            # Check if old_string matches uniquely
             matches = content.count(old_string)
             if matches != 1:
                 return ToolResponse.error(
                     code=ToolErrorCode.INVALID_PARAM,
-                    message=f"old_string 必须唯一匹配文件内容。找到 {matches} 处匹配。",
+                    message=f"old_string must match file content uniquely. Found {matches} matches.",
                     context={"matches": matches}
                 )
 
-            # 执行替换
+            # Execute replacement
             new_content = content.replace(old_string, new_string)
             new_content = normalize_line_endings(new_content, line_ending)
             rel_path = _display_path(self.project_root, full_path)
 
             if new_content == content:
                 return _no_change_response(
-                    "编辑检查完成",
+                    "Edit check complete",
                     rel_path,
                     current_mtime_ms,
                     current_size,
@@ -848,10 +837,10 @@ class EditTool(Tool):
 
             diff_preview, diff_truncated = make_diff_preview(content, new_content, rel_path)
 
-            # 备份原文件
+            # Back up original file
             backup_path = self._backup_file(full_path) if not dry_run else None
 
-            # 写入新内容
+            # Write new content
             if not dry_run:
                 atomic_write(full_path, new_content)
 
@@ -862,8 +851,8 @@ class EditTool(Tool):
             response_factory = ToolResponse.partial if dry_run else ToolResponse.success
             return response_factory(
                 text=(
-                    f"{'Dry run：将编辑' if dry_run else '成功编辑'} {rel_path} (变化 {changed_bytes:+d} 字节)\n"
-                    f"元数据: file_mtime_ms={new_mtime_ms}, file_size_bytes={new_size}, "
+                    f"{'Dry run: Will edit' if dry_run else 'Successfully edited'} {rel_path} ({changed_bytes:+d} bytes changed)\n"
+                    f"Metadata: file_mtime_ms={new_mtime_ms}, file_size_bytes={new_size}, "
                     f"expected_mtime_ms={new_mtime_ms}, expected_size_bytes={new_size}"
                     + _format_diff_section(diff_preview, diff_truncated)
                 ),
@@ -886,22 +875,22 @@ class EditTool(Tool):
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"路径 '{path}' 超出项目根目录，访问被拒绝"
+                message=f"Path '{path}' is outside the project root, access denied"
             )
 
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"无权限编辑 '{path}'"
+                message=f"No permission to edit '{path}'"
             )
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"编辑文件失败：{str(e)}"
+                message=f"Failed to edit file: {str(e)}"
             )
 
     def _backup_file(self, full_path: Path) -> Path:
-        """备份文件"""
+        """Back up file"""
         backup_dir = full_path.parent / ".backups"
         backup_dir.mkdir(exist_ok=True)
 
@@ -913,7 +902,7 @@ class EditTool(Tool):
         return backup_path
 
     def _resolve_path(self, path: str) -> Path:
-        """解析相对路径"""
+        """Resolve relative path"""
         if os.path.isabs(path):
             full_path = Path(path).resolve()
         else:
@@ -923,17 +912,17 @@ class EditTool(Tool):
 
 
 class MultiEditTool(Tool):
-    """批量编辑工具
+    """Batch Edit Tool
 
-    功能：
-    - 批量执行多个替换操作
-    - 原子性保证（要么全部成功，要么全部失败）
-    - 乐观锁冲突检测（所有替换前检查一次）
+    Features:
+    - Execute multiple replacement operations in batch
+    - Atomicity guarantee (all succeed or all fail)
+    - Optimistic locking conflict detection (checked once before all replacements)
 
-    参数：
-    - path: 文件路径
-    - edits: 替换列表 [{"old_string": "...", "new_string": "..."}]
-    - file_mtime_ms: 缓存的 mtime（可选）
+    Parameters:
+    - path: File path
+    - edits: List of replacement objects [{"old_string": "...", "new_string": "..."}]
+    - file_mtime_ms: Cached mtime (optional)
     """
 
     def __init__(
@@ -999,7 +988,7 @@ class MultiEditTool(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """执行批量编辑"""
+        """Execute batch edit"""
         path = parameters.get("path")
         edits = parameters.get("edits")
         cached_mtime = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
@@ -1009,45 +998,45 @@ class MultiEditTool(Tool):
         if not path:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: path"
+                message="Missing required parameter: path"
             )
 
         if not edits or not isinstance(edits, list):
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="缺少必需参数: edits（必须是列表）"
+                message="Missing required parameter: edits (must be a list)"
             )
 
         try:
-            # 解析路径
+            # Resolve path
             full_path = self._resolve_path(path)
 
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"文件 '{path}' 不存在"
+                    message=f"File '{path}' does not exist"
                 )
             if full_path.is_dir():
                 return ToolResponse.error(
                     code=ToolErrorCode.IS_DIRECTORY,
-                    message=f"路径 '{path}' 是目录，不能按文件批量编辑"
+                    message=f"Path '{path}' is a directory, cannot batch edit as a file"
                 )
             if is_binary_file(full_path):
                 return ToolResponse.error(
                     code=ToolErrorCode.BINARY_FILE,
-                    message=f"文件 '{path}' 是二进制文件，无法按文本批量编辑"
+                    message=f"File '{path}' is a binary file, cannot batch edit as text"
                 )
 
-            # 获取当前文件元数据
+            # Get current file metadata
             current_mtime = os.path.getmtime(full_path)
             current_mtime_ms = int(current_mtime * 1000)
             current_size = os.path.getsize(full_path)
 
-            # 检查乐观锁冲突（所有替换前检查一次）
+            # Check optimistic locking conflict (checked once before all replacements)
             if cached_mtime is not None and current_mtime_ms != cached_mtime:
                 return ToolResponse.error(
                     code=ToolErrorCode.CONFLICT,
-                    message=f"文件自上次读取后被修改。所有替换已取消。当前 mtime={current_mtime_ms}, 缓存 mtime={cached_mtime}",
+                    message=f"File modified since last read. All replacements cancelled. Current mtime={current_mtime_ms}, cached mtime={cached_mtime}",
                     context={
                         "current_mtime_ms": current_mtime_ms,
                         "cached_mtime_ms": cached_mtime
@@ -1056,24 +1045,24 @@ class MultiEditTool(Tool):
             if cached_size is not None and current_size != cached_size:
                 return ToolResponse.error(
                     code=ToolErrorCode.CONFLICT,
-                    message=f"文件自上次读取后大小已变化。所有替换已取消。当前 size={current_size}, 缓存 size={cached_size}",
+                    message=f"File size changed since last read. All replacements cancelled. Current size={current_size}, cached size={cached_size}",
                     context={
                         "current_size_bytes": current_size,
                         "cached_size_bytes": cached_size
                     }
                 )
 
-            # 读取文件内容
+            # Read file content
             original_content, _ = read_text_file(full_path)
             line_ending = detect_line_ending(original_content)
             replacements = []
 
-            # 所有匹配都基于原始内容定位，避免前一次替换影响后一次锚点
+            # All matches are positioned based on original content to avoid previous replacements affecting subsequent anchors
             for i, edit in enumerate(edits):
                 if not isinstance(edit, dict):
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"编辑项 {i} 必须是对象，包含 old_string 和 new_string"
+                        message=f"Edit item {i} must be an object containing old_string and new_string"
                     )
 
                 old_string = edit.get("old_string")
@@ -1082,19 +1071,19 @@ class MultiEditTool(Tool):
                 if old_string is None or new_string is None:
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"编辑项 {i} 缺少 old_string 或 new_string"
+                        message=f"Edit item {i} is missing old_string or new_string"
                     )
                 if old_string == "":
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"编辑项 {i} 的 old_string 不能为空"
+                        message=f"old_string of edit item {i} cannot be empty"
                     )
 
                 matches = original_content.count(old_string)
                 if matches != 1:
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"编辑项 {i}: old_string 必须唯一匹配原始文件内容。找到 {matches} 处匹配。",
+                        message=f"Edit item {i}: old_string must uniquely match original file content. Found {matches} matches.",
                         context={"edit_index": i, "matches": matches}
                     )
 
@@ -1108,15 +1097,15 @@ class MultiEditTool(Tool):
                     "new_string": new_string,
                 })
 
-            # 检查替换区域冲突（按原始文件区域）
+            # Check for replacement area conflicts (relative to original file areas)
             ordered = sorted(replacements, key=lambda item: item["start"])
             for prev, curr in zip(ordered, ordered[1:]):
                 if curr["start"] < prev["end"]:
                     return ToolResponse.error(
                         code=ToolErrorCode.CONFLICT,
                         message=(
-                            f"编辑项 {prev['edit_index']} 与编辑项 {curr['edit_index']} 的替换区域重叠，"
-                            "无法原子批量应用。"
+                            f"The replacement area for edit item {prev['edit_index']} overlaps with edit item {curr['edit_index']}; "
+                            "cannot apply batch atomically."
                         ),
                         context={
                             "previous_edit_index": prev["edit_index"],
@@ -1138,7 +1127,7 @@ class MultiEditTool(Tool):
 
             if new_content == original_content:
                 return _no_change_response(
-                    "批量编辑检查完成",
+                    "Batch edit check complete",
                     rel_path,
                     current_mtime_ms,
                     current_size,
@@ -1146,10 +1135,10 @@ class MultiEditTool(Tool):
 
             diff_preview, diff_truncated = make_diff_preview(original_content, new_content, rel_path)
 
-            # 备份原文件
+            # Back up original file
             backup_path = self._backup_file(full_path) if not dry_run else None
 
-            # 原子写入
+            # Atomic write
             if not dry_run:
                 atomic_write(full_path, new_content)
 
@@ -1160,8 +1149,8 @@ class MultiEditTool(Tool):
             response_factory = ToolResponse.partial if dry_run else ToolResponse.success
             return response_factory(
                 text=(
-                    f"{'Dry run：将执行' if dry_run else '成功执行'} {len(edits)} 个独立替换操作于 {rel_path} (变化 {changed_bytes:+d} 字节)\n"
-                    f"元数据: file_mtime_ms={new_mtime_ms}, file_size_bytes={new_size}, "
+                    f"{'Dry run: Will execute' if dry_run else 'Successfully executed'} {len(edits)} independent replacement operations on {rel_path} ({changed_bytes:+d} bytes changed)\n"
+                    f"Metadata: file_mtime_ms={new_mtime_ms}, file_size_bytes={new_size}, "
                     f"expected_mtime_ms={new_mtime_ms}, expected_size_bytes={new_size}"
                     + _format_diff_section(diff_preview, diff_truncated)
                 ),
@@ -1185,22 +1174,22 @@ class MultiEditTool(Tool):
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"路径 '{path}' 超出项目根目录，访问被拒绝"
+                message=f"Path '{path}' is outside the project root, access denied"
             )
 
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"无权限编辑 '{path}'"
+                message=f"No permission to edit '{path}'"
             )
         except Exception as e:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"批量编辑失败：{str(e)}"
+                message=f"Failed to batch edit: {str(e)}"
             )
 
     def _backup_file(self, full_path: Path) -> Path:
-        """备份文件"""
+        """Back up file"""
         backup_dir = full_path.parent / ".backups"
         backup_dir.mkdir(exist_ok=True)
 
@@ -1212,7 +1201,7 @@ class MultiEditTool(Tool):
         return backup_path
 
     def _resolve_path(self, path: str) -> Path:
-        """解析相对路径"""
+        """Resolve relative path"""
         if os.path.isabs(path):
             full_path = Path(path).resolve()
         else:
@@ -1222,7 +1211,7 @@ class MultiEditTool(Tool):
 
 
 class EditFileMultiTool(MultiEditTool):
-    """兼容命名：EditFileMulti -> MultiEdit。"""
+    """Compatibility alias: EditFileMulti -> MultiEdit."""
 
     def __init__(
         self,

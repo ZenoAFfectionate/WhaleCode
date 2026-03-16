@@ -1,26 +1,25 @@
-"""ContextBuilder - GSSC流水线实现
+"""ContextBuilder - GSSC Pipeline Implementation
 
-实现 Gather-Select-Structure-Compress 上下文构建流程：
-1. Gather: 从多源收集候选信息（历史、工具结果）
-2. Select: 基于优先级、相关性、多样性筛选
-3. Structure: 组织成结构化上下文模板
-4. Compress: 在预算内压缩与规范化
+Implements the Gather-Select-Structure-Compress context building process:
+1. Gather: Collect candidate information from multiple sources (history, tool results)
+2. Select: Filter based on priority, relevance, and diversity
+3. Structure: Organize into a structured context template
+4. Compress: Compress and normalize within the budget
 
-注意：MemoryTool 和 RAGTool 已被移除，如需使用请自行实现
+Note: MemoryTool and RAGTool have been removed. If you need to use them, please implement them yourself.
 """
-
-from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, field
-from datetime import datetime
-import tiktoken
 import math
+import tiktoken
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple
 
 from ..core.message import Message
 
 
 @dataclass
 class ContextPacket:
-    """上下文信息包"""
+    """Context information packet"""
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -28,42 +27,42 @@ class ContextPacket:
     relevance_score: float = 0.0  # 0.0-1.0
     
     def __post_init__(self):
-        """自动计算token数"""
+        """Automatically calculate token count"""
         if self.token_count == 0:
             self.token_count = count_tokens(self.content)
 
 
 @dataclass
 class ContextConfig:
-    """上下文构建配置"""
-    max_tokens: int = 8000  # 总预算
-    reserve_ratio: float = 0.15  # 生成余量（10-20%）
-    min_relevance: float = 0.3  # 最小相关性阈值
-    enable_mmr: bool = True  # 启用最大边际相关性（多样性）
-    mmr_lambda: float = 0.7  # MMR平衡参数（0=纯多样性, 1=纯相关性）
-    system_prompt_template: str = ""  # 系统提示模板
-    enable_compression: bool = True  # 启用压缩
+    """Context build configuration"""
+    max_tokens: int = 8000  # Total budget
+    reserve_ratio: float = 0.15  # Generation margin (10-20%)
+    min_relevance: float = 0.3   # Minimum relevance threshold
+    enable_mmr: bool = True  # Enable Maximum Marginal Relevance (diversity)
+    mmr_lambda: float = 0.7  # MMR balance parameter (0=pure diversity, 1=pure relevance)
+    system_prompt_template: str = ""  # System prompt template
+    enable_compression: bool = True  # Enable compression
     
     def get_available_tokens(self) -> int:
-        """获取可用token预算（扣除余量）"""
+        """Get available token budget (deducting margin)"""
         return int(self.max_tokens * (1 - self.reserve_ratio))
 
 
 class ContextBuilder:
-    """上下文构建器 - GSSC流水线
+    """Context Builder - GSSC Pipeline
 
-    注意：MemoryTool 和 RAGTool 已被移除，此类暂时不可用
+    Note: MemoryTool and RAGTool have been removed. This class is temporarily unavailable.
 
-    用法示例：
+    Usage example:
     ```python
     builder = ContextBuilder(
         config=ContextConfig(max_tokens=8000)
     )
 
     context = builder.build(
-        user_query="用户问题",
+        user_query="User query",
         conversation_history=[...],
-        system_instructions="系统指令"
+        system_instructions="System instructions"
     )
     ```
     """
@@ -82,18 +81,18 @@ class ContextBuilder:
         system_instructions: Optional[str] = None,
         additional_packets: Optional[List[ContextPacket]] = None
     ) -> str:
-        """构建完整上下文
+        """Build the complete context
         
         Args:
-            user_query: 用户查询
-            conversation_history: 对话历史
-            system_instructions: 系统指令
-            additional_packets: 额外的上下文包
+            user_query: User query
+            conversation_history: Conversation history
+            system_instructions: System instructions
+            additional_packets: Additional context packets
             
         Returns:
-            结构化上下文字符串
+            Structured context string
         """
-        # 1. Gather: 收集候选信息
+        # 1. Gather: Collect candidate information
         packets = self._gather(
             user_query=user_query,
             conversation_history=conversation_history or [],
@@ -101,17 +100,17 @@ class ContextBuilder:
             additional_packets=additional_packets or []
         )
         
-        # 2. Select: 筛选与排序
+        # 2. Select: Filter and sort
         selected_packets = self._select(packets, user_query)
         
-        # 3. Structure: 组织成结构化模板
+        # 3. Structure: Organize into a structured template
         structured_context = self._structure(
             selected_packets=selected_packets,
             user_query=user_query,
             system_instructions=system_instructions
         )
         
-        # 4. Compress: 压缩与规范化（如果超预算）
+        # 4. Compress: Compress and normalize (if over budget)
         final_context = self._compress(structured_context)
         
         return final_context
@@ -123,22 +122,22 @@ class ContextBuilder:
         system_instructions: Optional[str],
         additional_packets: List[ContextPacket]
     ) -> List[ContextPacket]:
-        """Gather: 收集候选信息"""
+        """Gather: Collect candidate information"""
         packets = []
         
-        # P0: 系统指令（强约束）
+        # P0: System instructions (strong constraint)
         if system_instructions:
             packets.append(ContextPacket(
                 content=system_instructions,
                 metadata={"type": "instructions"}
             ))
 
-        # 注意：MemoryTool 和 RAGTool 已被移除
-        # 如需使用记忆和知识库功能，请自行实现
+        # Note: MemoryTool and RAGTool have been removed
+        # If you need memory and knowledge base features, please implement them yourself
 
-        # P3: 对话历史（辅助材料）
+        # P3: Conversation history (supplementary material)
         if conversation_history:
-            # 只保留最近N条
+            # Keep only the most recent N items
             recent_history = conversation_history[-10:]
             history_text = "\n".join([
                 f"[{msg.role}] {msg.content}"
@@ -149,7 +148,7 @@ class ContextBuilder:
                 metadata={"type": "history", "count": len(recent_history)}
             ))
 
-        # 添加额外包
+        # Add additional packets
         packets.extend(additional_packets)
 
         return packets
@@ -159,8 +158,8 @@ class ContextBuilder:
         packets: List[ContextPacket],
         user_query: str
     ) -> List[ContextPacket]:
-        """Select: 基于分数与预算的筛选"""
-        # 1) 计算相关性（关键词重叠）
+        """Select: Filtering based on score and budget"""
+        # 1) Calculate relevance (keyword overlap)
         query_tokens = set(user_query.lower().split())
         for packet in packets:
             content_tokens = set(packet.content.lower().split())
@@ -170,39 +169,39 @@ class ContextBuilder:
             else:
                 packet.relevance_score = 0.0
         
-        # 2) 计算新近性（指数衰减）
+        # 2) Calculate recency (exponential decay)
         def recency_score(ts: datetime) -> float:
             delta = max((datetime.now() - ts).total_seconds(), 0)
-            tau = 3600  # 1小时时间尺度，可暴露到配置
+            tau = 3600  # 1 hour time scale, can be exposed to config
             return math.exp(-delta / tau)
         
-        # 3) 计算复合分：0.7*相关性 + 0.3*新近性
+        # 3) Calculate composite score: 0.7*relevance + 0.3*recency
         scored_packets: List[Tuple[float, ContextPacket]] = []
         for p in packets:
             rec = recency_score(p.timestamp)
             score = 0.7 * p.relevance_score + 0.3 * rec
             scored_packets.append((score, p))
         
-        # 4) 系统指令单独拿出，固定纳入
+        # 4) Extract system instructions separately, fixed inclusion
         system_packets = [p for (_, p) in scored_packets if p.metadata.get("type") == "instructions"]
         remaining = [p for (s, p) in sorted(scored_packets, key=lambda x: x[0], reverse=True)
                      if p.metadata.get("type") != "instructions"]
         
-        # 5) 依据 min_relevance 过滤（对非系统包）
+        # 5) Filter by min_relevance (for non-system packets)
         filtered = [p for p in remaining if p.relevance_score >= self.config.min_relevance]
         
-        # 6) 按预算填充
+        # 6) Fill according to budget
         available_tokens = self.config.get_available_tokens()
         selected: List[ContextPacket] = []
         used_tokens = 0
         
-        # 先放入系统指令（不排序）
+        # Put system instructions first (unsorted)
         for p in system_packets:
             if used_tokens + p.token_count <= available_tokens:
                 selected.append(p)
                 used_tokens += p.token_count
         
-        # 再按分数加入其余
+        # Then add the rest based on score
         for p in filtered:
             if used_tokens + p.token_count > available_tokens:
                 continue
@@ -217,57 +216,57 @@ class ContextBuilder:
         user_query: str,
         system_instructions: Optional[str]
     ) -> str:
-        """Structure: 组织成结构化上下文模板"""
+        """Structure: Organize into a structured context template"""
         sections = []
         
-        # [Role & Policies] - 系统指令
+        # [Role & Policies] - System instructions
         p0_packets = [p for p in selected_packets if p.metadata.get("type") == "instructions"]
         if p0_packets:
             role_section = "[Role & Policies]\n"
             role_section += "\n".join([p.content for p in p0_packets])
             sections.append(role_section)
         
-        # [Task] - 当前任务
-        sections.append(f"[Task]\n用户问题：{user_query}")
+        # [Task] - Current task
+        sections.append(f"[Task]\nUser Query: {user_query}")
         
-        # [State] - 任务状态
+        # [State] - Task state
         p1_packets = [p for p in selected_packets if p.metadata.get("type") == "task_state"]
         if p1_packets:
-            state_section = "[State]\n关键进展与未决问题：\n"
+            state_section = "[State]\nKey Progress and Pending Issues:\n"
             state_section += "\n".join([p.content for p in p1_packets])
             sections.append(state_section)
         
-        # [Evidence] - 事实证据
+        # [Evidence] - Factual evidence
         p2_packets = [
             p for p in selected_packets
             if p.metadata.get("type") in {"related_memory", "knowledge_base", "retrieval", "tool_result"}
         ]
         if p2_packets:
-            evidence_section = "[Evidence]\n事实与引用：\n"
+            evidence_section = "[Evidence]\nFacts and References:\n"
             for p in p2_packets:
                 evidence_section += f"\n{p.content}\n"
             sections.append(evidence_section)
         
-        # [Context] - 辅助材料（历史等）
+        # [Context] - Supplementary material (history, etc.)
         p3_packets = [p for p in selected_packets if p.metadata.get("type") == "history"]
         if p3_packets:
-            context_section = "[Context]\n对话历史与背景：\n"
+            context_section = "[Context]\nConversation History and Background:\n"
             context_section += "\n".join([p.content for p in p3_packets])
             sections.append(context_section)
         
-        # [Output] - 输出约束
+        # [Output] - Output constraints
         output_section = """[Output]
-                            请按以下格式回答：
-                            1. 结论（简洁明确）
-                            2. 依据（列出支撑证据及来源）
-                            3. 风险与假设（如有）
-                            4. 下一步行动建议（如适用）"""
+                            Please answer in the following format:
+                            1. Conclusion (concise and clear)
+                            2. Basis (list supporting evidence and sources)
+                            3. Risks and Assumptions (if any)
+                            4. Next Steps (if applicable)"""
         sections.append(output_section)
         
         return "\n\n".join(sections)
     
     def _compress(self, context: str) -> str:
-        """Compress: 压缩与规范化"""
+        """Compress: Compress and normalize"""
         if not self.config.enable_compression:
             return context
         
@@ -277,11 +276,11 @@ class ContextBuilder:
         if current_tokens <= available_tokens:
             return context
         
-        # 简单截断策略（保留前N个token）
-        # 实际应用中可用LLM做高保真摘要
-        print(f"⚠️ 上下文超预算 ({current_tokens} > {available_tokens})，执行截断")
+        # Simple truncation strategy (keep the first N tokens)
+        # In practice, an LLM can be used for high-fidelity summarization
+        print(f"⚠️ Context exceeds budget ({current_tokens} > {available_tokens}), performing truncation")
         
-        # 按段落截断，保留结构
+        # Truncate by paragraph, preserving structure
         lines = context.split("\n")
         compressed_lines = []
         used_tokens = 0
@@ -297,11 +296,10 @@ class ContextBuilder:
 
 
 def count_tokens(text: str) -> int:
-    """计算文本token数（使用tiktoken）"""
+    """Calculate text token count (using tiktoken)"""
     try:
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     except Exception:
-        # 降级方案：粗略估算（1 token ≈ 4 字符）
+        # Fallback plan: rough estimation (1 token ≈ 4 characters)
         return len(text) // 4
-

@@ -2,159 +2,161 @@
 
 Responsibilities:
 - Local token estimation (no API calls required)
-- Caching mechanism (avoid repeated calculations)
+- Caching mechanism with bounded size (LRU eviction)
 - Incremental calculation (only calculate new messages)
-- Fallback plan (use character estimation when tiktoken is unavailable)
+- Multi-backend: transformers AutoTokenizer → tiktoken → character estimation
 """
 
-import tiktoken
-from typing import List, Dict
+from collections import OrderedDict
+from typing import List, Dict, Optional
+
 from ..core.message import Message
+
+
+class _LRUCache:
+    """Simple bounded LRU cache using OrderedDict."""
+
+    def __init__(self, max_size: int = 4096):
+        self._data: OrderedDict[str, int] = OrderedDict()
+        self.max_size = max_size
+
+    def get(self, key: str) -> Optional[int]:
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        return None
+
+    def put(self, key: str, value: int) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+            self._data[key] = value
+        else:
+            if len(self._data) >= self.max_size:
+                self._data.popitem(last=False)  # evict oldest
+            self._data[key] = value
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def values(self):
+        return self._data.values()
 
 
 class TokenCounter:
     """Token Counter
-    
-    Features:
-    - Local estimation (no API calls required)
-    - Caching mechanism (avoid repeated calculations)
-    - Incremental calculation (only calculate new messages)
-    - Fallback plan (use character estimation when tiktoken is unavailable)
-    
-    Usage Example:
-    ```python
-    counter = TokenCounter(model="gpt-4")
-    
-    # Calculate single message
-    tokens = counter.count_message(message)
-    
-    # Calculate list of messages
-    total = counter.count_messages(messages)
-    
-    # Incremental calculation
-    new_total = counter.count_incremental(previous_count, new_messages)
-    ```
+
+    Encoder priority:
+    1. transformers AutoTokenizer (accurate for Qwen / LLaMA / etc.)
+    2. tiktoken (accurate for GPT family)
+    3. Character estimation (1 token ≈ 4 chars, no dependency)
+
+    The cache is bounded (default 4096 entries, LRU eviction).
     """
-    
-    def __init__(self, model: str = "gpt-4"):
+
+    # Singleton cache for tokenizer instances (avoid repeated loading)
+    _tokenizer_cache: Dict[str, object] = {}
+
+    def __init__(self, model: str = "gpt-4", cache_max_size: int = 4096):
         """Initialize Token Counter
-        
+
         Args:
-            model: Model name (used to select tiktoken encoder)
+            model: Model name (used to select the best tokenizer)
+            cache_max_size: Maximum number of cached token counts (LRU)
         """
         self.model = model
         self._encoding = self._get_encoding()
-        self._cache: Dict[str, int] = {}  # Message content -> Token count
-    
+        self._cache = _LRUCache(max_size=cache_max_size)
+
     def _get_encoding(self):
-        """Get tiktoken encoder
-        
+        """Get the best available tokenizer for the model.
+
         Returns:
-            tiktoken encoder instance, returns None on failure
+            A tokenizer object with an `encode(text) -> list` method,
+            or None if no tokenizer is available.
         """
+        # 1. Try transformers AutoTokenizer (best for Qwen, LLaMA, etc.)
+        hf_tokenizer = self._try_transformers_tokenizer()
+        if hf_tokenizer is not None:
+            return hf_tokenizer
+
+        # 2. Try tiktoken (best for GPT family)
+        return self._try_tiktoken()
+
+    def _try_transformers_tokenizer(self):
+        """Try to load a HuggingFace tokenizer for the model."""
+        if self.model in self._tokenizer_cache:
+            return self._tokenizer_cache[self.model]
+
         try:
-            # Attempt to get encoder based on model name
-            return tiktoken.encoding_for_model(self.model)
-        except KeyError:
-            # Fallback to generic encoder
-            try:
-                return tiktoken.get_encoding("cl100k_base")
-            except Exception:
-                return None
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+            self._tokenizer_cache[self.model] = tokenizer
+            return tokenizer
         except Exception:
-            # tiktoken unavailable
             return None
-    
+
+    def _try_tiktoken(self):
+        """Try to get a tiktoken encoder."""
+        try:
+            import tiktoken
+            try:
+                return tiktoken.encoding_for_model(self.model)
+            except KeyError:
+                return tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return None
+
     def count_messages(self, messages: List[Message]) -> int:
-        """Calculate token count for a list of messages
-        
-        Args:
-            messages: List of messages
-        
-        Returns:
-            Token count
-        """
+        """Calculate token count for a list of messages"""
         total = 0
         for msg in messages:
             total += self.count_message(msg)
         return total
-    
+
     def count_message(self, message: Message) -> int:
-        """Calculate token count for a single message (with caching)
-        
-        Args:
-            message: Message object
-        
-        Returns:
-            Token count
-        """
-        # Use message content as cache key
+        """Calculate token count for a single message (with LRU caching)"""
         cache_key = f"{message.role}:{message.content}"
-        
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        # Calculate token count
+
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         tokens = self._count_text(message.content)
-        
         # Add overhead for role markers (approx. 4 tokens)
         tokens += 4
-        
-        # Cache result
-        self._cache[cache_key] = tokens
-        
+
+        self._cache.put(cache_key, tokens)
         return tokens
-    
+
     def count_text(self, text: str) -> int:
-        """Calculate token count for text (no cache)
-        
-        Args:
-            text: Text content
-        
-        Returns:
-            Token count
-        """
+        """Calculate token count for text (no cache)"""
         return self._count_text(text)
-    
+
     def _count_text(self, text: str) -> int:
-        """Internal token calculation method
-        
-        Args:
-            text: Text content
-        
-        Returns:
-            Token count
-        """
-        if self._encoding:
-            # Precise calculation using tiktoken
+        """Internal token calculation method"""
+        if self._encoding is not None:
             try:
                 return len(self._encoding.encode(text))
             except Exception:
-                # tiktoken encoding failed, fallback to character estimation
-                return len(text) // 4
-        else:
-            # Fallback plan: Rough estimation (1 token ≈ 4 characters)
-            return len(text) // 4
-    
+                pass
+        # Fallback: rough estimation (1 token ≈ 4 characters)
+        return len(text) // 4
 
     def clear_cache(self):
         """Clear cache"""
         self._cache.clear()
 
     def get_cache_size(self) -> int:
-        """Get cache size
-
-        Returns:
-            Number of cached messages
-        """
+        """Get cache size"""
         return len(self._cache)
 
     def get_cache_stats(self) -> Dict[str, int]:
-        """Get cache statistics
-
-        Returns:
-            Dictionary of cache statistics
-        """
+        """Get cache statistics"""
         return {
             "cached_messages": len(self._cache),
             "total_cached_tokens": sum(self._cache.values())

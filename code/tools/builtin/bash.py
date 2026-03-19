@@ -187,30 +187,41 @@ class BashTool(Tool):
         return response
 
     def _validate_command(self, command: str) -> Optional[str]:
+        """Validate *command* against security policies.
+
+        Three-layer validation:
+          1. Catastrophic pattern detection (``rm -rf /``).
+          2. Raw-string scan for blocked commands — catches bypass vectors
+             such as ``env sudo``, ``$(sudo …)``, `` `sudo` ``, and
+             ``bash -c "sudo …"``.
+          3. Token-based preference check for segment leaders (soft).
+        """
         lowered = command.lower()
+
+        # --- Layer 1: catastrophic patterns ---
         if re.search(r"(^|[;&|]\s*)rm\s+-rf\s+/", lowered):
             return "Refusing to run a destructive command."
 
-        try:
-            tokens = shlex.split(command, posix=True)
-        except ValueError:
-            tokens = re.findall(r"[a-zA-Z0-9_./+-]+", command)
+        # --- Layer 2: raw-string scan for security-critical commands ---
+        # Searches the entire command string (including inside $(), ``,
+        # quotes, etc.) so that token-level bypass tricks are caught.
+        _categories: List[tuple[str, Set[str]]] = [
+            ("Privileged commands are not allowed", self.PRIVILEGED_COMMANDS),
+            ("Interactive terminal commands are not allowed", self.INTERACTIVE_COMMANDS),
+            ("Destructive system commands are not allowed", self.DESTRUCTIVE_COMMANDS),
+        ]
+        if not self.allow_network:
+            _categories.append(
+                ("Network-related commands are disabled for Bash by default", self.NETWORK_COMMANDS),
+            )
+        for message, blocklist in _categories:
+            for cmd in blocklist:
+                if re.search(rf"\b{re.escape(cmd)}\b", lowered):
+                    return f"{message} (detected '{cmd}')."
 
-        # Security blocklists: check all tokens regardless of position.
-        for token in tokens:
-            base = Path(token).name
-            if base in self.PRIVILEGED_COMMANDS:
-                return "Privileged commands are not allowed."
-            if base in self.INTERACTIVE_COMMANDS:
-                return "Interactive terminal commands are not allowed."
-            if base in self.DESTRUCTIVE_COMMANDS:
-                return "Destructive system commands are not allowed."
-            if base in self.NETWORK_COMMANDS and not self.allow_network:
-                return "Network-related commands are disabled for Bash by default."
-
-        # Preference blocklist: only check the leading command of each
-        # pipeline/chain segment so that piped usage is allowed.
-        # e.g. `git log | grep fix` is fine, but standalone `grep pattern` is not.
+        # --- Layer 3: preference blocklist (token-based, segment leaders only) ---
+        # Only the leading command of each pipeline/chain segment is checked,
+        # so piped usage like `git log | grep fix` is still allowed.
         for leader in self._extract_segment_leaders(command):
             if leader in self.PREFER_SPECIALIZED_TOOLS:
                 return (

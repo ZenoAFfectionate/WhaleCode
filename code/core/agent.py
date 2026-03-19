@@ -379,73 +379,67 @@ class Agent(ABC):
 （历史已压缩，保留最近 {self.config.min_retain_rounds} 轮完整对话）"""
 
     def _generate_smart_summary(self, history: List[Message]) -> str:
-        """生成智能摘要（调用 LLM）
+        """Generate a structured summary using the LLM.
 
-        使用轻量 LLM 生成结构化摘要，保留关键信息：
-        - 任务目标
-        - 关键决策
-        - 已完成工作
-        - 待处理事项
-        - 重要发现
+        Uses the shared SUMMARY_SYSTEM_PROMPT for consistent, English-language
+        summaries that preserve file paths, commands, and technical decisions.
 
         Args:
-            history: 历史消息列表
+            history: List of history messages
 
         Returns:
-            摘要文本
+            Summary text
         """
-        # 1. 提取要压缩的历史片段
+        import sys
+        from pathlib import Path
+        _proj_root = str(Path(__file__).resolve().parents[2])
+        if _proj_root not in sys.path:
+            sys.path.insert(0, _proj_root)
+        from prompts.summary_prompt import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
+
+        # 1. Extract the history segment to compress
         boundaries = self.history_manager.find_round_boundaries()
         if len(boundaries) <= self.config.min_retain_rounds:
             return self._generate_simple_summary(history)
 
-        # 保留最近 N 轮，压缩之前的
+        # Keep the most recent N rounds, compress the rest
         keep_from_index = boundaries[-self.config.min_retain_rounds]
         to_compress = history[:keep_from_index]
 
         if not to_compress:
             return self._generate_simple_summary(history)
 
-        # 2. 构建摘要 Prompt
+        # 2. Build conversation text for the summary prompt
         history_text = self._format_history_for_summary(to_compress)
 
-        summary_prompt = f"""请将以下对话历史压缩为结构化摘要，保留关键信息：
+        summary_prompt = SUMMARY_USER_TEMPLATE.format(
+            conversation=history_text,
+            focus_instruction="",
+            max_tokens=min(self.config.summary_max_tokens, 2048),
+        )
 
-## 对话历史
-{history_text}
-
-## 摘要要求
-1. **任务目标**：用户想要完成什么？
-2. **关键决策**：做了哪些重要决定？
-3. **已完成工作**：完成了哪些任务？（列表形式）
-4. **待处理事项**：还有什么未完成？
-5. **重要发现**：有哪些关键信息或问题？
-
-请用简洁的中文输出，每部分不超过 3 行。"""
-
-        # 3. 调用主 LLM 生成摘要
+        # 3. Call LLM to generate the summary
         try:
             messages = [
-                {"role": "system", "content": "你是一个专业的对话摘要助手，擅长提取关键信息。"},
+                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": summary_prompt}
             ]
 
-            # 非流式调用，快速获取结果
             summary = self.llm.invoke(
                 messages,
                 temperature=self.config.summary_temperature,
-                max_tokens=self.config.summary_max_tokens
+                max_tokens=min(self.config.summary_max_tokens, 2048)
             )
 
-            return f"""## 历史摘要（{len(to_compress)} 条消息）
+            return f"""## Archived Session Summary ({len(to_compress)} messages)
 {summary}
 
 ---
-（已压缩，保留最近 {self.config.min_retain_rounds} 轮完整对话）"""
+(Compressed, retaining the most recent {self.config.min_retain_rounds} complete rounds)"""
 
         except Exception as e:
-            # 回退到简单摘要
-            print(f"⚠️ 智能摘要生成失败: {e}，使用简单摘要")
+            # Fallback to simple summary
+            print(f"⚠️ Smart summary generation failed: {e}, using simple summary")
             return self._generate_simple_summary(history)
 
     def _format_history_for_summary(self, history: List[Message]) -> str:
@@ -624,6 +618,17 @@ class Agent(ABC):
 
         return converted
 
+    def _truncate_output(self, tool_name: str, text: str) -> str:
+        """Apply observation truncation if truncator is available.
+
+        Uses ``self.truncator`` (initialized from Config) to enforce
+        ``tool_output_max_lines`` / ``tool_output_max_bytes``.
+        """
+        if not hasattr(self, "truncator") or self.truncator is None:
+            return text
+        result = self.truncator.truncate(tool_name=tool_name, output=text)
+        return result.get("preview", text)
+
     def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具调用并返回字符串结果
 
@@ -656,7 +661,7 @@ class Agent(ABC):
                 elif response.status == ToolStatus.PARTIAL:
                     return f"⚠️ 部分成功: {response.text}"
                 else:
-                    return response.text
+                    return self._truncate_output(tool_name, response.text)
             except Exception as exc:
                 return f"❌ 工具调用失败：{exc}"
 
@@ -675,7 +680,7 @@ class Agent(ABC):
                 elif response.status == ToolStatus.PARTIAL:
                     return f"⚠️ 部分成功: {response.text}"
                 else:
-                    return response.text
+                    return self._truncate_output(tool_name, response.text)
             except Exception as exc:
                 return f"❌ 工具调用失败：{exc}"
 

@@ -24,9 +24,9 @@ class Config(BaseModel):
     # Context Compact Config
     compact_enabled: bool = True
     compact_token_threshold: int = 225000
-    compact_keep_recent_tool_results: int = 3
+    compact_keep_recent_tool_results: int = 5
     compact_transcript_dir: str = "memory/transcripts"
-    summary_max_tokens: int = 8192
+    summary_max_tokens: int = 4096
     summary_temperature: float = 0.3
 
     # 工具输出截断配置

@@ -163,45 +163,75 @@ class CLIUI:
                 return str(path)
 
         if self.use_rich:
-            # 3-column right side: label (fixed) + value (flexible)
-            layout = Table.grid(padding=(0, 3), expand=True)
-            layout.add_column(width=35)   # whale art (with indent)
-            layout.add_column(width=14)   # label
-            layout.add_column(ratio=1)    # value
+            import rich.box as box
 
-            P = "    "  # 4-space indent for whale
-            layout.add_row(
-                Text(f"{P}      .", style="bold bright_blue"),
-                Text(""), Text(""),
-            )
-            layout.add_row(
-                Text(f'{P}      ":"', style="bold bright_blue"),
-                Text(""), Text(""),
-            )
-            layout.add_row(
-                Text(f'{P}    ___:____     |"\\/"|', style="bold bright_blue"),
-                Text(display_name, style="bold white"),
-                Text(version, style="dim"),
-            )
-            layout.add_row(
-                Text(f"{P}  ,'        `.    \\  /", style="bold bright_blue"),
-                Text(provider, style="bold bright_green"),
-                Text(str(model), style="bold bright_cyan"),
-            )
-            layout.add_row(
-                Text(f"{P}  |  O    _   \\___/  |", style="bold bright_blue"),
-                Text("Workspace", style="dim"),
-                Text(_pretty_path(workspace), style="bold bright_green"),
-            )
-            layout.add_row(
-                Text(f"{P}~^~^~^~^~^~^~", style="bold bright_blue"),
-                Text(""), Text(""),
-            )
+            # --- Left panel content (whale art, centered) ---
+            whale_lines = [
+                '      .',
+                '      ":"',
+                '    ___:____     |"\\/"|',
+                "  ,'        `.    \\  /",
+                "  |  O    _   \\___/  |",
+                "~^~^~^~^~^~^~",
+            ]
+            # Find the widest whale line for centering reference
+            whale_width = max(len(line) for line in whale_lines)
 
+            # Pad "Welcome back!" to center-align with whale art
+            welcome_text = "Welcome back!"
+            welcome_pad = max(0, (whale_width - len(welcome_text)) // 2)
+            model_text = str(model)
+            model_pad = max(0, (whale_width - len(model_text)) // 2)
+
+            left_parts = Text()
+            left_parts.append("\n")
+            left_parts.append(" " * welcome_pad + welcome_text + "\n", style="bold white")
+            left_parts.append("\n")
+            for line in whale_lines:
+                left_parts.append(f"{line}\n", style="bold bright_blue")
+            left_parts.append("\n")
+            left_parts.append(" " * model_pad + model_text + "\n", style="bold bright_cyan")
+
+            left_aligned = Align(left_parts, align="center")
+
+            # --- Right panel content (placeholder for now) ---
+            right_parts = Text()
+            right_parts.append("\n")
+            right_parts.append("Recent activity\n", style="bold white")
+            right_parts.append("No recent activity\n", style="dim")
+
+            # --- Two-column table with vertical divider ---
+            # Use a custom box that only draws inner vertical lines
+            INNER_VERT = box.Box(
+                "    \n"
+                "  │ \n"
+                "    \n"
+                "  │ \n"
+                "    \n"
+                "  │ \n"
+                "    \n"
+                "    \n"
+            )
+            layout = Table(
+                box=INNER_VERT,
+                show_header=False,
+                show_edge=False,
+                expand=True,
+                border_style="dim bright_blue",
+                padding=(0, 2),
+            )
+            layout.add_column(ratio=1)   # left: whale
+            layout.add_column(ratio=1)   # right: info
+
+            layout.add_row(left_aligned, right_parts)
+
+            title = f"  {display_name} {version}  "
             banner = Panel(
                 layout,
+                title=title,
+                title_align="left",
                 border_style="bright_blue",
-                padding=(1, 2),
+                padding=(0, 1),
                 width=self.console.width,
             )
 
@@ -211,6 +241,7 @@ class CLIUI:
             P = "    "
             W = 38
             L = 14
+            print(f"--- {display_name} {version} ---")
             print(f"{P}      .")
             print(f'{P}      ":"')
             art3 = f'{P}    ___:____     |"\\/"|'

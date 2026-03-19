@@ -72,7 +72,9 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 f"2. Test your implementation by running the example assertions from the "
                 f"task description via `Bash` (e.g. `python3 -c \"from solution import "
                 f"{entry_point}; assert ...\"`).\n"
-                f"3. If any assertion fails, fix the code and re-test.\n\n"
+                f"3. If any assertion fails, fix the code and re-test.\n"
+                f"4. Once all assertions pass, call `Finish` with a brief summary of your "
+                f"implementation.\n\n"
                 f"Rules:\n"
                 f"- The function must satisfy all the assertions in the task description.\n"
                 f"- Include any necessary imports at the top of the file.\n"
@@ -134,8 +136,8 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-steps", type=int, default=32)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--task-ids", nargs="*", default=None)

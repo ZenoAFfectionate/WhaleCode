@@ -20,7 +20,12 @@ class AskUserTool(Tool):
     def __init__(self, interactive: bool = True):
         super().__init__(
             name="AskUser",
-            description="Ask the user a question and get an answer (main agent only).",
+            description=(
+                "Ask the user a clarifying question when critical information is "
+                "missing and you cannot proceed without it. "
+                "Do NOT use for greetings, casual conversation, or when you "
+                "already have enough context to respond or act."
+            ),
         )
         self._interactive = bool(interactive)
 

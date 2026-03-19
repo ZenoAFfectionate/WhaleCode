@@ -42,20 +42,19 @@ conda activate agent
 # Install dependencies
 pip install -r requirements.txt
 
-# Configure your API key
-cp .env.example .env   # then edit .env with your key
+# Configure your API key on .env
 ```
 
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
-   --language-model-only \
-    --tool-call-parser qwen3_coder
+    --language-model-only \
+    --tool-call-parser qwen3_xml
 ```
 
 ```bash
@@ -377,8 +376,8 @@ Whale Code includes a built-in benchmark suite to evaluate the coding agent on f
 > **Prerequisite**: The LLM backend must be running (e.g. vLLM, or set the API key in `.env`).
 
 ```bash
-bash scripts/run_clev.sh  # run ClassEval benchmark
 bash scripts/run_hevp.sh  # run HumanEval benchmark
+bash scripts/run_clev.sh  # run ClassEval benchmark
 bash scripts/run_mbpp.sh  # run MBPP benchmark
 bash scripts/run_aime.sh  # run AIME benchmark
 
@@ -388,16 +387,16 @@ bash scripts/run_swev.sh  # (Phase 1: agent inference)
 bash scripts/run_swev_eval.sh data/_results/swev_predictions_<timestamp>.jsonl
 ```
 
-### Result
+### Result(v2.0.0)
 
 > Model: **Qwen3.5-35B-A3B-FP8** (vLLM, local)
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **HumanEval+** | 164 | 144 | **87.8%** | 9.1s | 2026-03-15 |
-| **MBPP+** | 378 | 341 | **90.2%** | 34.1s | 2026-03-15 |
-| **ClassEval** | 100 | 24 | 24.0% | 23.5s | 2026-03-15 |
-| **AIME** | 30 | 6 | 20.0% | 480.0s | 2026-03-15 |
+| **HumanEval+** | 164 | 152 | **92.7%** | 17.1s | 2026-03-18 |
+| **MBPP+** | 378 | 356 | **94.2%** | 38.8s | 2026-03-18 |
+| **ClassEval** | 100 | 64 | 64.0% | 121.8s | 2026-03-18 |
+| **AIME** | 30 | 22 | 73.3% | 976.9s | 2026-03-18 |
 | **SWE-bench Verified** | 500 | — | — | — | — |
 
 ---

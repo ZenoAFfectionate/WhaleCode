@@ -197,7 +197,10 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 f"code you read. Explain your understanding before making changes.\n"
                 f"4. Use `Edit` to implement a minimal, targeted fix. Change only what "
                 f"is necessary to resolve the issue.\n"
-                f"5. Use `Read` to verify your edit was applied correctly.\n\n"
+                f"5. Use `Read` to verify your edit was applied correctly.\n"
+                f"6. Once you have verified the fix, call `Finish` immediately with a "
+                f"brief summary of what you changed and why. Do NOT continue searching "
+                f"or reading after a successful edit — stop and finish.\n\n"
                 f"## Rules\n\n"
                 f"- Do NOT run `pip install`, `python setup.py`, or any installation "
                 f"commands. The environment is pre-configured.\n"
@@ -207,6 +210,8 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 f"- Make the smallest possible change that fixes the issue.\n"
                 f"- Preserve existing code style, indentation, and conventions.\n"
                 f"- If the fix requires changes in multiple files, edit each one.\n"
+                f"- Do NOT over-search. If you have identified the fix location, make "
+                f"the edit promptly instead of reading more files.\n"
             )
 
             try:
@@ -306,8 +311,8 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--max-steps", type=int, default=50, help="More steps for complex repo tasks")
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-steps", type=int, default=128)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--task-ids", nargs="*", default=None)

@@ -67,7 +67,9 @@ class ClassEvalBenchmark(BenchmarkRunner):
                 f"correct method bodies using the Edit or Write tool.\n"
                 f"3. Run `python tests.py` via Bash to verify your implementation.\n"
                 f"4. If any tests fail, read the error output, fix the code, and re-run "
-                f"until all tests pass.\n\n"
+                f"until all tests pass.\n"
+                f"5. Once all tests pass, call `Finish` with a brief summary of your "
+                f"implementation.\n\n"
                 f"Rules:\n"
                 f"- Do NOT change the class name, method signatures, or docstrings.\n"
                 f"- Keep existing imports; add more if needed.\n"
@@ -132,8 +134,8 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-steps", type=int, default=32)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
     parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")

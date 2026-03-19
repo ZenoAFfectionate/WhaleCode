@@ -308,6 +308,7 @@ class ReActAgent(Agent):
         total_completion_tokens = 0
         no_tool_call_retries = 0
         max_no_tool_call_retries = 2
+        _is_retry = False  # 标记当前是否为重试（重试时不渲染 step header）
 
         # 记录用户消息
         if self.trace_logger:
@@ -319,8 +320,10 @@ class ReActAgent(Agent):
         self._render_agent_start(input_text)
 
         while self.max_steps <= 0 or current_step < self.max_steps:
-            current_step += 1
-            self._render_step_start(current_step)
+            if not _is_retry:
+                current_step += 1
+                self._render_step_start(current_step)
+            _is_retry = False  # 重置标记
 
             # 保存当前步数（用于异常时保存）
             self._current_step = current_step
@@ -384,16 +387,14 @@ class ReActAgent(Agent):
             # 处理工具调用
             tool_calls = response_message.tool_calls
             if not tool_calls:
-                # 模型未返回工具调用。如果是第一步（尚未做任何工作），
-                # 可能是模型 tool-calling 不稳定导致的，注入提示后重试。
-                if current_step == 1 and no_tool_call_retries < max_no_tool_call_retries:
+                text_content = (response_message.content or "").strip()
+
+                # 如果模型返回了有意义的文本，说明它判断无需工具即可回答，
+                # 直接接受为最终答案（例如问候、闲聊、知识问答等场景）。
+                # 只有当模型返回空内容时，才认为是 tool-calling 不稳定并重试。
+                if not text_content and no_tool_call_retries < max_no_tool_call_retries:
                     no_tool_call_retries += 1
-                    # 将模型的文本回复加入上下文，再追加一条提醒
-                    if response_message.content:
-                        messages.append({
-                            "role": "assistant",
-                            "content": response_message.content,
-                        })
+                    _is_retry = True  # 标记下次循环为重试，不渲染 step header
                     messages.append({
                         "role": "user",
                         "content": (
@@ -403,8 +404,8 @@ class ReActAgent(Agent):
                     })
                     continue
 
-                # 没有工具调用，直接返回文本响应
-                final_answer = response_message.content or "Sorry, I cannot answer this question."
+                # 直接返回文本响应
+                final_answer = text_content or "Sorry, I cannot answer this question."
                 self._render_direct_response(final_answer)
 
                 # 保存到历史记录
@@ -426,7 +427,8 @@ class ReActAgent(Agent):
 
                 return final_answer
 
-            # 将助手消息添加到历史
+            # 将助手消息添加到历史（模型成功发起了工具调用，重置重试计数器）
+            no_tool_call_retries = 0
             messages.append({
                 "role": "assistant",
                 "content": response_message.content,
@@ -736,6 +738,7 @@ class ReActAgent(Agent):
             total_tokens = 0
             no_tool_call_retries = 0
             max_no_tool_call_retries = 2
+            _is_retry = False
 
             # 记录用户消息
             if self.trace_logger:
@@ -747,8 +750,10 @@ class ReActAgent(Agent):
             self._render_agent_start(input_text)
 
             while self.max_steps <= 0 or current_step < self.max_steps:
-                current_step += 1
-                self._render_step_start(current_step)
+                if not _is_retry:
+                    current_step += 1
+                    self._render_step_start(current_step)
+                _is_retry = False
 
                 # 触发步骤开始事件
                 await self._emit_event(
@@ -809,9 +814,10 @@ class ReActAgent(Agent):
                 # 处理工具调用
                 tool_calls = response_message.tool_calls
                 if not tool_calls:
-                    # 重试机制：第一步未调用工具时，注入提示后重试
-                    if current_step == 1 and no_tool_call_retries < max_no_tool_call_retries:
+                    # 重试机制：未调用工具时，注入提示后重试
+                    if no_tool_call_retries < max_no_tool_call_retries:
                         no_tool_call_retries += 1
+                        _is_retry = True
                         if response_message.content:
                             messages.append({
                                 "role": "assistant",
@@ -856,7 +862,8 @@ class ReActAgent(Agent):
 
                     return final_answer
 
-                # 将助手消息添加到历史
+                # 将助手消息添加到历史（模型成功发起了工具调用，重置重试计数器）
+                no_tool_call_retries = 0
                 messages.append({
                     "role": "assistant",
                     "content": response_message.content,

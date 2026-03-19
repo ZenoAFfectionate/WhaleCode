@@ -48,6 +48,22 @@ def _format_diff_section(diff_preview: str, diff_truncated: bool) -> str:
     return '\n'.join(lines)
 
 
+def _require_prior_read(
+    registry: Optional['ToolRegistry'],
+    rel_path: str,
+) -> Optional[ToolResponse]:
+    """Return an error response if the file has not been Read yet, else None."""
+    if registry is not None and rel_path not in registry.read_metadata_cache:
+        return ToolResponse.error(
+            code=ToolErrorCode.INVALID_PARAM,
+            message=(
+                f"You must Read '{rel_path}' before editing. "
+                f"Call the Read tool first to see current content."
+            ),
+        )
+    return None
+
+
 def _no_change_response(
     action_text: str,
     rel_path: str,
@@ -537,6 +553,12 @@ class WriteTool(Tool):
                         message=f"File '{path}' is a binary file, refusing to overwrite as text"
                     )
 
+                # Enforce read-before-write (existing files only)
+                rel_path_early = _display_path(self.project_root, full_path)
+                err = _require_prior_read(self.registry, rel_path_early)
+                if err:
+                    return err
+
                 # Get current file metadata
                 current_mtime = os.path.getmtime(full_path)
                 current_mtime_ms = int(current_mtime * 1000)
@@ -784,6 +806,12 @@ class EditTool(Tool):
                     message=f"File '{path}' is a binary file, cannot edit as text"
                 )
 
+            # Enforce read-before-edit
+            rel_path = _display_path(self.project_root, full_path)
+            err = _require_prior_read(self.registry, rel_path)
+            if err:
+                return err
+
             # Get current file metadata
             current_mtime = os.path.getmtime(full_path)
             current_mtime_ms = int(current_mtime * 1000)
@@ -825,7 +853,6 @@ class EditTool(Tool):
             # Execute replacement
             new_content = content.replace(old_string, new_string)
             new_content = normalize_line_endings(new_content, line_ending)
-            rel_path = _display_path(self.project_root, full_path)
 
             if new_content == content:
                 return _no_change_response(
@@ -1027,6 +1054,12 @@ class MultiEditTool(Tool):
                     message=f"File '{path}' is a binary file, cannot batch edit as text"
                 )
 
+            # Enforce read-before-edit
+            rel_path = _display_path(self.project_root, full_path)
+            err = _require_prior_read(self.registry, rel_path)
+            if err:
+                return err
+
             # Get current file metadata
             current_mtime = os.path.getmtime(full_path)
             current_mtime_ms = int(current_mtime * 1000)
@@ -1122,8 +1155,6 @@ class MultiEditTool(Tool):
                 )
 
             new_content = normalize_line_endings(new_content, line_ending)
-
-            rel_path = _display_path(self.project_root, full_path)
 
             if new_content == original_content:
                 return _no_change_response(

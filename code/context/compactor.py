@@ -55,6 +55,9 @@ class ContextCompactor:
     def __init__(self, config: Config, token_counter: Optional[TokenCounter] = None):
         self.config = config
         self.token_counter = token_counter or TokenCounter()
+        # Cached tool_call_id -> tool_name mapping (incrementally updated)
+        self._tool_name_map: Dict[str, str] = {}
+        self._tool_name_map_msg_count: int = 0  # messages scanned so far
 
 
     def estimate_tokens(self, messages: List[Dict]) -> int:
@@ -107,8 +110,8 @@ class ContextCompactor:
         ]
         tool_indices.reverse()  # Newest first
 
-        # Build tool_call_id -> tool_name mapping
-        tool_name_map = self._build_tool_name_map(messages)
+        # Build tool_call_id -> tool_name mapping (incremental update)
+        tool_name_map = self._update_tool_name_map(messages)
 
         # Skip the most recent keep_recent, truncate the rest
         for idx_pos, msg_idx in enumerate(tool_indices):
@@ -215,6 +218,34 @@ class ContextCompactor:
         })
 
         return compacted
+
+    def _update_tool_name_map(self, messages: List[Dict]) -> Dict[str, str]:
+        """Incrementally update the tool_call_id -> tool_name mapping.
+
+        Only scans messages added since the last call, avoiding O(n) full scan
+        on every micro_compact invocation.
+        """
+        start = self._tool_name_map_msg_count
+        # Handle list shrinking after compaction
+        if start > len(messages):
+            self._tool_name_map.clear()
+            start = 0
+
+        for msg in messages[start:]:
+            if msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                continue
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                func = tc.get("function", {})
+                name = func.get("name", "unknown")
+                if tc_id:
+                    self._tool_name_map[tc_id] = name
+
+        self._tool_name_map_msg_count = len(messages)
+        return self._tool_name_map
 
     def _build_tool_name_map(self, messages: List[Dict]) -> Dict[str, str]:
         """Build tool_call_id -> tool_name mapping from assistant message's tool_calls"""

@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
@@ -65,7 +65,9 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                 f"3. Verify your implementation by running a quick test via Bash, e.g.:\n"
                 f"   `python3 -c \"from solution import {entry_point}; "
                 f"print({entry_point}(...))\"` with example inputs from the docstring.\n"
-                f"4. If the output is wrong, fix the code and re-test.\n\n"
+                f"4. If the output is wrong, fix the code and re-test.\n"
+                f"5. Once all tests pass, call `Finish` with a brief summary of your "
+                f"implementation.\n\n"
                 f"Rules:\n"
                 f"- Do NOT change the function signature or docstring.\n"
                 f"- Keep existing imports; add more if needed.\n"
@@ -124,8 +126,8 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-steps", type=int, default=32)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
     parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")

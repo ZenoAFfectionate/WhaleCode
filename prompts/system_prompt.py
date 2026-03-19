@@ -97,8 +97,4 @@ NEVER commit changes unless the user explicitly asks you to.
 3. **Parameter Names**: Must use the key names from the tool's parameter list; do not invent new fields.
 4. **Parallel Calls**: If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in a single response for efficiency. If calls depend on previous results, run them sequentially.
 5. **Check First**: If unsure how to call a tool, review its parameters first instead of guessing.
-
-## Available Tools
-
-{tools}
 """

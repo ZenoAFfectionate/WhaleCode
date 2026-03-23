@@ -13,7 +13,7 @@ Message format (OpenAI function calling):
 """
 
 import os
-import sys
+import re
 import json
 from pathlib import Path
 from datetime import datetime
@@ -22,12 +22,25 @@ from typing import Dict, List, Optional
 from ..core.config import Config
 from .token_counter import TokenCounter
 
-# Ensure the project root is on sys.path so we can import from the `prompts` package.
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# ---------------------------------------------------------------------------
+# Load summary prompts from the markdown file
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_SUMMARY_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "summary_prompt.md"
 
-from prompts.summary_prompt import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
+
+def _extract_section(text: str, name: str) -> str:
+    """Extract content between <!-- {name}_START --> and <!-- {name}_END --> markers."""
+    pattern = rf"<!--\s*{re.escape(name)}_START\s*-->\s*\n(.*?)\n\s*<!--\s*{re.escape(name)}_END\s*-->"
+    match = re.search(pattern, text, re.DOTALL)
+    if not match:
+        raise ValueError(f"Section '{name}' not found in summary_prompt.md")
+    return match.group(1).strip()
+
+
+_SUMMARY_MD = _SUMMARY_PROMPT_FILE.read_text(encoding="utf-8")
+SUMMARY_SYSTEM_PROMPT: str = _extract_section(_SUMMARY_MD, "SUMMARY_SYSTEM_PROMPT")
+SUMMARY_USER_TEMPLATE: str = _extract_section(_SUMMARY_MD, "SUMMARY_USER_TEMPLATE")
 
 
 class ContextCompactor:

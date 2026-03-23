@@ -36,8 +36,8 @@ git clone https://github.com/ZenoAFfectionate/Coding_Agent.git
 cd WhaleCode
 
 # Create and activate a conda virtual environment
-conda create -n agent python=3.12 -y
-conda activate agent
+conda create -n WhaleCode python=3.12 -y
+conda activate WhaleCode
 
 # Install dependencies
 pip install -r requirements.txt
@@ -48,9 +48,18 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
+CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+    --port 8000 \
+    --tensor-parallel-size 2 \
+    --gpu-memory-utilization 0.92 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder
+```
+
+```bash
 CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --port 8000 \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.92 \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --language-model-only \
@@ -361,8 +370,8 @@ Whale Code includes a built-in benchmark suite to evaluate the coding agent on f
 
 | Benchmark | Dataset | Tasks | Metric | Description |
 |-----------|---------|-------|--------|-------------|
-| **HumanEval+** | `data/HEVP/` | 164 | pass@1 | Function-generation tasks with 80× more tests than original HumanEval |
 | **MBPP+** | `data/MBPP/` | 378 | pass@1 | Crowd-sourced Python programming problems |
+| **HumanEval+** | `data/HEVP/` | 164 | pass@1 | Function-generation tasks with 80× more tests than original HumanEval |
 | **ClassEval** | `data/CLEV/` | 100 | pass@1 | Class-level code generation requiring multi-method implementation |
 | **AIME** | `data/AIME/` | — | accuracy | Math competition problems solved via agent-written Python programs |
 | **SWE-bench Verified** | `data/SWEV/` | 500 | resolve rate | Real GitHub issues requiring multi-file codebase navigation and editing |
@@ -384,20 +393,28 @@ bash scripts/run_aime.sh  # run AIME benchmark
 # run SWEV benchmark and evaluation
 bash scripts/run_swev.sh  # (Phase 1: agent inference)
 
-bash scripts/run_swev_eval.sh data/_results/swev_predictions_<timestamp>.jsonl
+bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 ```
 
-### Result(v2.0.0)
+### Result
 
-> Model: **Qwen3.5-35B-A3B-FP8** (vLLM, local)
+> Model: **Qwen3.5-35B-A3B-FP8**
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **HumanEval+** | 164 | 152 | **92.7%** | 17.1s | 2026-03-18 |
-| **MBPP+** | 378 | 356 | **94.2%** | 38.8s | 2026-03-18 |
-| **ClassEval** | 100 | 64 | 64.0% | 121.8s | 2026-03-18 |
-| **AIME** | 30 | 22 | 73.3% | 976.9s | 2026-03-18 |
-| **SWE-bench Verified** | 500 | — | — | — | — |
+| **MBPP+**      | 378 | 374 | **98.9%** | 53.6s  | 2026-03-22 |
+| **HumanEval+** | 164 | 159 | **96.9%** | 64.29s | 2026-03-22 |
+| **ClassEval**  | 100 | 90  | **90.0%** | 471.7s | 2026-03-22 |
+| **AIME**       | 30  | 24  | **90.0%** | 236.5s | 2026-03-22 |
+
+> Model: **Qwen3-Coder-Next-FP8**
+
+| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
+|-----------|------:|-------:|----------:|---------:|------|
+| **MBPP+**      | 378 |   |   |   | 2026-03-xx |
+| **HumanEval+** | 164 |   |   |   | 2026-03-xx |
+| **ClassEval**  | 100 |   |   |   | 2026-03-xx |
+| **AIME**       | 30  |   |   |   | 2026-03-xx |
 
 ---
 

@@ -390,12 +390,7 @@ class Agent(ABC):
         Returns:
             Summary text
         """
-        import sys
-        from pathlib import Path
-        _proj_root = str(Path(__file__).resolve().parents[2])
-        if _proj_root not in sys.path:
-            sys.path.insert(0, _proj_root)
-        from prompts.summary_prompt import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
+        from ..context.compactor import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
 
         # 1. Extract the history segment to compress
         boundaries = self.history_manager.find_round_boundaries()

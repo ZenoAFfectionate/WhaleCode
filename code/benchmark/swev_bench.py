@@ -11,18 +11,87 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 
 from .base import BenchmarkRunner, _PROJECT_ROOT
+
+# ---------------------------------------------------------------------------
+# Build the SWE-bench system prompt: base system prompt + benchmark overrides
+# ---------------------------------------------------------------------------
+_BASE_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "system_prompt.md"
+_BASE_SYSTEM_PROMPT: str = _BASE_PROMPT_FILE.read_text(encoding="utf-8")
+
+_SWEV_ADDENDUM = """\
+
+---
+
+## SWE-bench Override: Autonomous Issue Resolution
+
+The general workflow above is overridden for this benchmark session. \
+You are an autonomous software engineer. Your sole job is to resolve \
+a GitHub issue by editing source code in the local repository. \
+You work alone — there is no human in the loop.
+
+### Workflow (follow strictly)
+
+```
+1. Locate — Use Grep and Glob to find the relevant code. Start from
+   class names, function names, or error strings mentioned in the issue.
+2. Understand — Use Read to study the surrounding code (callers, tests,
+   related functions). Read ENOUGH context to be confident about the
+   root cause.
+3. Diagnose — Use Thought to reason about the root cause BEFORE editing.
+   State clearly: what is wrong, why it happens, and what the fix should be.
+4. Fix — Use Edit (or MultiEdit) to make the minimal change. Only change
+   what is necessary.
+5. Verify — Read the edited region to confirm the fix looks correct.
+6. Finish — Call Finish with a brief summary. Do NOT keep searching
+   after a successful edit.
+```
+
+### Critical Rules
+
+```
+- You MUST produce a code change. Saying "I cannot fix this" is NOT
+  acceptable. Always attempt a fix even if you are uncertain.
+- Make the SMALLEST possible change. Prefer a 1-3 line fix over a
+  large refactor.
+- Do NOT run pip install, python setup.py, pytest, or any shell commands
+  that install packages or run tests. Testing is handled externally.
+- Do NOT modify test files (tests/, test_*.py, *_test.py).
+- Do NOT add new dependencies or create new files unless absolutely
+  necessary.
+- Preserve existing code style, indentation, and naming conventions.
+```
+
+### Efficiency Rules (save tokens and steps)
+
+```
+- Do NOT read the whole repository. Search targeted: grep for the key
+  symbol, read only the relevant file region.
+- When you find the fix location, edit IMMEDIATELY. Do not read 5 more
+  files to "make sure" — that wastes steps.
+- Use Glob with specific patterns (e.g. **/models/sql/*.py) rather than
+  broad **/*.py.
+- If a Grep returns too many results, narrow the query or add file filters.
+- Avoid Bash for file searching — use Grep/Glob/Read instead.
+- If you are going in circles (reading the same files repeatedly), STOP,
+  reason in a Thought, then commit to a fix.
+```
+"""
+
+_SWEV_SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _SWEV_ADDENDUM
 
 
 class SWEBenchVerifiedBenchmark(BenchmarkRunner):
@@ -45,6 +114,8 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         *args,
         repo_cache_dir: Optional[str] = None,
         model_name: str = "whale-code",
+        task_timeout: int = 1800,
+        resume_file: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -52,6 +123,12 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         if self.repo_cache_dir:
             self.repo_cache_dir.mkdir(parents=True, exist_ok=True)
         self.model_name = model_name
+        self.task_timeout = task_timeout  # per-task wall-clock timeout (seconds)
+        self.resume_file = resume_file
+
+    def _get_system_prompt(self) -> Optional[str]:
+        """Use the SWE-bench-specific system prompt."""
+        return _SWEV_SYSTEM_PROMPT
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
         tasks = []
@@ -64,9 +141,75 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                     tasks.append(task)
         return tasks
 
+    def _load_completed_task_ids(self) -> Set[str]:
+        """Load task IDs already completed from a previous results file."""
+        if not self.resume_file:
+            return set()
+        resume_path = Path(self.resume_file)
+        if not resume_path.exists():
+            return set()
+        completed = set()
+        with open(resume_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    result = json.loads(line)
+                    # Only skip tasks that actually ran (not clone failures)
+                    error = result.get("error") or ""
+                    if "Failed to clone" not in error:
+                        completed.add(result.get("task_id", ""))
+                except json.JSONDecodeError:
+                    continue
+        completed.discard("")
+        print(f"  [RESUME] Found {len(completed)} completed tasks to skip")
+        return completed
+
     # ------------------------------------------------------------------
     # Repository management
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _remove_git_lock_files(repo_path: Path) -> None:
+        """Remove stale git lock files that prevent checkout/reset."""
+        for lock_file in ["index.lock", "HEAD.lock", "refs/heads/*.lock"]:
+            for p in repo_path.glob(f".git/{lock_file}"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    def _reset_cached_repo(self, cached: Path, base_commit: str) -> bool:
+        """Reset a cached repo to a specific commit. Returns True on success."""
+        ws = str(cached)
+        try:
+            # Clean up any stale lock files from previous crashed runs
+            self._remove_git_lock_files(cached)
+
+            # Hard reset to discard any staged/unstaged changes from previous task
+            subprocess.run(
+                ["git", "reset", "--hard"],
+                cwd=ws, capture_output=True, timeout=120,
+            )
+            # Remove all untracked files and directories
+            subprocess.run(
+                ["git", "clean", "-fdx"],
+                cwd=ws, capture_output=True, timeout=120,
+            )
+            # Checkout the target commit
+            subprocess.run(
+                ["git", "checkout", "-f", base_commit],
+                cwd=ws, capture_output=True, timeout=300, check=True,
+            )
+            # Clean again after checkout (in case checkout brought changes)
+            subprocess.run(
+                ["git", "clean", "-fdx"],
+                cwd=ws, capture_output=True, timeout=120,
+            )
+            return True
+        except Exception:
+            return False
 
     def _clone_repo(self, repo: str, base_commit: str) -> Optional[Path]:
         """Clone a GitHub repo at a specific commit.
@@ -81,24 +224,27 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         if self.repo_cache_dir:
             cached = self.repo_cache_dir / repo_slug
             if cached.exists():
+                # Try direct checkout
+                if self._reset_cached_repo(cached, base_commit):
+                    return cached
+
+                # First attempt failed — try fetching latest refs then retry
+                print(f"\n  [WARN] Cache checkout failed for {repo}@{base_commit[:10]}, fetching...")
                 try:
                     subprocess.run(
-                        ["git", "checkout", "-f", base_commit],
-                        cwd=str(cached),
-                        capture_output=True,
-                        timeout=120,
+                        ["git", "fetch", "--all"],
+                        cwd=str(cached), capture_output=True, timeout=300,
                     )
-                    subprocess.run(
-                        ["git", "clean", "-fdx"],
-                        cwd=str(cached),
-                        capture_output=True,
-                        timeout=60,
-                    )
-                    return cached
                 except Exception:
-                    shutil.rmtree(cached, ignore_errors=True)
+                    pass
 
-        # Clone fresh
+                if self._reset_cached_repo(cached, base_commit):
+                    return cached
+
+                print(f"\n  [WARN] Retry checkout also failed for {repo}@{base_commit[:10]}")
+                return None
+
+        # Clone fresh (no cache or cache dir doesn't have this repo yet)
         target = (self.repo_cache_dir / repo_slug) if self.repo_cache_dir else Path(
             tempfile.mkdtemp(prefix=f"swev_{repo_slug}_")
         )
@@ -107,18 +253,11 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         try:
             subprocess.run(
                 ["git", "clone", "--quiet", "--filter=blob:none", url, str(target)],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=True,
+                capture_output=True, text=True, timeout=600, check=True,
             )
             subprocess.run(
                 ["git", "checkout", "-f", base_commit],
-                cwd=str(target),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
+                cwd=str(target), capture_output=True, text=True, timeout=120, check=True,
             )
             return target
         except subprocess.TimeoutExpired:
@@ -138,14 +277,18 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             return None
 
     def _get_agent_diff(self, workspace: Path) -> str:
-        """Capture the diff of all changes the agent made."""
+        """Capture the diff of all changes the agent made, including new files."""
+        ws = str(workspace)
         try:
+            # Stage all new (untracked) files so they appear in the diff
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=ws, capture_output=True, timeout=30,
+            )
+            # Diff between base_commit (HEAD) and current staged state
             result = subprocess.run(
-                ["git", "diff"],
-                cwd=str(workspace),
-                capture_output=True,
-                text=True,
-                timeout=30,
+                ["git", "diff", "--no-color", "HEAD"],
+                cwd=ws, capture_output=True, text=True, timeout=60,
             )
             return result.stdout.strip()
         except Exception:
@@ -180,42 +323,39 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             # Step 2: Run agent
             agent = self._create_agent(workspace)
             hints = task.get("hints_text", "").strip()
-            hints_block = f"\n\nHints:\n{hints}" if hints else ""
+            hints_block = f"\n\n## Hints\n\n{hints}" if hints else ""
 
             agent_prompt = (
-                f"You are a software engineer fixing a bug in the `{repo}` repository.\n\n"
+                f"Fix the following issue in the `{repo}` repository.\n\n"
                 f"## Issue\n\n{problem_statement}\n"
                 f"{hints_block}\n\n"
-                f"## Instructions\n\n"
-                f"1. Use `Grep` and `Glob` to locate the relevant source files. Start by "
-                f"searching for key class names, function names, or error messages "
-                f"mentioned in the issue.\n"
-                f"2. Use `Read` to understand the code around the identified location. "
-                f"Read enough context (surrounding functions, class definitions) to "
-                f"fully understand the logic.\n"
-                f"3. Reason about the root cause based on the issue description and the "
-                f"code you read. Explain your understanding before making changes.\n"
-                f"4. Use `Edit` to implement a minimal, targeted fix. Change only what "
-                f"is necessary to resolve the issue.\n"
-                f"5. Use `Read` to verify your edit was applied correctly.\n"
-                f"6. Once you have verified the fix, call `Finish` immediately with a "
-                f"brief summary of what you changed and why. Do NOT continue searching "
-                f"or reading after a successful edit — stop and finish.\n\n"
-                f"## Rules\n\n"
-                f"- Do NOT run `pip install`, `python setup.py`, or any installation "
-                f"commands. The environment is pre-configured.\n"
-                f"- Do NOT run test commands (`pytest`, `python -m pytest`, etc.). "
-                f"Testing is handled separately after your changes.\n"
-                f"- Do NOT modify any test files (files under `tests/` or `test_*.py`).\n"
-                f"- Make the smallest possible change that fixes the issue.\n"
-                f"- Preserve existing code style, indentation, and conventions.\n"
-                f"- If the fix requires changes in multiple files, edit each one.\n"
-                f"- Do NOT over-search. If you have identified the fix location, make "
-                f"the edit promptly instead of reading more files.\n"
+                f"The repository is already checked out at the correct commit. "
+                f"Your working directory is the repo root.\n\n"
+                f"## Strategy\n\n"
+                f"1. **Identify the bug location**: Grep for key symbols from the "
+                f"issue (class names, method names, error messages). Narrow down "
+                f"to 1-2 files.\n"
+                f"2. **Read the relevant code**: Read the specific function or "
+                f"method (not the whole file). Understand the logic.\n"
+                f"3. **Diagnose**: Use `Thought` to state: (a) what the current "
+                f"code does wrong, (b) what it should do instead.\n"
+                f"4. **Edit**: Make the minimal fix with `Edit`.\n"
+                f"5. **Verify & Finish**: `Read` the edited lines, then call "
+                f"`Finish` with a summary of what you changed and why.\n"
             )
 
             try:
-                agent_response = agent.run(agent_prompt)
+                agent_response = self._run_agent_with_timeout(agent, agent_prompt)
+            except _TaskTimeout:
+                return {
+                    "task_id": task_id,
+                    "repo": repo,
+                    "passed": None,
+                    "error": f"Task timed out after {self.task_timeout}s",
+                    "agent_diff": self._get_agent_diff(workspace),
+                    "agent_response": "",
+                    "elapsed_s": round(time.time() - start, 2),
+                }
             except Exception as exc:
                 return {
                     "task_id": task_id,
@@ -244,8 +384,40 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             if is_temp and workspace and workspace.exists():
                 shutil.rmtree(workspace, ignore_errors=True)
 
+    def _run_agent_with_timeout(self, agent, prompt: str) -> str:
+        """Run agent.run() with a wall-clock timeout using SIGALRM."""
+        if self.task_timeout <= 0:
+            return agent.run(prompt)
+
+        # Use a threading-based timeout on all platforms
+        import threading
+
+        result_holder: Dict[str, Any] = {}
+        exception_holder: List[BaseException] = []
+
+        def target():
+            try:
+                result_holder["value"] = agent.run(prompt)
+            except Exception as exc:
+                exception_holder.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=self.task_timeout)
+
+        if thread.is_alive():
+            # Thread is still running — we can't forcefully kill it,
+            # but we signal timeout and move on. The daemon thread will
+            # be cleaned up when the process exits or on next task.
+            raise _TaskTimeout(f"Agent did not finish within {self.task_timeout}s")
+
+        if exception_holder:
+            raise exception_holder[0]
+
+        return result_holder.get("value", "")
+
     # ------------------------------------------------------------------
-    # Override run() to add predictions export
+    # Override run() to add resume support and predictions export
     # ------------------------------------------------------------------
 
     def run(
@@ -253,9 +425,16 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         limit: Optional[int] = None,
         task_ids: Optional[List[str]] = None,
         dry_run: bool = False,
+        resume: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the benchmark and export predictions for Docker evaluation."""
-        summary = super().run(limit=limit, task_ids=task_ids, dry_run=dry_run)
+        # Use the constructor's resume_file (swev has custom clone-failure logic)
+        effective_resume = resume or self.resume_file
+
+        summary = super().run(
+            limit=limit, task_ids=task_ids, dry_run=dry_run,
+            resume=effective_resume,
+        )
 
         if dry_run:
             return summary
@@ -266,26 +445,37 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         if not results_file.exists():
             return summary
 
+        # If resuming, also include results from the resume file
+        all_results_files = []
+        if self.resume_file and Path(self.resume_file).exists():
+            all_results_files.append(Path(self.resume_file))
+        all_results_files.append(results_file)
+
         timestamp = summary.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
         predictions_file = self.output_dir / f"swev_predictions_{timestamp}.jsonl"
 
         diff_count = 0
-        with open(results_file, encoding="utf-8") as fin, \
-             open(predictions_file, "w", encoding="utf-8") as fout:
-            for line in fin:
-                result = json.loads(line.strip())
-                instance_id = result.get("task_id", "")
-                agent_diff = result.get("agent_diff", "")
-                if agent_diff:
-                    diff_count += 1
-                prediction = {
-                    "instance_id": instance_id,
-                    "model_name_or_path": self.model_name,
-                    "model_patch": agent_diff,
-                }
-                fout.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+        seen_ids: Set[str] = set()
+        with open(predictions_file, "w", encoding="utf-8") as fout:
+            for rf in all_results_files:
+                with open(rf, encoding="utf-8") as fin:
+                    for line in fin:
+                        result = json.loads(line.strip())
+                        instance_id = result.get("task_id", "")
+                        if instance_id in seen_ids:
+                            continue
+                        seen_ids.add(instance_id)
+                        agent_diff = result.get("agent_diff", "")
+                        if agent_diff:
+                            diff_count += 1
+                        prediction = {
+                            "instance_id": instance_id,
+                            "model_name_or_path": self.model_name,
+                            "model_patch": agent_diff,
+                        }
+                        fout.write(json.dumps(prediction, ensure_ascii=False) + "\n")
 
-        total = summary.get("total", 0)
+        total = len(seen_ids)
         print(f"\n{'=' * 60}")
         print(f"  Predictions: {predictions_file}")
         print(f"  Diffs produced: {diff_count}/{total}")
@@ -296,6 +486,10 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         summary["predictions_file"] = str(predictions_file)
         summary["diff_count"] = diff_count
         return summary
+
+
+class _TaskTimeout(Exception):
+    """Raised when a single task exceeds its wall-clock timeout."""
 
 
 def main():
@@ -326,6 +520,18 @@ def main():
         default="whale-code",
         help="Model name for predictions file (default: whale-code)",
     )
+    parser.add_argument(
+        "--task-timeout",
+        type=int,
+        default=1800,
+        help="Per-task wall-clock timeout in seconds (default: 1800 = 30min)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="RESULTS_FILE",
+        help="Resume from a previous results JSONL file, skipping completed tasks",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -340,8 +546,10 @@ def main():
         timeout=args.timeout,
         repo_cache_dir=args.repo_cache_dir,
         model_name=args.model_name,
+        task_timeout=args.task_timeout,
+        resume_file=args.resume,
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 
 if __name__ == "__main__":

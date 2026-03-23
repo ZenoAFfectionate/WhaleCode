@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -13,6 +14,78 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 from .base import BenchmarkRunner, _PROJECT_ROOT
+
+
+# ---------------------------------------------------------------------------
+# tests.py wrapper — transforms plain assert into informative checks
+# ---------------------------------------------------------------------------
+_MBPP_TESTS_PY_TEMPLATE = """\
+import sys
+sys.path.insert(0, ".")
+from solution import *
+
+_failed = 0
+_total = 0
+
+{checks}
+
+print(f"{{_total - _failed}}/{{_total}} passed")
+if _failed:
+    sys.exit(1)
+else:
+    print("All tests passed!")
+"""
+
+_MBPP_CHECK_TEMPLATE = """\
+_total += 1
+try:
+    _actual = {actual_expr}
+    _expected = {expected_expr}
+    assert _actual == _expected, ""
+except AssertionError:
+    _failed += 1
+    print(f"[FAIL] {actual_expr_escaped}")
+    print(f"  actual:   {{_actual!r}}")
+    print(f"  expected: {{_expected!r}}")
+except Exception as _e:
+    _failed += 1
+    print(f"[ERROR] {actual_expr_escaped}")
+    print(f"  {{type(_e).__name__}}: {{_e}}")
+"""
+
+
+def _build_tests_py(assertion_code: str) -> str:
+    """Convert plain assert statements into a tests.py with detailed output."""
+    checks = []
+    for line in assertion_code.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^assert\s+(.+?)\s*==\s*(.+)$", line)
+        if m:
+            actual_expr = m.group(1).strip()
+            expected_expr = m.group(2).strip()
+            escaped = actual_expr.replace("{", "{{").replace("}", "}}")
+            checks.append(
+                _MBPP_CHECK_TEMPLATE.format(
+                    actual_expr=actual_expr,
+                    expected_expr=expected_expr,
+                    actual_expr_escaped=escaped,
+                )
+            )
+        else:
+            # Non-standard assert — wrap with try/except
+            escaped = line.replace("{", "{{").replace("}", "}}")
+            checks.append(
+                f'_total += 1\n'
+                f'try:\n'
+                f'    {line}\n'
+                f'except Exception as _e:\n'
+                f'    _failed += 1\n'
+                f'    print(f"[ERROR] {escaped}")\n'
+                f'    print(f"  {{type(_e).__name__}}: {{_e}}")\n'
+            )
+    return _MBPP_TESTS_PY_TEMPLATE.format(checks="\n".join(checks))
 
 
 class MBPPPlusBenchmark(BenchmarkRunner):
@@ -51,6 +124,7 @@ class MBPPPlusBenchmark(BenchmarkRunner):
         task_id = task["task_id"]
         prompt_text = task["prompt"]
         entry_point = task["entry_point"]
+        assertion_code = task.get("assertion", "")
 
         workspace = Path(tempfile.mkdtemp(prefix=f"mbpp_{task_id.replace('/', '_')}_"))
         try:
@@ -61,6 +135,11 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 encoding="utf-8",
             )
 
+            # tests.py — assertion wrapper with detailed error output
+            (workspace / "tests.py").write_text(
+                _build_tests_py(assertion_code), encoding="utf-8"
+            )
+
             # Run the agent
             agent = self._create_agent(workspace)
             agent_prompt = (
@@ -68,16 +147,17 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 f"in `solution.py`.\n\n"
                 f"**Task description:**\n{prompt_text}\n\n"
                 f"Follow these steps:\n"
-                f"1. Implement the function in `solution.py` using the Edit or Write tool.\n"
-                f"2. Test your implementation by running the example assertions from the "
-                f"task description via `Bash` (e.g. `python3 -c \"from solution import "
-                f"{entry_point}; assert ...\"`).\n"
-                f"3. If any assertion fails, fix the code and re-test.\n"
-                f"4. Once all assertions pass, call `Finish` with a brief summary of your "
-                f"implementation.\n\n"
+                f"1. Carefully analyze the task description and identify edge cases.\n"
+                f"2. Implement the function in `solution.py` using the Edit or Write tool.\n"
+                f"3. Run `python3 tests.py` to verify. If tests fail, analyze the error, "
+                f"fix your code, and re-run until all tests pass.\n"
+                f"4. Once all tests pass, call `Finish` with a brief summary.\n\n"
                 f"Rules:\n"
                 f"- The function must satisfy all the assertions in the task description.\n"
                 f"- Include any necessary imports at the top of the file.\n"
+                f"- Handle edge cases gracefully (empty inputs, special values).\n"
+                f"- Prefer simple, readable implementations over clever one-liners.\n"
+                f"- Only `solution.py` and `tests.py` exist in the workspace.\n"
             )
 
             start = time.time()
@@ -136,11 +216,12 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-steps", type=int, default=32)
-    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--max-steps", type=int, default=64)
+    parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--task-ids", nargs="*", default=None)
+    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -154,7 +235,7 @@ def main():
         max_steps=args.max_steps,
         timeout=args.timeout,
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 
 if __name__ == "__main__":

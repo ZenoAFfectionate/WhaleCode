@@ -1002,6 +1002,7 @@ def main():
         default=None,
         help="Only run tasks with this scenario type",
     )
+    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -1016,7 +1017,7 @@ def main():
         timeout=args.timeout,
         scenario_filter=args.scenario,
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 
 if __name__ == "__main__":

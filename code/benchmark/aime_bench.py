@@ -31,29 +31,71 @@ class AIMEBenchmark(BenchmarkRunner):
 
     benchmark_name = "aime"
 
-    _MATH_SYSTEM_PROMPT = (
-        "You are a mathematical problem-solving agent. You solve competition-level "
-        "math problems by combining mathematical reasoning with Python computation.\n\n"
-        "**Output Format (STRICT)**\n"
-        "- Use OpenAI function calling for tools. Do NOT emit tool calls in plain text.\n"
-        "- If you need a tool, call it via tool_calls only.\n\n"
-        "# Workflow\n"
-        "1. Analyze the problem — identify the mathematical domain (number theory, "
-        "combinatorics, geometry, algebra, probability) and the key techniques.\n"
-        "2. Use `Bash` to run `python3 -c \"...\"` for exploratory computations, "
-        "testing conjectures, and verifying intermediate results.\n"
-        "3. Write the final solution in `solution.py` using `Write` or `Edit`.\n"
-        "4. Run `python3 solution.py` via `Bash` to verify the output.\n"
-        "5. When done, call `Finish` with a concise summary of your answer.\n\n"
-        "# Available Python Libraries\n"
-        "You may freely use: `sympy`, `math`, `fractions`, `itertools`, "
-        "`functools`, `collections`, `numpy`, `decimal`, `cmath`.\n\n"
-        "# Tool Calling Rules\n"
-        "1. Use `tool_calls` only; do not output Action/ToolName text.\n"
-        "2. Arguments must be valid JSON.\n"
-        "3. Make independent tool calls in parallel when possible.\n\n"
-        "## Available Tools\n\n{tools}"
-    )
+    _MATH_SYSTEM_PROMPT = """\
+You are a mathematical problem-solving agent. You solve competition-level math \
+problems (AIME) by combining careful mathematical reasoning with Python computation.
+
+AIME answers are always integers from 000 to 999.
+
+# Core Principle: Think First, Code Second
+
+Before writing any code, you MUST reason about the problem mathematically using \
+the Thought tool. Identify the domain, key constraints, and a clear solution \
+strategy. Only then write code to execute your plan.
+
+# Workflow
+
+1. **Analyze** — Use Thought to identify the mathematical domain (number theory, \
+combinatorics, geometry, algebra, probability) and outline your approach. This is \
+the most important step.
+2. **Explore** (optional) — Use `Bash` with `python3 -c "..."` for quick \
+computations to test conjectures or verify small cases. Keep explorations focused \
+(at most 2-3 attempts).
+3. **Solve** — Write your solution in `solution.py`. The script must print exactly \
+one integer (the answer) as its only output. No debug prints.
+4. **Verify** — Run `python3 solution.py` via Bash. The output must be a single \
+integer in 0-999. If it is not, your approach is wrong — go back to step 1.
+5. **Finish** — Call `Finish` with your answer. You MUST run solution.py before \
+calling Finish.
+
+# Strategy Guidelines
+
+- **Think before brute-forcing.** If values explode or computation is slow, switch \
+to a smarter approach (modular arithmetic, closed-form, generating functions).
+- **Verify on small cases first.** Before scaling up, check your formula works on \
+cases you can compute by hand.
+- **Sequences & Recurrences**: Look for periodicity or closed-form solutions. Use \
+modular arithmetic if values grow large.
+- **Counting**: Use inclusion-exclusion or generating functions for large cases. \
+Verify formula on small n first.
+- **Geometry**: Use coordinate geometry or sympy for exact symbolic computation.
+- **Number Theory**: Work modulo the target. Use CRT, Fermat's little theorem, or \
+sympy.ntheory.
+- **Sanity check**: AIME answers are 0-999. If your answer is outside this range, \
+your approach is fundamentally wrong. Do not force it — rethink.
+
+# Available Libraries
+
+sympy, math, fractions, itertools, functools, collections, numpy, decimal, cmath.
+"""
+
+    # Template for solution.py — includes a sanity-check wrapper
+    _SOLUTION_TEMPLATE = """\
+# AIME Solution — answer must be an integer from 0 to 999.
+# Write your solution below. Assign the final answer to `answer`.
+# The sanity check at the bottom will print it.
+
+answer = None  # Replace with your computed answer
+
+
+# --- Sanity check (do not remove) ---
+if answer is None:
+    raise ValueError("No answer computed — set the `answer` variable.")
+answer = int(answer)
+if not (0 <= answer <= 999):
+    raise ValueError(f"Answer {answer} is outside AIME range 0-999. Rethink your approach.")
+print(answer)
+"""
 
     def _get_system_prompt(self):
         return self._MATH_SYSTEM_PROMPT
@@ -88,30 +130,25 @@ class AIMEBenchmark(BenchmarkRunner):
 
         workspace = Path(tempfile.mkdtemp(prefix=f"aime_{task_id}_"))
         try:
-            # Create an empty solution file
+            # Pre-populate solution.py with sanity-check template
             solution_file = workspace / "solution.py"
-            solution_file.write_text(
-                "# Write your solution here\n",
-                encoding="utf-8",
-            )
+            solution_file.write_text(self._SOLUTION_TEMPLATE, encoding="utf-8")
 
             # Run the agent
             agent = self._create_agent(workspace)
             agent_prompt = (
-                f"Solve this AIME (American Invitational Mathematics Examination) problem. "
-                f"The answer is always an integer from 000 to 999.\n\n"
+                f"Solve this AIME problem. The answer is an integer from 0 to 999.\n\n"
                 f"**Problem:**\n{problem}\n\n"
-                f"**Steps:**\n"
-                f"1. Reason about the problem mathematically. Identify the domain "
-                f"(number theory, combinatorics, geometry, algebra, probability) and "
-                f"plan your approach.\n"
-                f"2. Use `Bash` with `python3 -c \"...\"` to explore and test ideas. "
-                f"You have: sympy, itertools, math, fractions, numpy, collections.\n"
-                f"3. Write the final solution in `solution.py` — it must print exactly "
-                f"one integer (the answer, nothing else).\n"
-                f"4. Run `python3 solution.py` via Bash to verify the output is correct "
-                f"and in range 0–999.\n"
-                f"5. If the output looks wrong, revise and re-test.\n"
+                f"**Instructions:**\n"
+                f"1. First, use Thought to analyze the problem mathematically. "
+                f"Identify the domain and plan your approach before writing any code.\n"
+                f"2. Optionally use `python3 -c \"...\"` via Bash to explore ideas "
+                f"(sympy, itertools, numpy are available). Keep this to 2-3 attempts.\n"
+                f"3. Edit `solution.py` — set the `answer` variable to your computed "
+                f"result. The template already handles printing and sanity checking.\n"
+                f"4. Run `python3 solution.py` via Bash. If it raises a ValueError, "
+                f"your answer is wrong — rethink your approach.\n"
+                f"5. Call `Finish` with your answer.\n"
             )
 
             start = time.time()
@@ -174,11 +211,12 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-steps", type=int, default=64)
-    parser.add_argument("--timeout", type=int, default=60, help="Longer timeout for math computations")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--max-steps", type=int, default=128)
+    parser.add_argument("--timeout", type=int, default=120, help="Longer timeout for math computations")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
     parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
+    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -192,7 +230,7 @@ def main():
         max_steps=args.max_steps,
         timeout=args.timeout,
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 
 if __name__ == "__main__":

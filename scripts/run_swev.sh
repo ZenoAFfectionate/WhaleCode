@@ -8,6 +8,8 @@
 #   bash scripts/run_swev.sh --limit 5                  # First 5 instances
 #   bash scripts/run_swev.sh --dry-run                  # Dry run
 #   bash scripts/run_swev.sh --repo-cache-dir /tmp/repos  # Cache cloned repos
+#   bash scripts/run_swev.sh --resume data/_results/prev.jsonl  # Resume from crash
+#   bash scripts/run_swev.sh --task-timeout 1800           # 30min per task
 
 set -euo pipefail
 

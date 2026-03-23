@@ -48,8 +48,17 @@ class BashTool(Tool):
         "poweroff",
         "halt",
     }
-    PREFER_SPECIALIZED_TOOLS: Set[str] = {"ls", "grep", "rg", "find"}
-    NETWORK_COMMANDS: Set[str] = {"pnpm", "yarn", "apt", "brew"}
+    PREFER_SPECIALIZED_TOOLS: Set[str] = {
+        "ls", "find",            # use LS / Glob
+        "grep", "rg",            # use Grep
+        "sed", "awk",            # use Edit / MultiEdit
+    }
+    NETWORK_COMMANDS: Set[str] = {
+        "npm", "pnpm", "yarn",   # JS package managers
+        "pip", "pip3",           # Python package managers
+        "apt", "apt-get", "brew",  # system package managers
+        "curl", "wget",          # HTTP clients
+    }
 
     def __init__(
         self,
@@ -60,9 +69,11 @@ class BashTool(Tool):
         super().__init__(
             name=name,
             description=(
-                "Run a non-interactive shell command inside the workspace. Prefer this for tests, "
-                "builds, formatters, linters, package scripts, and one-off developer commands. "
-                "Do not use Bash for simple file listing, file reading, or code search when `LS`, `Read`, or `Grep` can do the job more safely."
+                "Run a non-interactive shell command inside the workspace. "
+                "Use this for builds, tests, formatters, linters, package scripts, developer commands, "
+                "and quick file inspection (cat, head, tail). "
+                "Do NOT use Bash for code search (`Grep`, `Glob`), "
+                "directory listing (`LS`), or file editing (`Edit`) — use the dedicated tools instead."
             ),
         )
         self.project_root = Path(project_root).expanduser().resolve()
@@ -80,16 +91,27 @@ class BashTool(Tool):
                 name="command",
                 type="string",
                 description=(
-                    "The shell command to execute. Best for commands like `pytest`, `python -m`, "
-                    "`npm test`, `ruff check`, `make`, or project scripts. Avoid using this for file browsing or text search."
+                    "The shell command to execute. Use for commands like `pytest`, `python -m`, "
+                    "`npm test`, `ruff check`, `make`, `git`, or project scripts."
                 ),
                 required=True,
+            ),
+            ToolParameter(
+                name="description",
+                type="string",
+                description=(
+                    "A short human-readable summary of what this command does (5-10 words). "
+                    "Displayed in logs and used for context compression."
+                ),
+                required=False,
+                default="",
             ),
             ToolParameter(
                 name="directory",
                 type="string",
                 description=(
-                    "Working directory relative to the workspace root. Use this when the command should run from a subdirectory such as `frontend` or `backend`."
+                    "Working directory relative to the workspace root. "
+                    "Use this instead of `cd` when the command should run from a subdirectory."
                 ),
                 required=False,
                 default=".",
@@ -98,8 +120,8 @@ class BashTool(Tool):
                 name="timeout_ms",
                 type="integer",
                 description=(
-                    f"Execution timeout in milliseconds. Increase this for slow test suites or builds. "
-                    f"Default {self.DEFAULT_TIMEOUT_MS}, hard max {self.MAX_TIMEOUT_MS}."
+                    f"Execution timeout in milliseconds. "
+                    f"Increase for slow test suites or builds. Max {self.MAX_TIMEOUT_MS}."
                 ),
                 required=False,
                 default=self.DEFAULT_TIMEOUT_MS,
@@ -108,6 +130,7 @@ class BashTool(Tool):
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         command = parameters.get("command")
+        description = parameters.get("description", "")
         directory = parameters.get("directory", ".")
         timeout_ms = parameters.get("timeout_ms", self.DEFAULT_TIMEOUT_MS)
 
@@ -158,6 +181,7 @@ class BashTool(Tool):
             stderr = exc.stderr or b""
             return self._format_response(
                 command=command,
+                description=description,
                 directory=target_dir,
                 exit_code=None,
                 stdout=stdout,
@@ -170,21 +194,15 @@ class BashTool(Tool):
                 message=f"Failed to execute shell command: {exc}",
             )
 
-        response = self._format_response(
+        return self._format_response(
             command=command,
+            description=description,
             directory=target_dir,
             exit_code=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
             timed_out=False,
         )
-        if result.returncode != 0:
-            return ToolResponse.partial(
-                text=response.text,
-                data=response.data,
-                context=response.context,
-            )
-        return response
 
     def _validate_command(self, command: str) -> Optional[str]:
         """Validate *command* against security policies.
@@ -225,8 +243,9 @@ class BashTool(Tool):
         for leader in self._extract_segment_leaders(command):
             if leader in self.PREFER_SPECIALIZED_TOOLS:
                 return (
-                    "Use the dedicated tools instead of shell for listing, reading, "
-                    "or searching files."
+                    f"Use the dedicated tool instead of `{leader}` in Bash. "
+                    "Read → file reading, Grep → code search, Glob → file finding, "
+                    "LS → directory listing, Edit → file editing."
                 )
 
         return None
@@ -269,6 +288,7 @@ class BashTool(Tool):
     def _format_response(
         self,
         command: str,
+        description: str,
         directory: Path,
         exit_code: Optional[int],
         stdout: bytes,
@@ -280,45 +300,59 @@ class BashTool(Tool):
         stdout_text, stdout_lines_truncated = apply_line_limit(stdout_text)
         stderr_text, stderr_lines_truncated = apply_line_limit(stderr_text)
 
-        parts = [
-            f"Command: {command}",
-            f"Directory: {relative_display(self.project_root, directory)}",
-        ]
-        if timed_out:
-            parts.append("Status: timed out")
-        else:
-            parts.append(f"Exit code: {exit_code}")
+        rel_dir = relative_display(self.project_root, directory)
 
+        # --- Header ---
+        parts: List[str] = []
+        if description:
+            parts.append(f"Description: {description}")
+        parts.append(f"Command: {command}")
+        parts.append(f"Directory: {rel_dir}")
+
+        if timed_out:
+            parts.append("Status: TIMED OUT")
+        elif exit_code == 0:
+            parts.append(f"Exit code: {exit_code} (success)")
+        else:
+            parts.append(f"Exit code: {exit_code} (failure)")
+
+        # --- Output sections ---
         if stdout_text:
-            parts.extend(["", "[stdout]", stdout_text])
+            parts.extend(["", "--- stdout ---", stdout_text])
             if stdout_bytes_truncated or stdout_lines_truncated:
                 parts.append("[stdout truncated]")
 
         if stderr_text:
-            parts.extend(["", "[stderr]", stderr_text])
+            parts.extend(["", "--- stderr ---", stderr_text])
             if stderr_bytes_truncated or stderr_lines_truncated:
                 parts.append("[stderr truncated]")
 
         if not stdout_text and not stderr_text:
             parts.extend(["", "[no output]"])
 
+        text = "\n".join(parts)
+        data = {
+            "command": command,
+            "description": description,
+            "directory": rel_dir,
+            "exit_code": exit_code,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "timed_out": timed_out,
+        }
+
         if timed_out:
             return ToolResponse.error(
                 code=ToolErrorCode.TIMEOUT,
-                message="\n".join(parts),
-                context={
-                    "command": command,
-                    "directory": relative_display(self.project_root, directory),
-                },
+                message=text,
+                context={"command": command, "directory": rel_dir},
             )
 
-        return ToolResponse.success(
-            text="\n".join(parts),
-            data={
-                "command": command,
-                "directory": relative_display(self.project_root, directory),
-                "exit_code": exit_code,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-            },
-        )
+        if exit_code != 0:
+            return ToolResponse.error(
+                code=ToolErrorCode.EXECUTION_ERROR,
+                message=text,
+                context={"command": command, "directory": rel_dir, "exit_code": exit_code},
+            )
+
+        return ToolResponse.success(text=text, data=data)

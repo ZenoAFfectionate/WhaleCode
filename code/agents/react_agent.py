@@ -130,6 +130,8 @@ class ReActAgent(Agent):
             self._console(f"🎉 Final answer: {payload.get('final_answer', '')}")
         elif event_type == "timeout":
             self._console("⏰ Maximum steps reached, stopping.")
+        elif event_type == "stagnation_detected":
+            self._console(f"🔄 Stagnation detected: {payload.get('reason')}. Stopping early.")
         elif event_type == "stream_chunk":
             self._console(payload.get("chunk", ""), end="", flush=True)
         elif event_type == "stream_newline":
@@ -309,6 +311,12 @@ class ReActAgent(Agent):
         no_tool_call_retries = 0
         max_no_tool_call_retries = 2
         _is_retry = False  # 标记当前是否为重试（重试时不渲染 step header）
+
+        # --- Stagnation detection ---
+        _consecutive_no_diff_edits = 0   # adjacent Edit calls with no textual diff
+        _last_test_output_hash = None    # hash of last test run output
+        _consecutive_same_tests = 0      # consecutive identical test results
+        _stagnation_detected = False
 
         # 记录用户消息
         if self.trace_logger:
@@ -565,8 +573,46 @@ class ReActAgent(Agent):
                         "content": result
                     })
 
-        # 达到最大步数
-        self._render_timeout()
+                    # --- Stagnation detection ---
+                    if tool_name in ("Edit", "MultiEdit"):
+                        if "[no textual diff]" in result:
+                            _consecutive_no_diff_edits += 1
+                        else:
+                            _consecutive_no_diff_edits = 0
+                    else:
+                        # Non-Edit tool resets the counter (user requires adjacent Edit calls)
+                        _consecutive_no_diff_edits = 0
+
+                    if tool_name == "Bash":
+                        cmd = arguments.get("command", "")
+                        if "tests.py" in cmd or "pytest" in cmd or "unittest" in cmd:
+                            test_hash = hash(result)
+                            if test_hash == _last_test_output_hash:
+                                _consecutive_same_tests += 1
+                            else:
+                                _consecutive_same_tests = 0
+                                _last_test_output_hash = test_hash
+
+                    if _consecutive_no_diff_edits >= 3 or _consecutive_same_tests >= 3:
+                        reason = (
+                            "3 consecutive Edit calls with no textual diff"
+                            if _consecutive_no_diff_edits >= 3
+                            else "3 consecutive identical test results"
+                        )
+                        self._render_event("stagnation_detected", {
+                            "reason": reason,
+                            "step": current_step,
+                        })
+                        _stagnation_detected = True
+                        break  # break inner for-loop
+
+            # Check if stagnation was detected to break the outer while-loop
+            if _stagnation_detected:
+                break
+
+        # 达到最大步数或停滞检测触发
+        if not _stagnation_detected:
+            self._render_timeout()
         final_answer = "Sorry, I could not complete this task within the step limit."
 
         # 保存到历史记录

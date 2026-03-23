@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -13,12 +12,9 @@ from ..observability.trace_logger import TraceLogger
 from ..tools.registry import ToolRegistry
 from .react_agent import ReActAgent
 
-# Ensure the project root is on sys.path so we can import from the `prompts` package.
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-from prompts.system_prompt import CODE_AGENT_SYSTEM_PROMPT
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CODE_AGENT_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "system_prompt.md"
+CODE_AGENT_SYSTEM_PROMPT: str = _CODE_AGENT_PROMPT_FILE.read_text(encoding="utf-8")
 
 
 def _copy_config(config: Optional[Config]) -> Config:

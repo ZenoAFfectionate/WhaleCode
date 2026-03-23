@@ -9,8 +9,8 @@ class Config(BaseModel):
     # LLM Config
     default_model: str = "Qwen/Qwen3.5-35B-A3B-FP8"
     default_provider: str = "vllm"
-    temperature: float = 0.3
-    max_tokens: Optional[int] = 8192
+    temperature: float = 1.0
+    max_tokens: Optional[int] = 65536
 
     debug: bool = False
     log_level: str = "INFO"
@@ -93,7 +93,7 @@ class Config(BaseModel):
         kwargs: Dict[str, Any] = {
             "debug": os.getenv("DEBUG", "false").lower() == "true",
             "log_level": os.getenv("LOG_LEVEL", "INFO"),
-            "temperature": float(os.getenv("TEMPERATURE", "0.3")),
+            "temperature": float(os.getenv("TEMPERATURE", "1.0")),
         }
 
         if os.getenv("MAX_TOKENS"):

@@ -208,13 +208,51 @@ class BenchmarkRunner(ABC):
     # Main run loop
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Resume support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_completed_ids(resume_file: Path) -> set:
+        """Read a previous results JSONL and return the set of completed task_ids."""
+        completed: set = set()
+        if not resume_file.exists():
+            return completed
+        with open(resume_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    tid = record.get("task_id")
+                    if tid is not None:
+                        completed.add(tid)
+                except json.JSONDecodeError:
+                    continue
+        return completed
+
+    # ------------------------------------------------------------------
+    # Main run loop
+    # ------------------------------------------------------------------
+
     def run(
         self,
         limit: Optional[int] = None,
         task_ids: Optional[List[str]] = None,
         dry_run: bool = False,
+        resume: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run the benchmark and return a summary dict."""
+        """Run the benchmark and return a summary dict.
+
+        Args:
+            limit: Only run the first *limit* tasks.
+            task_ids: Only run tasks whose ``task_id`` is in this list.
+            dry_run: Print tasks without executing.
+            resume: Path to a previous results ``.jsonl`` file.  Already-
+                completed task IDs are skipped and new results are **appended**
+                to the same file.
+        """
         tasks = self._load_tasks()
         if task_ids:
             id_set = set(task_ids)
@@ -222,28 +260,58 @@ class BenchmarkRunner(ABC):
         if limit and limit > 0:
             tasks = tasks[:limit]
 
+        # --- Resume handling ---
+        completed_ids: set = set()
+        if resume:
+            resume_path = Path(resume)
+            if not resume_path.exists():
+                print(f"  ⚠ Resume file not found: {resume}")
+                print(f"    Starting a fresh run instead.\n")
+            else:
+                completed_ids = self._load_completed_ids(resume_path)
+                print(f"  ▶ Resuming from: {resume}")
+                print(f"    Already completed: {len(completed_ids)} tasks")
+
+        # Decide which file to write results to
+        if resume and Path(resume).exists():
+            results_file = Path(resume)
+            # Derive timestamp from the resume filename for the summary
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
+
         print(f"\n{'=' * 60}")
         print(f"  Benchmark: {self.benchmark_name}")
         print(f"  Tasks: {len(tasks)}")
         print(f"  Model: {self.model or '(from env)'}")
         print(f"  Max steps: {self.max_steps}")
         print(f"  Timeout: {self.timeout}s")
+        if completed_ids:
+            remaining = sum(1 for t in tasks if t.get("task_id", "") not in completed_ids)
+            print(f"  Resume: {len(completed_ids)} done, {remaining} remaining")
         print(f"{'=' * 60}\n")
 
         if dry_run:
             for t in tasks:
-                print(f"  [dry-run] {t.get('task_id')}")
+                tid = t.get("task_id")
+                tag = " [SKIP]" if tid in completed_ids else ""
+                print(f"  [dry-run] {tid}{tag}")
             return {"benchmark": self.benchmark_name, "total": len(tasks), "dry_run": True}
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
         results: List[Dict[str, Any]] = []
-
         passed_count = 0
         total_time = 0.0
+        skipped = 0
 
         for i, task in enumerate(tasks):
             task_id = task.get("task_id", f"task_{i}")
+
+            if task_id in completed_ids:
+                skipped += 1
+                print(f"\n[{i + 1}/{len(tasks)}] {task_id}  [SKIP - already completed]")
+                continue
+
             print(f"\n[{i + 1}/{len(tasks)}] {task_id}")
 
             try:
@@ -274,24 +342,28 @@ class BenchmarkRunner(ABC):
 
             total_time += result.get("elapsed_s", 0)
 
-            # Stream results to file after each task
+            # Append results to file after each task (works for both new and resumed runs)
             with open(results_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-        # Summary
-        total = len(tasks)
-        pass_rate = (passed_count / total * 100) if total > 0 else 0
+        # Summary (includes both previous and new results)
+        evaluated = len(results)
+        total_with_resumed = evaluated + skipped
+        pass_rate = (passed_count / evaluated * 100) if evaluated > 0 else 0
         summary = {
             "benchmark": self.benchmark_name,
             "model": self.model or "(from env)",
-            "total": total,
+            "total": len(tasks),
+            "evaluated": evaluated,
+            "skipped": skipped,
             "passed": passed_count,
-            "failed": total - passed_count,
+            "failed": evaluated - passed_count,
             "pass_rate": round(pass_rate, 2),
             "total_time_s": round(total_time, 2),
-            "avg_time_s": round(total_time / total, 2) if total > 0 else 0,
+            "avg_time_s": round(total_time / evaluated, 2) if evaluated > 0 else 0,
             "timestamp": timestamp,
             "results_file": str(results_file),
+            "resumed_from": resume if resume else None,
         }
 
         summary_file = self.output_dir / f"{self.benchmark_name}_{timestamp}_summary.json"
@@ -299,7 +371,13 @@ class BenchmarkRunner(ABC):
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
         print(f"\n{'=' * 60}")
-        print(f"  Results: {passed_count}/{total} passed ({pass_rate:.1f}%)")
+        if skipped:
+            print(f"  Resumed: {skipped} previously completed")
+        print(f"  New results: {passed_count}/{evaluated} passed ({pass_rate:.1f}%)")
+        if skipped:
+            # Also show overall stats from the combined file
+            all_ids = self._load_completed_ids(results_file)
+            print(f"  Total in file: {len(all_ids)} tasks")
         print(f"  Time: {total_time:.1f}s total, {summary['avg_time_s']:.1f}s avg")
         print(f"  Output: {results_file}")
         print(f"  Summary: {summary_file}")

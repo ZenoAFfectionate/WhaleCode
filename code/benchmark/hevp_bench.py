@@ -12,10 +12,13 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from .base import BenchmarkRunner, _PROJECT_ROOT
+try:
+    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+except ImportError:
+    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
 
 
-_HEVP_SYSTEM_PROMPT = """\
+_HEVP_ADDENDUM = """\
 You are an expert Python programmer. Your task is to implement Python functions \
 correctly by reading the provided signature and docstring, then writing the body.
 
@@ -44,6 +47,12 @@ The error output from `python3 tests.py` already provides all the diagnostic \
 information you need (test index, expected vs actual values). \
 Rely solely on that output to debug your implementation.
 """
+
+_HEVP_SYSTEM_PROMPT = (
+    BENCHMARK_BASE_SYSTEM_PROMPT
+    + "\n\n---\n\n## HumanEval+ Benchmark Override\n\n"
+    + _HEVP_ADDENDUM
+)
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import subprocess
@@ -21,7 +20,8 @@ CODE_DIR = PROJECT_ROOT / "code"
 
 try:
     from rich.align import Align
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.rule import Rule
@@ -30,7 +30,7 @@ try:
 
     RICH_AVAILABLE = True
 except ImportError:
-    Align = Console = Markdown = Panel = Rule = Table = Text = None
+    Align = Console = Group = Live = Markdown = Panel = Rule = Table = Text = None
     RICH_AVAILABLE = False
 
 try:
@@ -120,6 +120,8 @@ class CLIUI:
     def __init__(self, use_rich: bool = True):
         self.use_rich = bool(use_rich and RICH_AVAILABLE)
         self.console = Console(record=True) if self.use_rich else None
+        self._live: Optional[Live] = None
+        self._live_agent = None
 
     def print(self, message: str = "") -> None:
         if self.use_rich:
@@ -307,6 +309,92 @@ class CLIUI:
             for line in lines:
                 print(line)
             print("---")
+
+    def _build_task_panel(self, agent):
+        """Build a Rich renderable showing live task progress.
+
+        Returns an empty Text when no tasks exist so the Live panel
+        occupies zero vertical space.
+        """
+        if not self.use_rich:
+            return Text("")
+
+        todo_tool = None
+        if hasattr(agent, "tool_registry") and agent.tool_registry:
+            todo_tool = agent.tool_registry.get_tool("TodoWrite")
+        if not todo_tool or not hasattr(todo_tool, "task_manager"):
+            return Text("")
+
+        try:
+            tasks = todo_tool.task_manager.list_all()
+        except Exception:
+            return Text("")
+        if not tasks:
+            return Text("")
+
+        max_label_len = 40
+        markers = {
+            "completed": ("✔", "green"),
+            "in_progress": ("►", "bold yellow"),
+            "pending": ("◻", "dim"),
+            "cancelled": ("✘", "dim red"),
+        }
+
+        total = len(tasks)
+        done = sum(1 for t in tasks if t["status"] == "completed")
+
+        lines = Text()
+        for i, t in enumerate(tasks):
+            label = t["subject"]
+            if len(label) > max_label_len:
+                label = label[: max_label_len - 1] + "…"
+            marker, style = markers.get(t["status"], ("?", "dim"))
+            lines.append(f"  {marker} ", style=style)
+            lines.append(label, style=style)
+            if i < total - 1:
+                lines.append("\n")
+
+        return Panel(
+            lines,
+            title=f"Tasks [{done}/{total}]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+            width=self.console.width if self.console else 80,
+        )
+
+    def start_live(self, agent) -> None:
+        """Start a pinned Live task panel at the bottom of the terminal."""
+        if not self.use_rich or self._live is not None:
+            return
+        self._live_agent = agent
+        renderable = self._build_task_panel(agent)
+        self._live = Live(
+            renderable,
+            console=self.console,
+            refresh_per_second=4,
+            vertical_overflow="visible",
+            transient=True,
+        )
+        self._live.start()
+
+    def stop_live(self) -> None:
+        """Stop the pinned Live task panel."""
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+            self._live_agent = None
+
+    def refresh_live(self) -> None:
+        """Re-render the Live task panel with current task state."""
+        if self._live is not None and self._live_agent is not None:
+            try:
+                self._live.update(self._build_task_panel(self._live_agent))
+            except Exception:
+                pass
 
     def render_assistant(self, text: str) -> None:
         if self.use_rich:
@@ -537,6 +625,7 @@ class CLICodeAgentMixin:
                     is_success = status != "error" and not content.startswith("❌")
                     if is_success:
                         self._todo_changed_this_turn = True
+                        self.ui.refresh_live()
 
                 if tool_call_id and tool_call_id in tracked_ids:
                     tracked_ids.discard(tool_call_id)
@@ -855,48 +944,23 @@ def load_session_and_tasks(agent, raw_value: Optional[str], fallback_name: str, 
         return False
 
 
-def _todowrite_state_digest(agent) -> Optional[str]:
-    """Return a digest of TodoWrite task files, or None if unavailable."""
-    try:
-        if not hasattr(agent, "tool_registry") or not agent.tool_registry:
-            return None
-        todo_tool = agent.tool_registry.get_tool("TodoWrite")
-        if not todo_tool or not hasattr(todo_tool, "task_manager"):
-            return None
-
-        task_dir = Path(todo_tool.task_manager.dir)
-        hasher = hashlib.sha256()
-        has_any_file = False
-
-        for task_file in sorted(task_dir.glob("task_*.json")):
-            if not task_file.is_file():
-                continue
-            has_any_file = True
-            stat = task_file.stat()
-            # Use filename + mtime + size as a lightweight fingerprint.
-            hasher.update(task_file.name.encode("utf-8"))
-            hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
-            hasher.update(str(stat.st_size).encode("utf-8"))
-
-        return hasher.hexdigest() if has_any_file else "empty"
-    except Exception:
-        return None
 
 
 def run_agent_turn(agent, prompt: str, ui: CLIUI) -> str:
     if hasattr(agent, "_reset_todo_turn_tracking"):
         agent._reset_todo_turn_tracking()
 
-    todo_before = _todowrite_state_digest(agent)
     start_time = time.time()
-    response = agent.run(prompt)
-    todo_after = _todowrite_state_digest(agent)
-    todo_changed_by_events = False
-    if hasattr(agent, "_todo_changed_in_turn"):
-        todo_changed_by_events = bool(agent._todo_changed_in_turn())
 
-    if todo_before != todo_after or todo_changed_by_events:
-        ui.render_task_status(agent)
+    # Start the pinned Live task panel during agent execution.
+    ui.start_live(agent)
+    try:
+        response = agent.run(prompt)
+    finally:
+        ui.stop_live()
+
+    # Always render final task status (static) after the turn.
+    ui.render_task_status(agent)
     ui.render_assistant(response or "")
     ui.render_summary(time.time() - start_time, agent=agent)
     return response or ""
@@ -945,15 +1009,12 @@ def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
 
 def build_prompt_reader(history_file: Path):
     if PROMPT_TOOLKIT_AVAILABLE and sys.stdin.isatty():
-        # Timing-based paste detection.
-        # Human typing: >50ms between last keystroke and Enter.
-        # Pasted text:  ~0ms between characters (arrives as a burst).
-        #
-        # When Enter arrives within _PASTE_THRESHOLD of the last text
-        # change, we treat it as part of a paste and insert a newline.
-        # Otherwise we submit.  This works regardless of whether the
-        # terminal supports bracket paste mode.
-        _PASTE_THRESHOLD = 0.05  # 50 ms
+        from prompt_toolkit.filters import in_paste_mode
+
+        # Timing-based paste detection (fallback for terminals without
+        # bracketed paste support).  Human typing has >150ms between the
+        # last keystroke and Enter; pasted text arrives as a burst (~0ms).
+        _PASTE_THRESHOLD = 0.15  # 150 ms
         _last_text_change = [0.0]
 
         def _on_text_changed(buf):
@@ -961,7 +1022,13 @@ def build_prompt_reader(history_file: Path):
 
         bindings = KeyBindings()
 
-        @bindings.add(Keys.Enter, eager=True)
+        # --- Bracketed paste mode: always insert newline (never submit) ---
+        @bindings.add(Keys.Enter, eager=True, filter=in_paste_mode)
+        def _paste_enter(event):
+            event.current_buffer.insert_text("\n")
+
+        # --- Normal mode: timing heuristic ---
+        @bindings.add(Keys.Enter, eager=True, filter=~in_paste_mode)
         def _smart_enter(event):
             """Submit on Enter, unless rapid input indicates a paste."""
             delta = time.monotonic() - _last_text_change[0]
@@ -1022,6 +1089,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
 
     while True:
         try:
+            ui.render_task_status(agent)
             user_input = read_prompt()
         except EOFError:
             ui.print()

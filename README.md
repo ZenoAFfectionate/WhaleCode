@@ -15,14 +15,11 @@ Whale Code is a from-scratch implementation of an autonomous coding agent that o
   - [Tool Response Protocol](#tool-response-protocol)
   - [Circuit Breaker](#circuit-breaker)
 - [Task System](#task-system)
-  - [Persistent Task Graph (TaskTool)](#persistent-task-graph-tasktool)
-  - [Lightweight Progress Tracking (TodoWrite)](#lightweight-progress-tracking-todowrite)
+  - [Unified Task Management (TodoWrite)](#unified-task-management-todowrite)
   - [Background Execution via Bash](#background-execution-via-bash)
 - [Benchmarks](#benchmarks)
   - [Supported Benchmarks](#supported-benchmarks)
   - [Quick Start](#quick-start-1)
-  - [CLI Options](#cli-options)
-  - [Output Format](#output-format)
 - [License](#license)
 
 ---
@@ -33,7 +30,7 @@ Whale Code is a from-scratch implementation of an autonomous coding agent that o
 
 ```bash
 git clone https://github.com/ZenoAFfectionate/Coding_Agent.git
-cd WhaleCode
+cd Whale_Code
 
 # Create and activate a conda virtual environment
 conda create -n WhaleCode python=3.12 -y
@@ -42,7 +39,10 @@ conda activate WhaleCode
 # Install dependencies
 pip install -r requirements.txt
 
-# Configure your API key on .env
+# Configure `.env` (minimum required):
+#   LLM_MODEL_ID=<your-model>
+#   LLM_API_KEY=<your-key>
+#   LLM_BASE_URL=<your-openai-compatible-endpoint>
 ```
 
 ### Running the Agent
@@ -85,6 +85,7 @@ The CLI provides an interactive loop where you can issue coding tasks:
 | `/clear` | Clear the in-memory conversation history |
 | `/save [name]` | Save the current session snapshot (default name: `session-latest`) |
 | `/load [path\|name]` | Load a previously saved session by file path or name |
+| `/resume [path\|name]` | Alias of `/load`; restores conversation + task snapshot |
 | `/sessions` | List all saved session files with metadata (steps, tokens, timestamps) |
 | `/compact [focus]` | Manually trigger context compaction; optional `focus` guides the summary |
 
@@ -249,13 +250,9 @@ If the model tries to run `grep pattern .` or `sed -i ...` as a standalone comma
 | | `Delete` | Safe file/directory deletion with guardrails and atomic trash move |
 | | `Edit` | Single-snippet surgical replacement with conflict detection + backup |
 | **Execution** | `Bash` | Shell commands with command policy validation and `block_until_ms` backgrounding |
-| **Planning** | `TodoWrite` | Lightweight declarative progress tracking |
-| | `task_create` | Create a persistent task with dependency graph |
-| | `task_update` | Update task status/fields/dependencies |
-| | `task_list` / `task_get` | Query task status |
+| **Planning** | `TodoWrite` | Unified task manager (`action=create/update/list/get/bulk_create/delete`) with persisted dependency graph |
 | **Web** | `WebSearch` | Search the web via DuckDuckGo |
 | | `WebFetch` | Fetch and extract readable text from a URL |
-| **Knowledge** | `Skill` | Load domain-specific skills on demand |
 | **Interaction** | `AskUser` | Ask the user a question (main agent only, disabled in sub-agents) |
 
 ### Tool Response Protocol
@@ -280,68 +277,35 @@ The circuit breaker tracks per-tool failure counts. When a tool hits the thresho
 
 ## Task System
 
-Whale Code implements three complementary mechanisms for multi-task scheduling, each serving a different purpose:
+Whale Code now uses a merged task architecture centered on one tool (`TodoWrite`) plus asynchronous execution through `Bash`.
 
-### Persistent Task Graph (TaskTool)
-
-**Source**: `code/tools/builtin/task_tool.py`
-
-A **file-per-task** persistent graph that survives context compression. This is the core mechanism for complex, multi-step work.
-
-**Storage**: Each task is stored as an individual JSON file under `memory/tasks/task_{id}.json`.
-
-**Data Model**:
-
-```json
-{
-  "id": 1,
-  "subject": "Implement user authentication",
-  "description": "Add JWT-based auth to the API endpoints",
-  "status": "in_progress",
-  "blockedBy": [2],
-  "blocks": [3, 4],
-  "owner": "code-agent"
-}
-```
-
-**Key Features**:
-
-1. **Dependency Graph** — Tasks can declare `blockedBy` (prerequisites) and `blocks` (dependents) relationships. When a task is completed, its ID is automatically removed from all other tasks' `blockedBy` lists, unblocking dependent work.
-
-2. **Bidirectional Edge Maintenance** — Adding `blockedBy: [2]` to task 1 automatically adds `blocks: [1]` to task 2.
-
-3. **Context-Compression Resilience** — Because tasks are stored as files on disk (not in conversation history), they survive context compaction. Even after the conversation is summarized, the agent can query `task_list` to recall pending work.
-
-4. **Expandable Tool Pattern** — `TaskTool` is registered as an `expandable=True` tool that auto-expands into 4 independent sub-tools via the `@tool_action` decorator:
-   - `task_create` — Create a task with optional `blocked_by` dependencies.
-   - `task_update` — Update status (`pending` → `in_progress` → `completed`), subject, description, owner, or dependencies.
-   - `task_list` — List tasks with optional status filter.
-   - `task_get` — Get full details of one task.
-
-### Lightweight Progress Tracking (TodoWrite)
+### Unified Task Management (TodoWrite)
 
 **Source**: `code/tools/builtin/todowrite_tool.py`
 
-A **declarative, in-session** progress tracker for lightweight task management:
+`TodoWrite` is a single action-based tool that replaces separate `task_*` tools.
 
-- **Declarative Override** — each call submits the full todo list; no incremental add/remove.
-- **Single-Thread Enforcement** — at most 1 task can be `in_progress` at any time; the tool rejects lists with multiple active tasks.
-- **Auto-Recap Generation** — generates a compact status line (e.g. `[2/5] In progress: xxx. Pending: yyy; zzz.`) for context efficiency.
-- **Persistent Snapshots** — todo states are saved as timestamped JSON files under `memory/todos/`.
+- **Actions**: `create`, `update`, `list`, `get`, `bulk_create`, `delete`
+- **Storage model**: one JSON file per task under `memory/tasks/task_{id}.json`
+- **Status model**: `pending` → `in_progress` → `completed` or `cancelled`
+- **Dependencies**: `blockedBy` / `blocks` are maintained bidirectionally
+- **Auto-unblock behavior**: completing a task removes its ID from other tasks' `blockedBy`
+- **Progress recap**: each operation returns a compact status recap for context efficiency
+
+This merged design keeps task state persistent across context compaction and process restarts while reducing tool-surface complexity.
 
 ### Background Execution via Bash
 
 **Source**: `code/tools/builtin/bash.py`
 
-Enables **non-blocking parallel execution** of long-running commands through `Bash`:
+Long-running shell commands are handled directly by `Bash`:
 
-1. **`block_until_ms`** — each `Bash` call waits up to `block_until_ms` (default `30000`). If the process is still running, it is moved to background and the call returns immediately.
+1. **`block_until_ms`** — waits up to the configured window (default `30000`).
+2. **Automatic backgrounding** — if the process exceeds the wait window, it continues in background.
+3. **Immediate background mode** — set `block_until_ms: 0` to return immediately.
+4. **Terminal artifacts** — background runs are persisted under `memory/terminals/` with status and output.
 
-2. **Immediate Background Mode** — set `block_until_ms: 0` to start a command in the background without waiting.
-
-3. **Terminal Files** — backgrounded runs return `terminal_file` (for example `memory/terminals/7.txt`). The file includes a running header (`pid`, `running_for_seconds`) and completion footer (`exit_code`, `elapsed_ms`).
-
-4. **Status Tracking** — each terminal run is persisted under `memory/terminals/` so status and output can be polled while the agent continues other work.
+This removes the need for a dedicated background tool while preserving asynchronous workflow support.
 
 ---
 
@@ -387,9 +351,9 @@ bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**      | 378 | 374 | **98.9%** | 53.6s  | 2026-03-22 |
+| **MBPP+**      | 378 | 374 | **98.9%** | 53.62s | 2026-03-22 |
 | **HumanEval+** | 164 | 159 | **96.9%** | 64.29s | 2026-03-22 |
-| **ClassEval**  | 100 | 90  | **90.0%** | 471.7s | 2026-03-22 |
+| **ClassEval**  | 100 | 94  | **94.0%** | 139.5s | 2026-03-22 |
 | **AIME**       | 30  | 24  | **80.0%** | 236.5s | 2026-03-22 |
 
 ---

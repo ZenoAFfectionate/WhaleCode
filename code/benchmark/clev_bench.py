@@ -8,14 +8,17 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from .base import BenchmarkRunner, _PROJECT_ROOT
+try:
+    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+except ImportError:
+    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
 
 
-_CLEV_SYSTEM_PROMPT = """\
+_CLEV_ADDENDUM = """\
 You are an expert Python programmer. Your task is to implement all methods in a \
 Python class by reading the skeleton (signatures + docstrings) and writing \
 complete, correct method bodies.
@@ -44,10 +47,13 @@ your approach from scratch.
 files to read.
 """
 
+_CLEV_SYSTEM_PROMPT = (
+    BENCHMARK_BASE_SYSTEM_PROMPT
+    + "\n\n---\n\n## ClassEval Benchmark Override\n\n"
+    + _CLEV_ADDENDUM
+)
 
-# ---------------------------------------------------------------------------
-# tests.py wrapper for ClassEval — same hidden-dir strategy as HumanEval+.
-# ---------------------------------------------------------------------------
+
 _CLEV_TESTS_PY_WRAPPER = """\
 import sys, os, unittest, inspect, re
 sys.path.insert(0, os.environ["_HIDDEN_TEST_DIR"])
@@ -251,6 +257,7 @@ def main():
         max_steps=args.max_steps,
         timeout=args.timeout,
     )
+
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 

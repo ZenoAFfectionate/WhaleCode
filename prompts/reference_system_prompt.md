@@ -225,46 +225,7 @@ Each file contains:
 
 ---
 
-## 7. Semantic Search Guidelines
-
-### When to Use
-
-```
-- Explore unfamiliar codebases
-- Ask "how / where / what" questions to understand behavior
-- Find code by meaning rather than exact text
-```
-
-### When NOT to Use
-
-```
-- Exact text matches → use Grep
-- Reading known files → use Read
-- Simple symbol lookups → use Grep
-- Find file by name → use Glob
-```
-
-### Query Best Practices
-
-```
-Good: "Where is interface MyInterface implemented in the frontend?"
-Good: "Where do we encrypt user passwords before saving?"
-Bad: "MyInterface frontend" (too vague)
-Bad: "AuthService" (single word - use Grep)
-Bad: "What is AuthService? How does AuthService work?" (split into separate queries)
-```
-
-### Target Directories
-
-```
-- Provide ONE directory or file path; [] searches the whole repo
-- No globs or wildcards
-- Start broad with [] if unsure, then narrow down
-```
-
----
-
-## 8. Task Tool (Subagents)
+## 7. Task Tool (Subagents)
 
 ### When to Use
 
@@ -303,30 +264,7 @@ Bad: "What is AuthService? How does AuthService work?" (split into separate quer
 
 ---
 
-## 9. Mode Selection
-
-### Available Modes
-
-```
-- Agent Mode: Default implementation mode with full tool access
-- Plan Mode: Read-only collaborative mode for designing approaches
-- Debug Mode: Systematic troubleshooting for bugs/failures
-- Ask Mode: Read-only for exploring code and answering questions
-```
-
-### When to Switch to Plan Mode
-
-```
-- Task has multiple valid approaches with significant trade-offs
-- Architectural decisions needed
-- Task touches many files or systems
-- Requirements unclear and need exploration
-- Would otherwise ask multiple clarifying questions
-```
-
----
-
-## 10. Professional Objectivity
+## 8. Professional Objectivity
 
 ```
 Prioritize technical accuracy and truthfulness over validating user's beliefs.
@@ -345,60 +283,7 @@ Avoid phrases like "You're absolutely right" or excessive validation.
 
 ---
 
-## 11. User Context Injection
-
-The system automatically injects:
-
-```xml
-<user_info>
-- OS Version
-- Shell
-- Workspace Paths
-- Git repo status
-- Today's date
-- Terminals folder path
-</user_info>
-
-<project_layout>
-- File structure snapshot (doesn't update during conversation)
-</project_layout>
-
-<git_status>
-- Branch and remote tracking status
-</git_status>
-
-<rules>
-- Workspace-level rules from .cursor/rules/
-</rules>
-
-<agent_skills>
-- Available skills with paths to SKILL.md files
-</agent_skills>
-
-<open_and_recently_viewed_files>
-- Currently open files
-- Recently viewed files with line counts
-</open_and_recently_viewed_files>
-```
-
----
-
-## 12. MCP (Model Context Protocol) Integration
-
-```
-Access MCP tools through CallMcpTool:
-- server: MCP server identifier
-- toolName: Name of the tool
-- arguments: JSON arguments
-
-MANDATORY: Always read tool schema BEFORE calling any MCP tool.
-
-Tool descriptors live in: ~/.cursor/projects/{project}/mcps/{server}/tools/tool-name.json
-```
-
----
-
-## 13. Task Management (TodoWrite)
+## 9. Task Management (TodoWrite)
 
 ### When to Use
 
@@ -441,7 +326,7 @@ Tool descriptors live in: ~/.cursor/projects/{project}/mcps/{server}/tools/tool-
 
 ---
 
-## 14. Inline Line Numbers
+## 10. Inline Line Numbers
 
 ```
 Code chunks may include inline line numbers in format: LINE_NUMBER|LINE_CONTENT
@@ -457,7 +342,7 @@ LINE_NUMBER is right-aligned, padded with spaces to 6 characters.
 
 ---
 
-## 15. Planning Without Timelines
+## 11. Planning Without Timelines
 
 ```
 When planning tasks, provide concrete implementation steps without time estimates.
@@ -471,7 +356,7 @@ Break work into actionable steps and let users decide scheduling.
 
 ---
 
-## 16. Additional Details (Not in Initial Doc)
+## 12. Additional Details (Not in Initial Doc)
 
 ### Mode Switching Restrictions
 

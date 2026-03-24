@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,56 @@ def _bootstrap_package() -> None:
 
 
 _bootstrap_package()
+
+def _remove_markdown_section(text: str, heading: str) -> str:
+    """Remove a markdown section (heading + body) from *text*.
+
+    Matches ``## <heading>`` through to the next same-level heading or EOF.
+    """
+    pattern = rf"(^|\n)(##\s+\d+\.\s+)?{re.escape(heading)}.*?(?=\n## |\Z)"
+    return re.sub(pattern, "", text, flags=re.DOTALL).strip()
+
+
+def _build_benchmark_system_prompt() -> str:
+    """Derive benchmark system prompt from the canonical *system_prompt.md*.
+
+    Removes:
+    - AskUser tool definition (### User Interaction block)
+    - Web tool definitions (### Web block)
+    - Any mention of AskUser / WebSearch / WebFetch in surrounding text
+    """
+    prompt_file = _PROJECT_ROOT / "prompts" / "system_prompt.md"
+    text = prompt_file.read_text(encoding="utf-8")
+
+    # Remove "### User Interaction" section (heading + body until next ###/## or EOF)
+    text = re.sub(
+        r"\n### User Interaction\n.*?(?=\n###|\n##|\Z)",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Remove "### Web" section
+    text = re.sub(
+        r"\n### Web\n.*?(?=\n###|\n##|\Z)",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Remove stray references to AskUser / WebSearch / WebFetch
+    text = re.sub(r"- \*\*AskUser\*\*.*\n", "", text)
+    text = re.sub(r"- \*\*WebSearch\*\*.*\n", "", text)
+    text = re.sub(r"- \*\*WebFetch\*\*.*\n", "", text)
+
+    # Clean up multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip() + "\n"
+
+
+BENCHMARK_BASE_SYSTEM_PROMPT: str = _build_benchmark_system_prompt()
+
 
 from hello_agents.agents.code_agent import CodeAgent
 from hello_agents.core.config import Config
@@ -90,6 +142,7 @@ class BenchmarkRunner(ABC):
         )
         from hello_agents.tools.builtin.glob_tool import GlobTool
         from hello_agents.tools.builtin.grep_tool import GrepTool
+        from hello_agents.tools.builtin.todowrite_tool import TodoWriteTool
 
         llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
         if self.model:
@@ -116,7 +169,7 @@ class BenchmarkRunner(ABC):
             register_default_tools=False,  # We register manually below
             enable_task_tool=False,
             interactive=False,
-            system_prompt=self._get_system_prompt(),
+            system_prompt=self._get_system_prompt() or BENCHMARK_BASE_SYSTEM_PROMPT,
         )
 
         ws = str(workspace)
@@ -128,6 +181,10 @@ class BenchmarkRunner(ABC):
         registry.register_tool(DeleteTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(EditTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(BashTool(project_root=ws, working_dir=ws))
+        # Persist task state outside the repo to avoid diff pollution.
+        _bench_task_dir = Path(tempfile.gettempdir()) / "whale_bench_tasks" / uuid.uuid4().hex[:8]
+        _bench_task_dir.mkdir(parents=True, exist_ok=True)
+        registry.register_tool(TodoWriteTool(project_root=ws, persistence_dir=str(_bench_task_dir)))
 
         return agent
 

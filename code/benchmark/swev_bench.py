@@ -24,13 +24,10 @@ from typing import Any, Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 
-from .base import BenchmarkRunner, _PROJECT_ROOT
-
-# ---------------------------------------------------------------------------
-# Build the SWE-bench system prompt: base system prompt + benchmark overrides
-# ---------------------------------------------------------------------------
-_BASE_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "system_prompt.md"
-_BASE_SYSTEM_PROMPT: str = _BASE_PROMPT_FILE.read_text(encoding="utf-8")
+try:
+    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+except ImportError:
+    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
 
 _SWEV_ADDENDUM = """\
 
@@ -91,7 +88,7 @@ You work alone — there is no human in the loop.
 ```
 """
 
-_SWEV_SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _SWEV_ADDENDUM
+_SWEV_SYSTEM_PROMPT = BENCHMARK_BASE_SYSTEM_PROMPT + _SWEV_ADDENDUM
 
 
 class SWEBenchVerifiedBenchmark(BenchmarkRunner):

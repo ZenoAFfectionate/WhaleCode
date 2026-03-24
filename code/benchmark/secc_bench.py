@@ -25,7 +25,10 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from .base import BenchmarkRunner, _PROJECT_ROOT
+try:
+    from .base import BenchmarkRunner, _PROJECT_ROOT
+except ImportError:
+    from base import BenchmarkRunner, _PROJECT_ROOT
 
 # ---------------------------------------------------------------------------
 # Vulnerability templates — one per category

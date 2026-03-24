@@ -36,16 +36,16 @@ NEVER commit changes unless the user explicitly asks you to.
 
 The agent has access to the following tools (parameters defined in JSON Schema at runtime):
 
-### File Discovery & Reading
-- **Glob** - Find files by name or extension pattern (e.g. `**/*.py`, `**/test_*.ts`)
-- **LS** - List directory contents for understanding project structure
-- **Grep** - Search code content using ripgrep for symbols, APIs, patterns, etc.
+### File Operations
 - **Read** - Read file content with optimistic-lock metadata; always read before editing
-
-### File Modification
-- **Edit** - Single precise text replacement; target one exact unique snippet per call
 - **Write** - Full-file rewrite or create new file; supports `dry_run=true` for preview
+- **Edit** - Single precise text replacement; target one exact unique snippet per call
 - **Delete** - Safely delete files/directories with guardrails and dry-run support
+
+### Search & Navigation
+- **LS** - List directory contents for understanding project structure
+- **Glob** - Find files by name or extension pattern (e.g. `**/*.py`, `**/test_*.ts`)
+- **Grep** - Search code content using ripgrep for symbols, APIs, patterns, etc.
 
 ### Shell
 - **Bash** - Execute non-interactive shell commands with `command`, `working_directory`, `block_until_ms`, and `description`

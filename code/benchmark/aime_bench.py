@@ -13,7 +13,10 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from .base import BenchmarkRunner, _PROJECT_ROOT
+try:
+    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+except ImportError:
+    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
 
 
 class AIMEBenchmark(BenchmarkRunner):
@@ -31,7 +34,7 @@ class AIMEBenchmark(BenchmarkRunner):
 
     benchmark_name = "aime"
 
-    _MATH_SYSTEM_PROMPT = """\
+    _AIME_ADDENDUM = """\
 You are a mathematical problem-solving agent. You solve competition-level math \
 problems (AIME) by combining careful mathematical reasoning with Python computation.
 
@@ -78,6 +81,12 @@ your approach is fundamentally wrong. Do not force it — rethink.
 
 sympy, math, fractions, itertools, functools, collections, numpy, decimal, cmath.
 """
+
+    _MATH_SYSTEM_PROMPT = (
+        BENCHMARK_BASE_SYSTEM_PROMPT
+        + "\n\n---\n\n## AIME Benchmark Override\n\n"
+        + _AIME_ADDENDUM
+    )
 
     # Template for solution.py — includes a sanity-check wrapper
     _SOLUTION_TEMPLATE = """\

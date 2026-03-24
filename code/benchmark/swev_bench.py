@@ -53,7 +53,7 @@ You work alone — there is no human in the loop.
    root cause.
 3. Diagnose — Use Thought to reason about the root cause BEFORE editing.
    State clearly: what is wrong, why it happens, and what the fix should be.
-4. Fix — Use Edit (or MultiEdit) to make the minimal change. Only change
+4. Fix — Use Edit to make the minimal change. Only change
    what is necessary.
 5. Verify — Read the edited region to confirm the fix looks correct.
 6. Finish — Call Finish with a brief summary. Do NOT keep searching

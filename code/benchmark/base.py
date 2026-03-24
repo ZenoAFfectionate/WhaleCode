@@ -80,12 +80,11 @@ class BenchmarkRunner(ABC):
 
     def _create_agent(self, workspace: Path) -> CodeAgent:
         """Create a fresh CodeAgent with coding tools only (no web tools)."""
-        from hello_agents.tools.builtin.background import BackgroundTool, get_background_manager
         from hello_agents.tools.builtin.bash import BashTool
         from hello_agents.tools.builtin.file_tools import (
+            DeleteTool,
             EditTool,
             ListFilesTool,
-            MultiEditTool,
             ReadTool,
             WriteTool,
         )
@@ -126,10 +125,9 @@ class BenchmarkRunner(ABC):
         registry.register_tool(GrepTool(project_root=ws, working_dir=ws))
         registry.register_tool(ReadTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(WriteTool(project_root=ws, working_dir=ws, registry=registry))
+        registry.register_tool(DeleteTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(EditTool(project_root=ws, working_dir=ws, registry=registry))
-        registry.register_tool(MultiEditTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(BashTool(project_root=ws, working_dir=ws))
-        registry.register_tool(BackgroundTool(project_root=ws, working_dir=ws))
 
         return agent
 

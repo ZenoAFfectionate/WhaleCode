@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import os
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -43,7 +44,10 @@ try:
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:
     PromptSession = HTML = FileHistory = KeyBindings = Keys = PromptStyle = None
-    PROMPT_TOOLKIT_AVAILABLE = False
+PROMPT_TOOLKIT_AVAILABLE = False
+
+
+TODO_MUTATING_ACTIONS = {"create", "update", "bulk_create", "delete"}
 
 
 def _get_version() -> str:
@@ -149,7 +153,6 @@ class CLIUI:
 
     def render_banner(self, agent, workspace: Path) -> None:
         model = getattr(agent.llm, "model", "[unknown]")
-        agent_name = getattr(agent, "name", "code-agent")
         base_url = str(getattr(agent.llm, "base_url", "") or "")
 
         display_name = getattr(agent, "display_name", None) or "Whale Code"
@@ -252,6 +255,58 @@ class CLIUI:
             print(f"{art5:<{W}}{'Workspace':<{L}}{_pretty_path(workspace)}")
             print(f"{P}~^~^~^~^~^~^~")
             print("Type `/help` for commands, or `exit` to quit.")
+
+    def render_task_status(self, agent) -> None:
+        """Render a compact task status bar from the TodoWrite tool's task files."""
+        todo_tool = None
+        if hasattr(agent, 'tool_registry') and agent.tool_registry:
+            todo_tool = agent.tool_registry.get_tool("TodoWrite")
+        if not todo_tool or not hasattr(todo_tool, 'task_manager'):
+            return
+
+        try:
+            tasks = todo_tool.task_manager.list_all()
+        except Exception:
+            return
+        if not tasks:
+            return
+
+        max_label_len = 30
+        markers = {
+            "completed": ("✔", "green"),
+            "in_progress": ("◼", "bold yellow"),
+            "pending": ("◻", "dim"),
+            "cancelled": ("✘", "dim red"),
+        }
+
+        lines = []
+        for t in tasks:
+            label = t["subject"]
+            if len(label) > max_label_len:
+                label = label[: max_label_len - 1] + "…"
+            marker, style = markers.get(t["status"], ("?", "dim"))
+            if self.use_rich:
+                lines.append(f"  [{style}]{marker} {label}[/{style}]")
+            else:
+                lines.append(f"  {marker} {label}")
+
+        if not lines:
+            return
+
+        total = len(tasks)
+        done = sum(1 for t in tasks if t["status"] == "completed")
+        header = f"Tasks [{done}/{total}]"
+
+        if self.use_rich:
+            self.console.print(Rule(header, style="dim cyan"))
+            for line in lines:
+                self.console.print(line)
+            self.console.print(Rule(style="dim cyan"))
+        else:
+            print(f"--- {header} ---")
+            for line in lines:
+                print(line)
+            print("---")
 
     def render_assistant(self, text: str) -> None:
         if self.use_rich:
@@ -403,6 +458,14 @@ class CLICodeAgentMixin:
 
     ui: CLIUI
 
+    def _reset_todo_turn_tracking(self) -> None:
+        self._todo_changed_this_turn = False
+        self._todo_mutating_call_ids = set()
+        self._todo_mutating_call_without_id = False
+
+    def _todo_changed_in_turn(self) -> bool:
+        return bool(getattr(self, "_todo_changed_this_turn", False))
+
     def _console(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
         if end == "" and hasattr(self, "_streaming_line_buffer"):
             self._streaming_line_buffer += message
@@ -443,6 +506,16 @@ class CLICodeAgentMixin:
             tool_call_id = payload.get("tool_call_id")
             prefix = f"[{tool_call_id}] " if tool_call_id else ""
             self.ui.render_log_block("action", f"{prefix}{tool_name}({arguments})")
+
+            if tool_name == "TodoWrite" and isinstance(arguments, dict):
+                action = str(arguments.get("action", "")).strip().lower()
+                if action in TODO_MUTATING_ACTIONS:
+                    if tool_call_id:
+                        if not hasattr(self, "_todo_mutating_call_ids"):
+                            self._todo_mutating_call_ids = set()
+                        self._todo_mutating_call_ids.add(tool_call_id)
+                    else:
+                        self._todo_mutating_call_without_id = True
         elif event_type == "tool_result":
             kind = "error" if payload.get("status") == "error" else "observation"
             tool_name = payload.get("tool_name")
@@ -453,6 +526,22 @@ class CLICodeAgentMixin:
                 right = f"{tool_name}\n" if tool_name else ""
                 header = left + right
             self.ui.render_log_block(kind, f"{header}{payload.get('result_content', '')}")
+
+            if tool_name == "TodoWrite":
+                tracked_ids = getattr(self, "_todo_mutating_call_ids", set())
+                tracked_wo_id = getattr(self, "_todo_mutating_call_without_id", False)
+                is_mutating = (tool_call_id in tracked_ids) or tracked_wo_id
+                if is_mutating:
+                    status = str(payload.get("status", "")).lower()
+                    content = str(payload.get("result_content", ""))
+                    is_success = status != "error" and not content.startswith("❌")
+                    if is_success:
+                        self._todo_changed_this_turn = True
+
+                if tool_call_id and tool_call_id in tracked_ids:
+                    tracked_ids.discard(tool_call_id)
+                elif tracked_wo_id:
+                    self._todo_mutating_call_without_id = False
         elif event_type == "final_answer":
             return None
         elif event_type == "timeout":
@@ -478,79 +567,6 @@ class CLICodeAgentMixin:
             )
         else:
             super()._render_event(event_type, payload)
-
-    def render_tools(self, agent) -> None:
-        tools = sorted(agent.tool_registry.get_all_tools(), key=lambda item: item.name)
-        if self.use_rich:
-            table = Table(title="Registered Tools", border_style="cyan")
-            table.add_column("Tool", style="bold cyan")
-            table.add_column("Description", style="white")
-            for tool in tools:
-                description = (tool.description or "").strip().replace("\n", " ")
-                table.add_row(tool.name, description)
-            self.console.print(table)
-            return
-
-        print("Registered tools:")
-        for tool in tools:
-            description = (tool.description or "").strip().replace("\n", " ")
-            print(f"- {tool.name}: {description}")
-
-    def render_history(self, history: Iterable, limit: Optional[int] = None) -> None:
-        all_items = list(history)
-        items = list(all_items)
-        if limit is not None and limit > 0:
-            items = items[-limit:]
-        if not items:
-            self.warning("History is empty.")
-            return
-
-        if self.use_rich:
-            table = Table(title="Conversation History", border_style="cyan")
-            table.add_column("#", style="cyan", width=4)
-            table.add_column("Role", style="magenta", width=10)
-            table.add_column("Content", style="white")
-            start_index = max(1, len(all_items) - len(items) + 1)
-            for index, message in enumerate(items, start=start_index):
-                content = str(message.content).replace("\n", " ")
-                if len(content) > 160:
-                    content = content[:160] + " ..."
-                table.add_row(str(index), message.role, content)
-            self.console.print(table)
-            return
-
-        for index, message in enumerate(items, start=1):
-            print(f"{index}. [{message.role}] {message.content}")
-
-    def render_sessions(self, sessions: list[dict]) -> None:
-        if not sessions:
-            self.warning("No saved sessions found.")
-            return
-
-        if self.use_rich:
-            table = Table(title="Saved Sessions", border_style="cyan")
-            table.add_column("File", style="bold cyan")
-            table.add_column("Saved At", style="white")
-            table.add_column("Steps", style="magenta")
-            table.add_column("Tokens", style="green")
-            for item in sessions:
-                metadata = item.get("metadata", {}) or {}
-                table.add_row(
-                    item.get("filename", ""),
-                    item.get("saved_at", ""),
-                    str(metadata.get("total_steps", "-")),
-                    str(metadata.get("total_tokens", "-")),
-                )
-            self.console.print(table)
-            return
-
-        print("Saved sessions:")
-        for item in sessions:
-            metadata = item.get("metadata", {}) or {}
-            print(
-                f"- {item.get('filename')} | saved_at={item.get('saved_at')} "
-                f"steps={metadata.get('total_steps', '-')} tokens={metadata.get('total_tokens', '-')}"
-            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -650,13 +666,26 @@ def create_agent(args, ui: CLIUI):
         project_root=str(workspace),
         working_dir=str(workspace),
         config=config,
+        max_steps=0,
         register_default_tools=True,
         enable_task_tool=True,
         ui=ui,
     )
 
     if args.resume:
-        agent.load_session(args.resume)
+        resume_path = resolve_session_to_load(agent, args.resume, args.session_name)
+        if resume_path is None:
+            raise RuntimeError("Session persistence is not enabled.")
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Session not found: {resume_path}")
+        agent.load_session(str(resume_path))
+        maybe_restore_task_snapshot(agent, resume_path, ui=ui)
+    else:
+        # New chat starts with fresh tasks instead of stale persisted ones.
+        clear_todo_tasks(agent)
+
+    # Always run with unlimited reasoning steps in CLI mode.
+    agent.max_steps = 0
 
     return agent, workspace
 
@@ -707,14 +736,167 @@ def maybe_auto_save(agent, session_name: str, enabled: bool, ui: CLIUI, reason: 
         return
     try:
         saved_path = agent.save_session(normalize_session_name(session_name))
+        maybe_save_task_snapshot(agent, Path(saved_path), ui=ui)
         ui.info(f"Auto-saved session ({reason}): {saved_path}")
     except Exception as exc:
         ui.warning(f"Auto-save failed: {exc}")
 
 
+def _task_snapshot_path(session_path: Path) -> Path:
+    return session_path.with_name(f"{session_path.stem}.tasks.json")
+
+
+def _get_todo_task_dir(agent) -> Optional[Path]:
+    try:
+        if not hasattr(agent, "tool_registry") or not agent.tool_registry:
+            return None
+        todo_tool = agent.tool_registry.get_tool("TodoWrite")
+        if not todo_tool or not hasattr(todo_tool, "task_manager"):
+            return None
+        task_dir = Path(todo_tool.task_manager.dir)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        return task_dir
+    except Exception:
+        return None
+
+
+def clear_todo_tasks(agent, ui: Optional[CLIUI] = None) -> None:
+    """Clear persisted TodoWrite tasks for starting a fresh conversation."""
+    task_dir = _get_todo_task_dir(agent)
+    if not task_dir:
+        return
+
+    removed = 0
+    for path in task_dir.glob("task_*.json"):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except Exception:
+            continue
+
+    if ui and removed:
+        ui.info(f"Cleared {removed} task file(s) for fresh conversation.")
+
+
+def maybe_save_task_snapshot(agent, session_path: Path, ui: Optional[CLIUI] = None) -> None:
+    """Persist current TodoWrite tasks beside the session file."""
+    task_dir = _get_todo_task_dir(agent)
+    if not task_dir:
+        return
+
+    tasks = []
+    for path in sorted(task_dir.glob("task_*.json")):
+        try:
+            tasks.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+
+    snapshot_path = _task_snapshot_path(session_path)
+    payload = {"session_file": str(session_path), "tasks": tasks}
+    snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if ui:
+        ui.info(f"Task snapshot saved: {snapshot_path}")
+
+
+def maybe_restore_task_snapshot(agent, session_path: Path, ui: Optional[CLIUI] = None) -> bool:
+    """Restore TodoWrite tasks from sidecar snapshot file.
+
+    Returns True if a snapshot file is found and restored.
+    """
+    task_dir = _get_todo_task_dir(agent)
+    if not task_dir:
+        return False
+
+    snapshot_path = _task_snapshot_path(session_path)
+    if not snapshot_path.exists():
+        return False
+
+    try:
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            return False
+
+        clear_todo_tasks(agent)
+        for task in tasks:
+            task_id = task.get("id")
+            if task_id is None:
+                continue
+            target = task_dir / f"task_{int(task_id)}.json"
+            target.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        if ui:
+            ui.info(f"Restored {len(tasks)} task(s) from snapshot.")
+        return True
+    except Exception as exc:
+        if ui:
+            ui.warning(f"Task snapshot restore failed: {exc}")
+        return False
+
+
+def load_session_and_tasks(agent, raw_value: Optional[str], fallback_name: str, ui: CLIUI) -> bool:
+    """Load session history and matching TodoWrite task snapshot."""
+    session_path = resolve_session_to_load(agent, raw_value, fallback_name)
+    if session_path is None:
+        ui.error("Session persistence is not enabled.")
+        return False
+    if not session_path.exists():
+        ui.error(f"Session not found: {session_path}")
+        return False
+
+    try:
+        agent.load_session(str(session_path))
+        maybe_restore_task_snapshot(agent, session_path, ui=ui)
+        ui.success(f"Loaded session: {session_path}")
+        return True
+    except Exception as exc:
+        ui.error(f"Load failed: {exc}")
+        return False
+
+
+def _todowrite_state_digest(agent) -> Optional[str]:
+    """Return a digest of TodoWrite task files, or None if unavailable."""
+    try:
+        if not hasattr(agent, "tool_registry") or not agent.tool_registry:
+            return None
+        todo_tool = agent.tool_registry.get_tool("TodoWrite")
+        if not todo_tool or not hasattr(todo_tool, "task_manager"):
+            return None
+
+        task_dir = Path(todo_tool.task_manager.dir)
+        hasher = hashlib.sha256()
+        has_any_file = False
+
+        for task_file in sorted(task_dir.glob("task_*.json")):
+            if not task_file.is_file():
+                continue
+            has_any_file = True
+            stat = task_file.stat()
+            # Use filename + mtime + size as a lightweight fingerprint.
+            hasher.update(task_file.name.encode("utf-8"))
+            hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+            hasher.update(str(stat.st_size).encode("utf-8"))
+
+        return hasher.hexdigest() if has_any_file else "empty"
+    except Exception:
+        return None
+
+
 def run_agent_turn(agent, prompt: str, ui: CLIUI) -> str:
+    if hasattr(agent, "_reset_todo_turn_tracking"):
+        agent._reset_todo_turn_tracking()
+
+    todo_before = _todowrite_state_digest(agent)
     start_time = time.time()
     response = agent.run(prompt)
+    todo_after = _todowrite_state_digest(agent)
+    todo_changed_by_events = False
+    if hasattr(agent, "_todo_changed_in_turn"):
+        todo_changed_by_events = bool(agent._todo_changed_in_turn())
+
+    if todo_before != todo_after or todo_changed_by_events:
+        ui.render_task_status(agent)
     ui.render_assistant(response or "")
     ui.render_summary(time.time() - start_time, agent=agent)
     return response or ""
@@ -733,6 +915,7 @@ def print_help(ui: CLIUI) -> None:
         "- /clear                Clear in-memory conversation history",
         "- /save [name]          Save a session snapshot into the session directory",
         "- /load [path|name]     Load a saved session (default: session-latest)",
+        "- /resume [path|name]   Alias of /load; restores dialogue + task snapshot",
         "- /sessions             List saved sessions",
         "- /compact [focus]      Compact conversation context",
         "- exit | quit | q       Exit the CLI",
@@ -843,6 +1026,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         except EOFError:
             ui.print()
             maybe_auto_save(agent, args.session_name, not args.no_auto_save, ui, "eof")
+            clear_todo_tasks(agent)
             return 0
         except KeyboardInterrupt:
             ui.warning("Interrupted. Type `exit` to quit.")
@@ -854,6 +1038,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         lowered = user_input.lower()
         if lowered in {"exit", "quit", "q"}:
             maybe_auto_save(agent, args.session_name, not args.no_auto_save, ui, "exit")
+            clear_todo_tasks(agent)
             return 0
 
         if lowered == "/help":
@@ -924,24 +1109,19 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             session_name = normalize_session_name(parts[1].strip()) if len(parts) > 1 else normalize_session_name(args.session_name)
             try:
                 saved_path = agent.save_session(session_name)
+                maybe_save_task_snapshot(agent, Path(saved_path), ui=ui)
                 ui.success(f"Saved session: {saved_path}")
             except Exception as exc:
                 ui.error(f"Save failed: {exc}")
             continue
-        if lowered.startswith("/load"):
+        if lowered.startswith("/load") or lowered.startswith("/resume"):
             parts = user_input.split(maxsplit=1)
-            session_path = resolve_session_to_load(agent, parts[1].strip() if len(parts) > 1 else None, args.session_name)
-            if session_path is None:
-                ui.error("Session persistence is not enabled.")
-                continue
-            if not session_path.exists():
-                ui.error(f"Session not found: {session_path}")
-                continue
-            try:
-                agent.load_session(str(session_path))
-                ui.success(f"Loaded session: {session_path}")
-            except Exception as exc:
-                ui.error(f"Load failed: {exc}")
+            load_session_and_tasks(
+                agent,
+                parts[1].strip() if len(parts) > 1 else None,
+                args.session_name,
+                ui,
+            )
             continue
         if lowered == "/sessions":
             if not getattr(agent, "session_store", None):
@@ -990,6 +1170,7 @@ def main() -> int:
         ui.render_banner(agent, workspace)
         exit_code = run_once(agent, args.prompt, ui)
         maybe_auto_save(agent, args.session_name, not args.no_auto_save, ui, "single-turn")
+        clear_todo_tasks(agent)
         return exit_code
 
     return run_interactive(agent, workspace, args, ui)

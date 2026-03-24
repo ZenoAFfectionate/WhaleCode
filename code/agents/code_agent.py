@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -49,7 +50,6 @@ class CodeAgent(ReActAgent):
         )
         initial_working_dir.relative_to(self.project_root)
         self.working_dir = initial_working_dir
-        self.background_manager = None
 
         effective_config = _copy_config(config)
         self._trace_enabled = bool(effective_config.trace_enabled)
@@ -78,15 +78,12 @@ class CodeAgent(ReActAgent):
     def register_default_tools(self, enable_task_tool: bool = True) -> None:
         """Register the coding-oriented tool set for this agent instance."""
         from ..tools.builtin.ask_user import AskUserTool
-        from ..tools.builtin.background import BackgroundTool, get_background_manager
         from ..tools.builtin.bash import BashTool
-        from ..tools.builtin.file_tools import EditTool, ListFilesTool, MultiEditTool, ReadTool, WriteTool
+        from ..tools.builtin.file_tools import DeleteTool, EditTool, ListFilesTool, ReadTool, WriteTool
         from ..tools.builtin.glob_tool import GlobTool
         from ..tools.builtin.grep_tool import GrepTool
-        from ..tools.builtin.task_tool import TaskTool
+        from ..tools.builtin.todowrite_tool import TodoWriteTool
         from ..tools.builtin.web_tool import WebSearchTool, WebFetchTool
-
-        self.background_manager = get_background_manager(self.project_root)
 
         self.tool_registry.register_tool(
             ListFilesTool(
@@ -116,14 +113,14 @@ class CodeAgent(ReActAgent):
             )
         )
         self.tool_registry.register_tool(
-            EditTool(
+            DeleteTool(
                 project_root=str(self.project_root),
                 working_dir=str(self.working_dir),
                 registry=self.tool_registry,
             )
         )
         self.tool_registry.register_tool(
-            MultiEditTool(
+            EditTool(
                 project_root=str(self.project_root),
                 working_dir=str(self.working_dir),
                 registry=self.tool_registry,
@@ -132,18 +129,15 @@ class CodeAgent(ReActAgent):
         self.tool_registry.register_tool(
             BashTool(project_root=str(self.project_root), working_dir=str(self.working_dir))
         )
-        self.tool_registry.register_tool(
-            BackgroundTool(project_root=str(self.project_root), working_dir=str(self.working_dir))
-        )
         self.tool_registry.register_tool(AskUserTool(interactive=self.interactive))
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(WebFetchTool())
 
         if enable_task_tool:
             self.tool_registry.register_tool(
-                TaskTool(
-                    config=self.config,
-                    persistence_dir=str(self.project_root / "memory" / "tasks"),
+                TodoWriteTool(
+                    project_root=str(self.project_root),
+                    persistence_dir="memory/tasks",
                 )
             )
 
@@ -162,47 +156,6 @@ class CodeAgent(ReActAgent):
 
     def _before_model_call(self, messages: List[Dict[str, object]], current_step: int) -> None:
         super()._before_model_call(messages, current_step)
-        if not self.background_manager:
-            return
-
-        notifications = self.background_manager.drain_notifications()
-        if not notifications:
-            return
-
-        notification_text = self.background_manager.format_notifications(notifications)
-        self._render_background_update(current_step, notification_text, notifications=notifications)
-        messages.append(
-            {
-                "role": "user",
-                "content": f"<background-results>\n{notification_text}\n</background-results>",
-            }
-        )
-
-        if self.trace_logger:
-            self.trace_logger.log_event(
-                "background_notifications",
-                {
-                    "count": len(notifications),
-                    "notifications": notifications,
-                },
-                step=current_step,
-            )
-
-    def _render_background_update(
-        self,
-        current_step: int,
-        notification_text: str,
-        *,
-        notifications: Optional[List[Dict[str, object]]] = None,
-    ) -> None:
-        self._render_event(
-            "background_update",
-            {
-                "step": current_step,
-                "notification_text": notification_text,
-                "notifications": notifications or [],
-            },
-        )
 
     # ------------------------------------------------------------------
     # Context compaction (public API)
@@ -303,7 +256,7 @@ class CodeAgent(ReActAgent):
                 self._history_token_count += self.token_counter.count_message(m)
 
     def run(self, input_text: str, **kwargs) -> str:
-        """Run with a fresh trace logger per turn for interactive CLI usage."""
+        """Run with async path for parallel tool execution."""
         self.trace_logger = None
 
         if self._trace_enabled:
@@ -323,7 +276,8 @@ class CodeAgent(ReActAgent):
             )
 
         try:
-            return super().run(input_text, **kwargs)
+            result = asyncio.run(self._arun_impl(input_text, **kwargs))
+            return result
         except Exception:
             if self.trace_logger and not self.trace_logger.jsonl_file.closed:
                 try:
@@ -337,6 +291,10 @@ class CodeAgent(ReActAgent):
             raise
         finally:
             self.trace_logger = None
+
+    async def _arun_impl(self, input_text: str, **kwargs) -> str:
+        """Internal async implementation that delegates to ReActAgent.arun()."""
+        return await ReActAgent.arun(self, input_text, **kwargs)
 
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
         """Build messages with workspace context and preserved conversation history.

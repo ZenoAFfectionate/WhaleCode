@@ -574,7 +574,7 @@ class ReActAgent(Agent):
                     })
 
                     # --- Stagnation detection ---
-                    if tool_name in ("Edit", "MultiEdit"):
+                    if tool_name == "Edit":
                         if "[no textual diff]" in result:
                             _consecutive_no_diff_edits += 1
                         else:
@@ -782,9 +782,17 @@ class ReActAgent(Agent):
 
             current_step = 0
             total_tokens = 0
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
             no_tool_call_retries = 0
             max_no_tool_call_retries = 2
             _is_retry = False
+
+            # --- Stagnation detection ---
+            _consecutive_no_diff_edits = 0
+            _last_test_output_hash = None
+            _consecutive_same_tests = 0
+            _stagnation_detected = False
 
             # 记录用户消息
             if self.trace_logger:
@@ -800,6 +808,16 @@ class ReActAgent(Agent):
                     current_step += 1
                     self._render_step_start(current_step)
                 _is_retry = False
+
+                # 保存当前步数
+                self._current_step = current_step
+
+                # 上下文压缩
+                if self._compactor and self.config.compact_enabled:
+                    self._compactor.micro_compact(messages)
+                    if self._compactor.estimate_tokens(messages) > self.config.compact_token_threshold:
+                        self._render_compaction_notice()
+                        messages[:] = self._compactor.auto_compact(messages, self.llm)
 
                 # 触发步骤开始事件
                 await self._emit_event(
@@ -860,15 +878,13 @@ class ReActAgent(Agent):
                 # 处理工具调用
                 tool_calls = response_message.tool_calls
                 if not tool_calls:
-                    # 重试机制：未调用工具时，注入提示后重试
-                    if no_tool_call_retries < max_no_tool_call_retries:
+                    text_content = (response_message.content or "").strip()
+
+                    # Only retry when model returns empty content (tool-calling instability).
+                    # If it returned meaningful text, accept it as the final answer.
+                    if not text_content and no_tool_call_retries < max_no_tool_call_retries:
                         no_tool_call_retries += 1
                         _is_retry = True
-                        if response_message.content:
-                            messages.append({
-                                "role": "assistant",
-                                "content": response_message.content,
-                            })
                         messages.append({
                             "role": "user",
                             "content": (
@@ -879,7 +895,7 @@ class ReActAgent(Agent):
                         continue
 
                     # 没有工具调用，直接返回
-                    final_answer = response_message.content or "Sorry, I cannot answer this question."
+                    final_answer = text_content or "Sorry, I cannot answer this question."
                     self._render_direct_response(final_answer)
 
                     self.add_message(Message(input_text, "user"))
@@ -966,11 +982,58 @@ class ReActAgent(Agent):
                         return final_answer
 
                     # 添加工具结果到消息
+                    result_content = result.get('content', str(result))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": result.get('content', str(result))
+                        "content": result_content
                     })
+
+                    # --- Stagnation detection ---
+                    if tool_name == "Edit":
+                        if "[no textual diff]" in result_content:
+                            _consecutive_no_diff_edits += 1
+                        else:
+                            _consecutive_no_diff_edits = 0
+                    else:
+                        _consecutive_no_diff_edits = 0
+
+                    if tool_name == "Bash":
+                        # Check tool_calls for matching arguments
+                        for tc in tool_calls:
+                            if tc.id == tool_call_id:
+                                try:
+                                    tc_args = json.loads(tc.function.arguments)
+                                    cmd = tc_args.get("command", "")
+                                except Exception:
+                                    cmd = ""
+                                break
+                        else:
+                            cmd = ""
+                        if "tests.py" in cmd or "pytest" in cmd or "unittest" in cmd:
+                            test_hash = hash(result_content)
+                            if test_hash == _last_test_output_hash:
+                                _consecutive_same_tests += 1
+                            else:
+                                _consecutive_same_tests = 0
+                                _last_test_output_hash = test_hash
+
+                    if _consecutive_no_diff_edits >= 3 or _consecutive_same_tests >= 3:
+                        reason = (
+                            "3 consecutive Edit calls with no textual diff"
+                            if _consecutive_no_diff_edits >= 3
+                            else "3 consecutive identical test results"
+                        )
+                        self._render_event("stagnation_detected", {
+                            "reason": reason,
+                            "step": current_step,
+                        })
+                        _stagnation_detected = True
+                        break
+
+                # Check stagnation to break outer loop
+                if _stagnation_detected:
+                    break
 
                 # 触发步骤完成事件
                 await self._emit_event(
@@ -980,8 +1043,9 @@ class ReActAgent(Agent):
                     tool_calls=len(tool_calls)
                 )
 
-            # 达到最大步数
-            self._render_timeout()
+            # 达到最大步数或停滞检测触发
+            if not _stagnation_detected:
+                self._render_timeout()
             final_answer = "Sorry, I could not complete this task within the step limit."
 
             self.add_message(Message(input_text, "user"))
@@ -1135,10 +1199,24 @@ class ReActAgent(Agent):
                     tool = self.tool_registry.get_tool(tool_name)
                     if not tool:
                         result_content = f"❌ 工具 {tool_name} 不存在"
+                        result_status = "error"
                     else:
                         try:
                             tool_response = await tool.arun_with_timing(arguments)
-                            result_content = tool_response.text
+                            if tool_response.status == ToolStatus.ERROR:
+                                error_code = (
+                                    tool_response.error_info.get("code", "UNKNOWN")
+                                    if tool_response.error_info
+                                    else "UNKNOWN"
+                                )
+                                result_content = f"❌ 错误 [{error_code}]: {tool_response.text}"
+                                result_status = "error"
+                            elif tool_response.status == ToolStatus.PARTIAL:
+                                result_content = f"⚠️ 部分成功: {tool_response.text}"
+                                result_status = "success"
+                            else:
+                                result_content = tool_response.text
+                                result_status = "success"
 
                             # 应用截断
                             truncate_result = self.truncator.truncate(
@@ -1148,6 +1226,7 @@ class ReActAgent(Agent):
                             result_content = truncate_result.get('preview', result_content)
                         except Exception as e:
                             result_content = f"❌ 工具执行失败: {str(e)}"
+                            result_status = "error"
 
                     # 记录工具结果
                     if self.trace_logger:
@@ -1156,6 +1235,7 @@ class ReActAgent(Agent):
                             {
                                 "tool_name": tool_name,
                                 "tool_call_id": tool_call_id,
+                                "status": result_status,
                                 "result": result_content
                             },
                             step=current_step
@@ -1165,6 +1245,7 @@ class ReActAgent(Agent):
                         result_content,
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,
+                        status=result_status,
                         step=current_step,
                     )
 
@@ -1522,10 +1603,24 @@ class ReActAgent(Agent):
                     tool = self.tool_registry.get_tool(tool_name)
                     if not tool:
                         result_content = f"❌ 工具 {tool_name} 不存在"
+                        result_status = "error"
                     else:
                         try:
                             tool_response = await tool.arun_with_timing(arguments)
-                            result_content = tool_response.text
+                            if tool_response.status == ToolStatus.ERROR:
+                                error_code = (
+                                    tool_response.error_info.get("code", "UNKNOWN")
+                                    if tool_response.error_info
+                                    else "UNKNOWN"
+                                )
+                                result_content = f"❌ 错误 [{error_code}]: {tool_response.text}"
+                                result_status = "error"
+                            elif tool_response.status == ToolStatus.PARTIAL:
+                                result_content = f"⚠️ 部分成功: {tool_response.text}"
+                                result_status = "success"
+                            else:
+                                result_content = tool_response.text
+                                result_status = "success"
 
                             # 应用截断
                             truncate_result = self.truncator.truncate(
@@ -1535,11 +1630,13 @@ class ReActAgent(Agent):
                             result_content = truncate_result.get('preview', result_content)
                         except Exception as e:
                             result_content = f"❌ 工具执行失败: {str(e)}"
+                            result_status = "error"
 
                     self._render_tool_result(
                         result_content,
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,
+                        status=result_status,
                         step=current_step,
                     )
 

@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Whale Code | Product Showcase</title>
+  <meta
+    name="description"
+    content="Whale Code is a production-grade coding agent framework built with a ReAct loop, atomized tools, context engineering, and persistent task orchestration."
+  />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap"
+    rel="stylesheet"
+  />
+  <style>
+    :root {
+      --primary: #2563eb;
+      --secondary: #1e293b;
+      --cta: #f97316;
+      --background: #f8fafc;
+      --surface: #ffffff;
+      --text: #1e293b;
+      --text-muted: #475569;
+      --border: #e2e8f0;
+      --success: #16a34a;
+      --shadow-soft: 0 12px 28px rgba(30, 41, 59, 0.08);
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --maxw: 1200px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: "DM Sans", sans-serif;
+      scroll-behavior: smooth;
+    }
+
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      inset: auto;
+      z-index: -2;
+      pointer-events: none;
+      filter: blur(40px);
+      opacity: 0.26;
+    }
+
+    body::before {
+      width: 460px;
+      height: 460px;
+      top: -140px;
+      right: -120px;
+      background: radial-gradient(circle, #93c5fd 0%, transparent 66%);
+    }
+
+    body::after {
+      width: 520px;
+      height: 520px;
+      bottom: -190px;
+      left: -180px;
+      background: radial-gradient(circle, #fdba74 0%, transparent 64%);
+    }
+
+    .container {
+      width: min(var(--maxw), calc(100% - 2.6rem));
+      margin: 0 auto;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 14px;
+      z-index: 10;
+      margin: 18px auto 28px;
+      width: min(var(--maxw), calc(100% - 2.6rem));
+      background: rgba(255, 255, 255, 0.86);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--primary), #60a5fa);
+      display: grid;
+      place-items: center;
+      color: #fff;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    .top-links {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .top-links a {
+      text-decoration: none;
+      color: var(--text-muted);
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 0.86rem;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    .top-links a:hover {
+      background: #e0edff;
+      color: var(--primary);
+    }
+
+    .hero {
+      padding: 36px 0 34px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #bfdbfe;
+      color: #1d4ed8;
+      background: #eff6ff;
+      font-weight: 700;
+      font-size: 0.8rem;
+      border-radius: 999px;
+      padding: 6px 12px;
+      letter-spacing: 0.01em;
+    }
+
+    .hero-grid {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 20px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      line-height: 1.05;
+      letter-spacing: -0.02em;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.05rem, 4.8vw, 4.2rem);
+      max-width: 15ch;
+    }
+
+    .hero p {
+      margin-top: 14px;
+      color: var(--text-muted);
+      font-size: 1.05rem;
+      line-height: 1.65;
+      max-width: 60ch;
+    }
+
+    .hero-cta {
+      margin-top: 24px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      text-decoration: none;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font-weight: 700;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+      box-shadow: 0 10px 20px rgba(37, 99, 235, 0.24);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      background: #1d4ed8;
+    }
+
+    .btn-ghost {
+      border: 1px solid var(--border);
+      color: var(--secondary);
+      background: #fff;
+    }
+
+    .btn-ghost:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .stats-panel {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      align-content: start;
+    }
+
+    .stat {
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, #ffffff, #f8fbff);
+    }
+
+    .stat-label {
+      font-size: 0.77rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+
+    .stat-value {
+      margin-top: 6px;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--secondary);
+    }
+
+    section {
+      margin-top: 38px;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 20px;
+      margin-bottom: 14px;
+    }
+
+    .section-head h2 {
+      font-size: clamp(1.35rem, 3vw, 2.1rem);
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--text-muted);
+      max-width: 52ch;
+      line-height: 1.6;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .feature-card {
+      padding: 18px;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-soft);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+      cursor: pointer;
+    }
+
+    .feature-card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 14px 30px rgba(30, 41, 59, 0.12);
+    }
+
+    .icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      margin-bottom: 12px;
+      color: #fff;
+      background: linear-gradient(135deg, var(--primary), #60a5fa);
+    }
+
+    .feature-card h3 {
+      font-size: 1.03rem;
+      margin-bottom: 8px;
+    }
+
+    .feature-card p {
+      margin: 0;
+      color: var(--text-muted);
+      line-height: 1.58;
+      font-size: 0.95rem;
+    }
+
+    .showcase {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .media-card {
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background: #fff;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .media-card img {
+      width: 100%;
+      display: block;
+      aspect-ratio: 16 / 10;
+      object-fit: cover;
+      background: #dbeafe;
+    }
+
+    .media-caption {
+      padding: 12px 14px 14px;
+    }
+
+    .media-caption h3 {
+      font-size: 1.03rem;
+      margin-bottom: 6px;
+    }
+
+    .media-caption p {
+      margin: 0;
+      color: var(--text-muted);
+      line-height: 1.56;
+      font-size: 0.94rem;
+    }
+
+    .timeline {
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background: linear-gradient(140deg, #ffffff 0%, #f8fbff 60%, #f2f7ff 100%);
+      padding: 18px;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .timeline-steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .step {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #fff;
+      padding: 12px;
+    }
+
+    .step-num {
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 0.78rem;
+      color: #1d4ed8;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+
+    .step h3 {
+      margin-top: 6px;
+      font-size: 1rem;
+    }
+
+    .step p {
+      margin-top: 6px;
+      margin-bottom: 0;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .bench {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr;
+      gap: 14px;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      border-radius: 14px;
+      overflow: hidden;
+      background: #fff;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-soft);
+      font-size: 0.93rem;
+    }
+
+    .table th,
+    .table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid #edf2f7;
+      text-align: left;
+    }
+
+    .table th {
+      background: #f8fbff;
+      font-weight: 700;
+      color: #334155;
+      font-size: 0.79rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 4px 8px;
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .bars {
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: #fff;
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      gap: 12px;
+    }
+
+    .bar {
+      display: grid;
+      grid-template-columns: 110px 1fr 66px;
+      gap: 10px;
+      align-items: center;
+      font-size: 0.9rem;
+    }
+
+    .track {
+      height: 12px;
+      border-radius: 999px;
+      background: #e5edf7;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--primary), #60a5fa);
+      width: 0;
+      animation: fillGrow 1.2s ease forwards;
+    }
+
+    @keyframes fillGrow {
+      from {
+        width: 0;
+      }
+      to {
+        width: var(--w);
+      }
+    }
+
+    .workflow {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .workflow-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid #334155;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 0.9rem;
+      color: #94a3b8;
+      background: #111b33;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 0.84rem;
+      line-height: 1.6;
+      color: #dbeafe;
+    }
+
+    .highlight {
+      color: #fdba74;
+    }
+
+    .fade-up {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+
+    .fade-up.in {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    footer {
+      margin: 44px 0 26px;
+      color: #64748b;
+      font-size: 0.9rem;
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+    }
+
+    @media (max-width: 980px) {
+      .hero-grid,
+      .showcase,
+      .bench {
+        grid-template-columns: 1fr;
+      }
+
+      .grid-3 {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .timeline-steps {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .section-head {
+        display: block;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .topbar {
+        border-radius: 18px;
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .grid-3,
+      .timeline-steps {
+        grid-template-columns: 1fr;
+      }
+
+      .stats-panel {
+        grid-template-columns: 1fr;
+      }
+
+      .bar {
+        grid-template-columns: 84px 1fr 52px;
+        font-size: 0.84rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">W</span>
+      Whale Code
+    </div>
+    <nav class="top-links">
+      <a href="#highlights">Highlights</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#workflow">Workflow</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="hero fade-up">
+      <span class="eyebrow">Production-Grade Coding Agent Framework</span>
+      <div class="hero-grid">
+        <div>
+          <h1>Whale Code builds reliable autonomous coding workflows.</h1>
+          <p>
+            Whale Code is a from-scratch coding agent framework built around a strict ReAct loop and OpenAI-compatible function calling. It combines safe atomized tools, layered context engineering, and persistent task orchestration to solve real repository work end-to-end.
+          </p>
+          <div class="hero-cta">
+            <a class="btn btn-primary" href="#highlights">Explore Highlights</a>
+            <a class="btn btn-ghost" href="../README.md">Read Full README</a>
+          </div>
+        </div>
+        <aside class="panel stats-panel">
+          <article class="stat">
+            <div class="stat-label">Model Context</div>
+            <div class="stat-value">262,144</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Tools (Core Set)</div>
+            <div class="stat-value">14+</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Pass Rate (MBPP+)</div>
+            <div class="stat-value">98.9%</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Pass Rate (HE+)</div>
+            <div class="stat-value">96.9%</div>
+          </article>
+        </aside>
+      </div>
+    </section>
+
+    <section id="highlights" class="fade-up">
+      <div class="section-head">
+        <h2>What Makes Whale Code Stand Out</h2>
+        <p>
+          The framework focuses on reliability under real coding pressure: structured tool calls, safe writes, resilient long-context behavior, and observable execution.
+        </p>
+      </div>
+      <div class="grid-3">
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M4 12l4 4L20 4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3>Structured Function Calling</h3>
+          <p>
+            Native tool-calling JSON replaces fragile regex parsing, delivering robust action execution and high parse reliability in production-style loops.
+          </p>
+        </article>
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M12 3v6m0 0l3-3m-3 3L9 6M4 14v4a3 3 0 003 3h10a3 3 0 003-3v-4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3>Layered Context Engine</h3>
+          <p>
+            Micro-compaction, auto-summary compaction, token tracking, and transcript persistence keep long sessions responsive and memory-efficient.
+          </p>
+        </article>
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M4 7h16M7 4v6m10-6v6M6 11h12l-1 9H7l-1-9z" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3>Safe, Atomized Tooling</h3>
+          <p>
+            Read/Write/Edit/Glob/Grep are sandboxed to workspace scope, support optimistic locking, and return structured status codes for deterministic control.
+          </p>
+        </article>
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M4 19h16M7 15l3-3 2 2 5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3>Persistent Task Graph</h3>
+          <p>
+            File-backed tasks with dependency edges survive context compression and support multi-step delivery across long development sessions.
+          </p>
+        </article>
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M5 12h14M5 7h14M5 17h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <h3>Interactive CLI Experience</h3>
+          <p>
+            Rich terminal UI, slash commands, session snapshots, resume/load flows, and readable tool telemetry make daily usage smooth.
+          </p>
+        </article>
+        <article class="feature-card">
+          <div class="icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M5 19V5h14v14H5zm4-4h6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h3>Built-in Benchmark Harness</h3>
+          <p>
+            Includes MBPP+, HumanEval+, ClassEval, AIME, and SWE-bench workflows with reproducible scripts and explicit evaluation pipelines.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="architecture" class="fade-up">
+      <div class="section-head">
+        <h2>Visual Architecture & Product Surface</h2>
+        <p>
+          Core assets from the project show how Whale Code is engineered: top-level architecture, key design map, and real CLI interaction.
+        </p>
+      </div>
+      <div class="showcase">
+        <article class="media-card">
+          <img src="./architecture.png" alt="Whale Code architecture overview" />
+          <div class="media-caption">
+            <h3>Architecture</h3>
+            <p>End-to-end ReAct lifecycle with tool execution, observation flow, context compaction, and persistence integration.</p>
+          </div>
+        </article>
+        <article class="media-card">
+          <img src="./key_design.png" alt="Whale Code key design diagram" />
+          <div class="media-caption">
+            <h3>Key Design</h3>
+            <p>Design decisions around reliability, traceability, and safe autonomous coding in local repositories.</p>
+          </div>
+        </article>
+        <article class="media-card">
+          <img src="./cli-demo.png" alt="Whale Code CLI screenshot" />
+          <div class="media-caption">
+            <h3>CLI Demo</h3>
+            <p>Interactive, developer-first terminal loop with observability and command ergonomics.</p>
+          </div>
+        </article>
+        <article class="timeline">
+          <h3>Execution Loop</h3>
+          <p style="margin: 8px 0 0; color: var(--text-muted); line-height: 1.58;">
+            Whale Code executes with a strict loop that keeps reasoning and action aligned:
+            <strong>Think → Act → Observe → Re-think</strong>.
+          </p>
+          <div class="timeline-steps">
+            <div class="step">
+              <div class="step-num">Step 01</div>
+              <h3>Think</h3>
+              <p>Model analyzes objective, history, and state under policy constraints.</p>
+            </div>
+            <div class="step">
+              <div class="step-num">Step 02</div>
+              <h3>Act</h3>
+              <p>Calls specialized tools through structured function-calling payloads.</p>
+            </div>
+            <div class="step">
+              <div class="step-num">Step 03</div>
+              <h3>Observe</h3>
+              <p>Processes typed tool responses with status and machine-readable fields.</p>
+            </div>
+            <div class="step">
+              <div class="step-num">Step 04</div>
+              <h3>Re-think</h3>
+              <p>Updates plan, compacts context if needed, and iterates safely.</p>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="benchmarks" class="fade-up">
+      <div class="section-head">
+        <h2>Benchmark Snapshot</h2>
+        <p>
+          Measured with Qwen3.5-35B-A3B-FP8, showcasing strong pass rates on coding and reasoning-oriented benchmarks.
+        </p>
+      </div>
+      <div class="bench">
+        <div>
+          <table class="table" aria-label="Whale Code benchmark table">
+            <thead>
+              <tr>
+                <th>Benchmark</th>
+                <th>Tasks</th>
+                <th>Pass Rate</th>
+                <th>Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>MBPP+</td>
+                <td>378</td>
+                <td><span class="chip">98.9%</span></td>
+                <td>2026-03-22</td>
+              </tr>
+              <tr>
+                <td>HumanEval+</td>
+                <td>164</td>
+                <td><span class="chip">96.9%</span></td>
+                <td>2026-03-22</td>
+              </tr>
+              <tr>
+                <td>ClassEval</td>
+                <td>100</td>
+                <td><span class="chip">90.0%</span></td>
+                <td>2026-03-22</td>
+              </tr>
+              <tr>
+                <td>AIME</td>
+                <td>30</td>
+                <td><span class="chip">80.0%</span></td>
+                <td>2026-03-22</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bars">
+          <div class="bar">
+            <div>MBPP+</div>
+            <div class="track"><div class="fill" style="--w: 98.9%;"></div></div>
+            <strong>98.9%</strong>
+          </div>
+          <div class="bar">
+            <div>HumanEval+</div>
+            <div class="track"><div class="fill" style="--w: 96.9%;"></div></div>
+            <strong>96.9%</strong>
+          </div>
+          <div class="bar">
+            <div>ClassEval</div>
+            <div class="track"><div class="fill" style="--w: 90%;"></div></div>
+            <strong>90.0%</strong>
+          </div>
+          <div class="bar">
+            <div>AIME</div>
+            <div class="track"><div class="fill" style="--w: 80%;"></div></div>
+            <strong>80.0%</strong>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflow" class="fade-up">
+      <div class="section-head">
+        <h2>Fast Path to Run Whale Code</h2>
+        <p>
+          Start the local model backend, then launch the CLI in a target workspace and assign coding tasks directly.
+        </p>
+      </div>
+      <article class="workflow">
+        <div class="workflow-head">
+          <span>Terminal Workflow</span>
+          <span>vLLM + run_cli.py</span>
+        </div>
+        <pre><code>CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+  --port 8000 \
+  --gpu-memory-utilization 0.92 \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --language-model-only \
+  --tool-call-parser qwen3_xml
+
+python run_cli.py --workspace /working/space
+
+<span class="highlight">&gt; Read the main entry point and summarize its structure</span>
+<span class="highlight">&gt; Add error handling to the data processing pipeline</span></code></pre>
+      </article>
+    </section>
+
+    <footer>
+      Whale Code Showcase Page · Built from project README facts and local repository assets.
+    </footer>
+  </main>
+
+  <script>
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("in");
+          }
+        });
+      },
+      { threshold: 0.12 }
+    );
+
+    document.querySelectorAll(".fade-up").forEach((el) => observer.observe(el));
+  </script>
+</body>
+</html>

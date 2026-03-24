@@ -1117,34 +1117,12 @@ class Agent(ABC):
         return "\n".join(summary_parts)
 
     def _register_task_tool(self):
-        """注册 TaskTool（子代理工具）
+        """注册子代理任务分发工具
 
-        自动注册逻辑，在启用子代理机制时注册。
+        Subagent mechanism — currently not active for CodeAgent.
+        Kept as placeholder for future multi-agent work.
         """
-        from ..tools.builtin.task_tool import TaskTool
-        from ..agents.factory import default_subagent_factory
-
-        # 创建子代理工厂函数
-        def agent_factory(agent_type: str) -> Agent:
-            """子代理工厂函数"""
-            llm = self._create_light_llm() if self.config.subagent_use_light_llm else self.llm
-
-            # 使用默认工厂创建子代理
-            return default_subagent_factory(
-                agent_type=agent_type,
-                llm=llm,
-                tool_registry=self.tool_registry,
-                config=self.config
-            )
-
-        # 创建并注册 TaskTool
-        task_tool = TaskTool(
-            agent_factory=agent_factory,
-            tool_registry=self.tool_registry,
-            config=self.config
-        )
-
-        self.tool_registry.register_tool(task_tool)
+        pass
 
     def _register_todowrite_tool(self):
         """注册 TodoWriteTool（进度管理工具）
@@ -1153,7 +1131,6 @@ class Agent(ABC):
         """
         from ..tools.builtin.todowrite_tool import TodoWriteTool
 
-        # 创建并注册 TodoWriteTool
         todo_tool = TodoWriteTool(
             project_root=str(self.working_dir) if hasattr(self, 'working_dir') else ".",
             persistence_dir=self.config.todowrite_persistence_dir

@@ -7,15 +7,13 @@ from .errors import ToolErrorCode
 
 # 内置工具
 from .builtin.bash import BashTool
-from .builtin.file_tools import ListFilesTool, ReadTool, WriteTool, EditTool, MultiEditTool, EditFileMultiTool
+from .builtin.file_tools import ListFilesTool, ReadTool, WriteTool, DeleteTool, EditTool
 from .builtin.glob_tool import GlobTool
 from .builtin.grep_tool import GrepTool
-from .builtin.todowrite_tool import TodoWriteTool, TodoItem, TodoList
-from .builtin.task_tool import TaskTool
+from .builtin.todowrite_tool import TodoWriteTool, TaskManager
 from .builtin.skill_tool import SkillTool
 from .builtin.ask_user import AskUserTool
 from .builtin.web_tool import WebSearchTool, WebFetchTool
-from .builtin.background import BackgroundTool, BackgroundManager, BackgroundTaskRecord, get_background_manager
 
 # 子代理机制
 from .tool_filter import ToolFilter, ReadOnlyFilter, FullAccessFilter, CustomFilter
@@ -38,23 +36,16 @@ __all__ = [
     "ListFilesTool",
     "ReadTool",
     "WriteTool",
+    "DeleteTool",
     "EditTool",
-    "MultiEditTool",
-    "EditFileMultiTool",
     "GlobTool",
     "GrepTool",
     "TodoWriteTool",
-    "TodoItem",
-    "TodoList",
-    "TaskTool",
+    "TaskManager",
     "SkillTool",
     "AskUserTool",
     "WebSearchTool",
     "WebFetchTool",
-    "BackgroundTool",
-    "BackgroundManager",
-    "BackgroundTaskRecord",
-    "get_background_manager",
 
     # 子代理机制
     "ToolFilter",

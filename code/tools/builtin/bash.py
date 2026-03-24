@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import subprocess
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -14,6 +18,7 @@ from ..errors import ToolErrorCode
 from ..response import ToolResponse
 from ._code_utils import (
     apply_line_limit,
+    atomic_write,
     ensure_working_dir,
     relative_display,
     resolve_path,
@@ -21,11 +26,227 @@ from ._code_utils import (
 )
 
 
+class _TerminalBackgroundManager:
+    """Persist background command execution into terminal files."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+        self.terminals_dir = (self.project_root / "memory" / "terminals").resolve()
+        self.terminals_dir.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.terminals_dir / "index.json"
+        self._lock = threading.RLock()
+        self._next_id = self._discover_next_id()
+        self._records: Dict[int, Dict[str, Any]] = {}
+        self._load_index()
+
+    def track_process(
+        self,
+        *,
+        process: subprocess.Popen,
+        command: str,
+        working_directory: str,
+        description: str,
+        block_until_ms: int,
+        stdout_prefix: bytes = b"",
+        stderr_prefix: bytes = b"",
+    ) -> Dict[str, Any]:
+        started_at = datetime.now().isoformat()
+        started_ts = time.time()
+        with self._lock:
+            terminal_id = self._next_id
+            self._next_id += 1
+            terminal_file = self.terminals_dir / f"{terminal_id}.txt"
+            record = {
+                "id": terminal_id,
+                "terminal_file": str(terminal_file),
+                "status": "running",
+                "pid": process.pid,
+                "command": command,
+                "working_directory": working_directory,
+                "description": description,
+                "block_until_ms": block_until_ms,
+                "started_at": started_at,
+                "started_ts": started_ts,
+                "finished_at": "",
+                "exit_code": None,
+                "elapsed_ms": None,
+            }
+            self._records[terminal_id] = record
+            atomic_write(terminal_file, self._render_running(record))
+            self._save_index()
+
+            waiter = threading.Thread(
+                target=self._wait_and_finalize,
+                args=(
+                    terminal_id,
+                    process,
+                    stdout_prefix,
+                    stderr_prefix,
+                ),
+                daemon=True,
+                name=f"bash-terminal-{terminal_id}",
+            )
+            waiter.start()
+
+            return {
+                "terminal_id": terminal_id,
+                "terminal_file": str(terminal_file),
+                "pid": process.pid,
+                "status": "running",
+            }
+
+    def _wait_and_finalize(
+        self,
+        terminal_id: int,
+        process: subprocess.Popen,
+        stdout_prefix: bytes,
+        stderr_prefix: bytes,
+    ) -> None:
+        try:
+            stdout, stderr = process.communicate()
+        except Exception as exc:
+            stdout = b""
+            stderr = str(exc).encode("utf-8", errors="replace")
+
+        stdout = stdout or b""
+        stderr = stderr or b""
+
+        if stdout_prefix and not stdout.startswith(stdout_prefix):
+            stdout = stdout_prefix + stdout
+        if stderr_prefix and not stderr.startswith(stderr_prefix):
+            stderr = stderr_prefix + stderr
+
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        exit_code = process.returncode
+
+        with self._lock:
+            record = self._records.get(terminal_id)
+            if not record:
+                return
+
+            finished_at = datetime.now().isoformat()
+            elapsed_ms = int((time.time() - record["started_ts"]) * 1000)
+
+            record["finished_at"] = finished_at
+            record["exit_code"] = exit_code
+            record["elapsed_ms"] = elapsed_ms
+            record["status"] = "completed" if exit_code == 0 else "failed"
+
+            terminal_file = Path(record["terminal_file"])
+            atomic_write(terminal_file, self._render_finished(record, stdout_text, stderr_text))
+            self._save_index()
+
+    def _render_running(self, record: Dict[str, Any]) -> str:
+        running_for_seconds = max(int(time.time() - record["started_ts"]), 0)
+        lines = [
+            f"[terminal:{record['id']}]",
+            f"status: {record['status']}",
+            f"pid: {record['pid']}",
+            f"running_for_seconds: {running_for_seconds}",
+            f"started_at: {record['started_at']}",
+            f"working_directory: {record['working_directory']}",
+            f"command: {record['command']}",
+            f"description: {record['description'] or '[none]'}",
+            f"block_until_ms: {record['block_until_ms']}",
+            "",
+            "--- output ---",
+            "[running]",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _render_finished(self, record: Dict[str, Any], stdout_text: str, stderr_text: str) -> str:
+        running_for_seconds = max(int((record.get("elapsed_ms") or 0) / 1000), 0)
+        lines = [
+            f"[terminal:{record['id']}]",
+            f"status: {record['status']}",
+            f"pid: {record['pid']}",
+            f"running_for_seconds: {running_for_seconds}",
+            f"started_at: {record['started_at']}",
+            f"finished_at: {record['finished_at']}",
+            f"working_directory: {record['working_directory']}",
+            f"command: {record['command']}",
+            f"description: {record['description'] or '[none]'}",
+            "",
+            "--- stdout ---",
+            stdout_text.strip() or "[empty]",
+            "",
+            "--- stderr ---",
+            stderr_text.strip() or "[empty]",
+            "",
+            f"exit_code: {record['exit_code']}",
+            f"elapsed_ms: {record['elapsed_ms']}",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _discover_next_id(self) -> int:
+        ids: List[int] = []
+        for item in self.terminals_dir.glob("*.txt"):
+            try:
+                ids.append(int(item.stem))
+            except ValueError:
+                continue
+        return (max(ids) + 1) if ids else 1
+
+    def _load_index(self) -> None:
+        if not self.index_path.exists():
+            return
+        try:
+            payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        records = payload.get("records") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            return
+        for item in records:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            record = dict(item)
+            started_at = record.get("started_at")
+            if started_at:
+                try:
+                    dt = datetime.fromisoformat(started_at)
+                    record.setdefault("started_ts", dt.timestamp())
+                except Exception:
+                    record.setdefault("started_ts", time.time())
+            else:
+                record.setdefault("started_ts", time.time())
+            self._records[int(record["id"])] = record
+
+    def _save_index(self) -> None:
+        records: List[Dict[str, Any]] = []
+        for record in sorted(self._records.values(), key=lambda item: item["id"]):
+            serializable = {
+                key: value
+                for key, value in record.items()
+                if key != "started_ts"
+            }
+            records.append(serializable)
+        atomic_write(
+            self.index_path,
+            json.dumps({"records": records}, ensure_ascii=False, indent=2) + "\n",
+        )
+
+
+_TERMINAL_MANAGERS: Dict[str, _TerminalBackgroundManager] = {}
+_TERMINAL_MANAGERS_LOCK = threading.Lock()
+
+
+def _get_terminal_manager(project_root: Path) -> _TerminalBackgroundManager:
+    root_key = str(project_root)
+    with _TERMINAL_MANAGERS_LOCK:
+        manager = _TERMINAL_MANAGERS.get(root_key)
+        if manager is None:
+            manager = _TerminalBackgroundManager(project_root)
+            _TERMINAL_MANAGERS[root_key] = manager
+        return manager
+
+
 class BashTool(Tool):
     """Run non-interactive shell commands inside the workspace."""
 
-    DEFAULT_TIMEOUT_MS = 120000
-    MAX_TIMEOUT_MS = 600000
+    DEFAULT_BLOCK_UNTIL_MS = 30000
+    MAX_BLOCK_UNTIL_MS = 600000
 
     INTERACTIVE_COMMANDS: Set[str] = {
         "vim",
@@ -48,16 +269,29 @@ class BashTool(Tool):
         "poweroff",
         "halt",
     }
+    DELETE_COMMANDS: Set[str] = {
+        "rm",
+        "rmdir",
+        "unlink",
+        "shred",
+        "srm",
+        "del",
+        "erase",
+    }
+    DELETE_PATTERNS: List[str] = [
+        r"\bfind\b[^\n]*\s-delete\b",
+        r"\bgit\s+clean\b",
+    ]
     PREFER_SPECIALIZED_TOOLS: Set[str] = {
-        "ls", "find",            # use LS / Glob
-        "grep", "rg",            # use Grep
-        "sed", "awk",            # use Edit / MultiEdit
+        "ls", "find",
+        "grep", "rg",
+        "sed", "awk",
     }
     NETWORK_COMMANDS: Set[str] = {
-        "npm", "pnpm", "yarn",   # JS package managers
-        "pip", "pip3",           # Python package managers
-        "apt", "apt-get", "brew",  # system package managers
-        "curl", "wget",          # HTTP clients
+        "npm", "pnpm", "yarn",
+        "pip", "pip3",
+        "apt", "apt-get", "brew",
+        "curl", "wget",
     }
 
     def __init__(
@@ -72,8 +306,7 @@ class BashTool(Tool):
                 "Run a non-interactive shell command inside the workspace. "
                 "Use this for builds, tests, formatters, linters, package scripts, developer commands, "
                 "and quick file inspection (cat, head, tail). "
-                "Do NOT use Bash for code search (`Grep`, `Glob`), "
-                "directory listing (`LS`), or file editing (`Edit`) — use the dedicated tools instead."
+                "Commands that exceed block_until_ms are moved to background and tracked by terminal files."
             ),
         )
         self.project_root = Path(project_root).expanduser().resolve()
@@ -90,186 +323,268 @@ class BashTool(Tool):
             ToolParameter(
                 name="command",
                 type="string",
-                description=(
-                    "The shell command to execute. Use for commands like `pytest`, `python -m`, "
-                    "`npm test`, `ruff check`, `make`, `git`, or project scripts."
-                ),
+                description="Shell command to execute.",
                 required=True,
             ),
             ToolParameter(
-                name="description",
+                name="working_directory",
                 type="string",
-                description=(
-                    "A short human-readable summary of what this command does (5-10 words). "
-                    "Displayed in logs and used for context compression."
-                ),
-                required=False,
-                default="",
-            ),
-            ToolParameter(
-                name="directory",
-                type="string",
-                description=(
-                    "Working directory relative to the workspace root. "
-                    "Use this instead of `cd` when the command should run from a subdirectory."
-                ),
+                description="Working directory relative to the workspace root.",
                 required=False,
                 default=".",
             ),
             ToolParameter(
-                name="timeout_ms",
+                name="block_until_ms",
                 type="integer",
                 description=(
-                    f"Execution timeout in milliseconds. "
-                    f"Increase for slow test suites or builds. Max {self.MAX_TIMEOUT_MS}."
+                    "Milliseconds to wait before returning. Default 30000. "
+                    "Set to 0 to run immediately in background."
                 ),
                 required=False,
-                default=self.DEFAULT_TIMEOUT_MS,
+                default=self.DEFAULT_BLOCK_UNTIL_MS,
+            ),
+            ToolParameter(
+                name="description",
+                type="string",
+                description="Optional summary of this command.",
+                required=False,
+                default="",
             ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         command = parameters.get("command")
-        description = parameters.get("description", "")
-        directory = parameters.get("directory", ".")
-        timeout_ms = parameters.get("timeout_ms", self.DEFAULT_TIMEOUT_MS)
 
-        if not command or not isinstance(command, str):
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message="command must be a non-empty string.",
-            )
-        if not isinstance(timeout_ms, int) or timeout_ms < 1 or timeout_ms > self.MAX_TIMEOUT_MS:
+        description_raw = parameters.get("description", "")
+        if description_raw is None:
+            description = ""
+        elif isinstance(description_raw, str):
+            description = description_raw.strip()
+        else:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
                 message=(
-                    f"timeout_ms must be an integer between 1 and {self.MAX_TIMEOUT_MS}."
+                    "Invalid parameter `description`: expected string when provided, "
+                    f"got {type(description_raw).__name__}."
+                ),
+            )
+
+        working_directory = parameters.get("working_directory")
+        if working_directory is None:
+            working_directory = parameters.get("directory", ".")
+
+        block_until_ms = parameters.get("block_until_ms")
+        if block_until_ms is None:
+            timeout_alias = parameters.get("timeout_ms")
+            block_until_ms = timeout_alias if timeout_alias is not None else self.DEFAULT_BLOCK_UNTIL_MS
+
+        if not isinstance(command, str) or not command.strip():
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=(
+                    "Invalid parameter `command`: expected non-empty string, "
+                    f"got {type(command).__name__}."
+                ),
+            )
+        command = command.strip()
+
+        if not isinstance(block_until_ms, int) or block_until_ms < 0 or block_until_ms > self.MAX_BLOCK_UNTIL_MS:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=(
+                    f"Invalid parameter `block_until_ms`: expected integer between 0 and {self.MAX_BLOCK_UNTIL_MS}, "
+                    f"got value={block_until_ms!r} ({type(block_until_ms).__name__})."
                 ),
             )
 
         try:
-            target_dir = resolve_path(self.project_root, self.working_dir, directory)
+            target_dir = resolve_path(self.project_root, self.working_dir, working_directory)
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message="directory escapes the workspace root.",
+                message=(
+                    "Invalid `working_directory`: path escapes workspace root.\n"
+                    f"working_directory={working_directory!r}"
+                ),
             )
 
         if not target_dir.exists() or not target_dir.is_dir():
             return ToolResponse.error(
                 code=ToolErrorCode.NOT_FOUND,
-                message=f"Working directory not found: {directory}",
+                message=f"Working directory not found: {working_directory}",
             )
 
         policy_error = self._validate_command(command)
         if policy_error:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=policy_error,
+                message=(
+                    f"Command blocked by Bash policy: {policy_error}\n"
+                    f"Command: {command}\n"
+                    f"Directory: {working_directory}"
+                ),
             )
 
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 ["bash", "-lc", command],
                 cwd=target_dir,
-                capture_output=True,
-                timeout=timeout_ms / 1000,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env={**os.environ, "PROJECT_ROOT": str(self.project_root)},
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or b""
-            stderr = exc.stderr or b""
-            return self._format_response(
-                command=command,
-                description=description,
-                directory=target_dir,
-                exit_code=None,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=True,
             )
         except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to execute shell command: {exc}",
+                message=(
+                    f"Failed to execute shell command: {exc}\n"
+                    f"Command: {command}\n"
+                    f"Directory: {working_directory}"
+                ),
+            )
+
+        if block_until_ms == 0:
+            return self._background_response(
+                process=process,
+                command=command,
+                description=description,
+                directory=target_dir,
+                block_until_ms=block_until_ms,
+                reason="immediate_background",
+            )
+
+        try:
+            stdout, stderr = process.communicate(timeout=block_until_ms / 1000)
+        except subprocess.TimeoutExpired as exc:
+            return self._background_response(
+                process=process,
+                command=command,
+                description=description,
+                directory=target_dir,
+                block_until_ms=block_until_ms,
+                reason="exceeded_block_until",
+                stdout_prefix=exc.stdout or b"",
+                stderr_prefix=exc.stderr or b"",
+            )
+        except Exception as exc:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return ToolResponse.error(
+                code=ToolErrorCode.INTERNAL_ERROR,
+                message=f"Failed while waiting for command: {exc}",
             )
 
         return self._format_response(
             command=command,
             description=description,
             directory=target_dir,
-            exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            timed_out=False,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def _background_response(
+        self,
+        *,
+        process: subprocess.Popen,
+        command: str,
+        description: str,
+        directory: Path,
+        block_until_ms: int,
+        reason: str,
+        stdout_prefix: bytes = b"",
+        stderr_prefix: bytes = b"",
+    ) -> ToolResponse:
+        rel_dir = relative_display(self.project_root, directory)
+        manager = _get_terminal_manager(self.project_root)
+        task = manager.track_process(
+            process=process,
+            command=command,
+            working_directory=rel_dir,
+            description=description,
+            block_until_ms=block_until_ms,
+            stdout_prefix=stdout_prefix,
+            stderr_prefix=stderr_prefix,
+        )
+
+        parts: List[str] = []
+        if description:
+            parts.append(f"Description: {description}")
+        parts.extend(
+            [
+                f"Command: {command}",
+                f"Directory: {rel_dir}",
+                f"Status: running in background (pid={task['pid']})",
+                f"Terminal file: {task['terminal_file']}",
+            ]
+        )
+        if reason == "exceeded_block_until":
+            parts.append(f"Reason: exceeded block_until_ms={block_until_ms}")
+        else:
+            parts.append("Reason: block_until_ms=0")
+
+        return ToolResponse.success(
+            text="\n".join(parts),
+            data={
+                "backgrounded": True,
+                "command": command,
+                "description": description,
+                "working_directory": rel_dir,
+                "block_until_ms": block_until_ms,
+                "terminal_id": task["terminal_id"],
+                "terminal_file": task["terminal_file"],
+                "pid": task["pid"],
+            },
         )
 
     def _validate_command(self, command: str) -> Optional[str]:
-        """Validate *command* against security policies.
-
-        Three-layer validation:
-          1. Catastrophic pattern detection (``rm -rf /``).
-          2. Raw-string scan for blocked commands — catches bypass vectors
-             such as ``env sudo``, ``$(sudo …)``, `` `sudo` ``, and
-             ``bash -c "sudo …"``.
-          3. Token-based preference check for segment leaders (soft).
-        """
         lowered = command.lower()
 
-        # --- Layer 1: catastrophic patterns ---
         if re.search(r"(^|[;&|]\s*)rm\s+-rf\s+/", lowered):
             return "Refusing to run a destructive command."
 
-        # --- Layer 2: raw-string scan for security-critical commands ---
-        # Searches the entire command string (including inside $(), ``,
-        # quotes, etc.) so that token-level bypass tricks are caught.
-        _categories: List[tuple[str, Set[str]]] = [
+        categories: List[tuple[str, Set[str]]] = [
             ("Privileged commands are not allowed", self.PRIVILEGED_COMMANDS),
             ("Interactive terminal commands are not allowed", self.INTERACTIVE_COMMANDS),
             ("Destructive system commands are not allowed", self.DESTRUCTIVE_COMMANDS),
+            (
+                "Delete-related shell commands are blocked in Bash; use the Delete tool instead",
+                self.DELETE_COMMANDS,
+            ),
         ]
         if not self.allow_network:
-            _categories.append(
+            categories.append(
                 ("Network-related commands are disabled for Bash by default", self.NETWORK_COMMANDS),
             )
-        for message, blocklist in _categories:
-            for cmd in blocklist:
-                if re.search(rf"\b{re.escape(cmd)}\b", lowered):
-                    return f"{message} (detected '{cmd}')."
+        for message, blocklist in categories:
+            for blocked in blocklist:
+                if re.search(rf"\b{re.escape(blocked)}\b", lowered):
+                    return f"{message} (detected '{blocked}')."
 
-        # --- Layer 3: preference blocklist (token-based, segment leaders only) ---
-        # Only the leading command of each pipeline/chain segment is checked,
-        # so piped usage like `git log | grep fix` is still allowed.
+        for pattern in self.DELETE_PATTERNS:
+            if re.search(pattern, lowered):
+                return "Delete-related shell commands are blocked in Bash; use the Delete tool instead."
+
         for leader in self._extract_segment_leaders(command):
             if leader in self.PREFER_SPECIALIZED_TOOLS:
                 return (
                     f"Use the dedicated tool instead of `{leader}` in Bash. "
                     "Read → file reading, Grep → code search, Glob → file finding, "
-                    "LS → directory listing, Edit → file editing."
+                    "LS → directory listing, Edit → file editing, Delete → file removal."
                 )
 
         return None
 
     @staticmethod
     def _extract_segment_leaders(command: str) -> List[str]:
-        """Return the leading command of each chain segment (ignoring piped commands).
-
-        Split by ``&&``, ``||``, ``;`` to get chain segments, then take only
-        the first command in each segment (before any ``|``).  This means:
-
-        - ``grep pattern *.py``       → ``['grep']``  (blocked)
-        - ``git log | grep fix``      → ``['git']``   (allowed)
-        - ``pytest | head -100``      → ``['pytest']`` (allowed)
-        - ``cat f.py && head f.py``   → ``['cat', 'head']`` (both blocked)
-        """
-        # Step 1: split by chain operators (&&, ||, ;) — NOT by pipe |
         chain_segments = re.split(r"\|\||&&|;", command)
         leaders: List[str] = []
         for segment in chain_segments:
             segment = segment.strip()
             if not segment:
                 continue
-            # Step 2: split by pipe | and take only the FIRST part
             first_pipe = segment.split("|")[0].strip()
             if not first_pipe:
                 continue
@@ -282,7 +597,6 @@ class BashTool(Tool):
         return leaders
 
     def validate_command_policy(self, command: str) -> Optional[str]:
-        """Public wrapper so other tools can share Bash command policy."""
         return self._validate_command(command)
 
     def _format_response(
@@ -293,7 +607,6 @@ class BashTool(Tool):
         exit_code: Optional[int],
         stdout: bytes,
         stderr: bytes,
-        timed_out: bool,
     ) -> ToolResponse:
         stdout_text, stdout_bytes_truncated = safe_decode_output(stdout)
         stderr_text, stderr_bytes_truncated = safe_decode_output(stderr)
@@ -302,21 +615,16 @@ class BashTool(Tool):
 
         rel_dir = relative_display(self.project_root, directory)
 
-        # --- Header ---
         parts: List[str] = []
         if description:
             parts.append(f"Description: {description}")
         parts.append(f"Command: {command}")
         parts.append(f"Directory: {rel_dir}")
-
-        if timed_out:
-            parts.append("Status: TIMED OUT")
-        elif exit_code == 0:
+        if exit_code == 0:
             parts.append(f"Exit code: {exit_code} (success)")
         else:
             parts.append(f"Exit code: {exit_code} (failure)")
 
-        # --- Output sections ---
         if stdout_text:
             parts.extend(["", "--- stdout ---", stdout_text])
             if stdout_bytes_truncated or stdout_lines_truncated:
@@ -332,27 +640,20 @@ class BashTool(Tool):
 
         text = "\n".join(parts)
         data = {
+            "backgrounded": False,
             "command": command,
             "description": description,
-            "directory": rel_dir,
+            "working_directory": rel_dir,
             "exit_code": exit_code,
             "stdout": stdout_text,
             "stderr": stderr_text,
-            "timed_out": timed_out,
         }
-
-        if timed_out:
-            return ToolResponse.error(
-                code=ToolErrorCode.TIMEOUT,
-                message=text,
-                context={"command": command, "directory": rel_dir},
-            )
 
         if exit_code != 0:
             return ToolResponse.error(
                 code=ToolErrorCode.EXECUTION_ERROR,
                 message=text,
-                context={"command": command, "directory": rel_dir, "exit_code": exit_code},
+                context={"command": command, "working_directory": rel_dir, "exit_code": exit_code},
             )
 
         return ToolResponse.success(text=text, data=data)

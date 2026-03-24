@@ -3,14 +3,12 @@
 A collection of built-in tools for the HelloAgents framework, including:
 - ReadTool: File read tool (supports optimistic locking)
 - WriteTool: File write tool (supports optimistic locking)
+- DeleteTool: Safe file/directory deletion tool
 - EditTool: File edit tool (supports optimistic locking)
-- MultiEditTool: Batch edit tool (supports optimistic locking)
 - BashTool: Shell command execution tool
 - GlobTool: File name pattern search tool
 - GrepTool: Code content search tool
-- TodoWriteTool: Task list management tool (progress tracking)
-- TaskTool: Persistent task graph tool
-- BackgroundTool: Background task tool
+- TodoWriteTool: Unified task management tool (task graph + progress tracking)
 - SkillTool: Skill loading tool
 - AskUserTool: User interaction tool
 - WebSearchTool: Web search tool (DuckDuckGo)
@@ -21,32 +19,23 @@ from .bash import BashTool
 from .ask_user import AskUserTool
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
-from .task_tool import TaskTool
 from .skill_tool import SkillTool
-from .background import BackgroundTool, BackgroundManager, BackgroundTaskRecord, get_background_manager
-from .file_tools import ListFilesTool, ReadTool, WriteTool, EditTool, MultiEditTool, EditFileMultiTool
-from .todowrite_tool import TodoWriteTool, TodoItem, TodoList
+from .file_tools import ListFilesTool, ReadTool, WriteTool, DeleteTool, EditTool
+from .todowrite_tool import TodoWriteTool, TaskManager
 from .web_tool import WebSearchTool, WebFetchTool
 
 __all__ = [
     "AskUserTool",
-    "BackgroundTool",
-    "BackgroundManager",
-    "BackgroundTaskRecord",
-    "get_background_manager",
     "BashTool",
     "ListFilesTool",
     "ReadTool",
     "WriteTool",
+    "DeleteTool",
     "EditTool",
-    "MultiEditTool",
-    "EditFileMultiTool",
     "GlobTool",
     "GrepTool",
     "TodoWriteTool",
-    "TodoItem",
-    "TodoList",
-    "TaskTool",
+    "TaskManager",
     "SkillTool",
     "WebSearchTool",
     "WebFetchTool",

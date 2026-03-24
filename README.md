@@ -17,7 +17,7 @@ Whale Code is a from-scratch implementation of an autonomous coding agent that o
 - [Task System](#task-system)
   - [Persistent Task Graph (TaskTool)](#persistent-task-graph-tasktool)
   - [Lightweight Progress Tracking (TodoWrite)](#lightweight-progress-tracking-todowrite)
-  - [Background Execution (BackgroundTool)](#background-execution-backgroundtool)
+  - [Background Execution via Bash](#background-execution-via-bash)
 - [Benchmarks](#benchmarks)
   - [Supported Benchmarks](#supported-benchmarks)
   - [Quick Start](#quick-start-1)
@@ -48,18 +48,9 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3-Coder-Next-FP8 \
-    --port 8000 \
-    --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.92 \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder
-```
-
-```bash
 CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --port 8000 \
-    --gpu-memory-utilization 0.92 \
+    --gpu-memory-utilization 0.90 \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --language-model-only \
@@ -123,7 +114,7 @@ Agent (base) → ReActAgent (function-calling ReAct loop) → CodeAgent (coding-
 
 2. **OpenAI Function Calling (not text-parsing)**: Unlike text-based ReAct implementations that rely on regex to parse `Action: ...` from model output, `CodeAgent` uses native function calling. The model's `tool_calls` are structured JSON, achieving a **99%+ parse success rate** with zero regex.
 
-3. **Tool Auto-Registration**: On initialization, `register_default_tools()` instantiates and registers 12+ atomic tools, each bound to the workspace root:
+3. **Tool Auto-Registration**: On initialization, `register_default_tools()` instantiates and registers atomic tools, each bound to the workspace root:
 
    ```python
    def register_default_tools(self, enable_task_tool=True):
@@ -133,15 +124,12 @@ Agent (base) → ReActAgent (function-calling ReAct loop) → CodeAgent (coding-
        self.tool_registry.register_tool(GlobTool(...))
        self.tool_registry.register_tool(GrepTool(...))
        self.tool_registry.register_tool(BashTool(...))
-       self.tool_registry.register_tool(BackgroundTool(...))
        # ... and more
    ```
 
-4. **Background Notification Injection**: Before each model call, `_before_model_call()` drains completed background task notifications and injects them as `<background-results>` messages, so the model is aware of async build/test results.
+4. **Sub-Agent Creation**: `_create_subagent()` spawns an isolated `CodeAgent` with its own `ToolRegistry`, separate history, and `interactive=False` (disabling `AskUser`). This enables context-isolated delegated work.
 
-5. **Sub-Agent Creation**: `_create_subagent()` spawns an isolated `CodeAgent` with its own `ToolRegistry`, separate history, and `interactive=False` (disabling `AskUser`). This enables context-isolated delegated work.
-
-6. **Manual Context Compaction**: The `compact()` method exposes a public API for on-demand context compression, reconstructing messages from history, running the compactor, and replacing the stored history.
+5. **Manual Context Compaction**: The `compact()` method exposes a public API for on-demand context compression, reconstructing messages from history, running the compactor, and replacing the stored history.
 
 ---
 
@@ -244,10 +232,10 @@ Atomic tools produce compact, well-formatted output. `GlobTool` returns sorted f
 The `BashTool` itself enforces this philosophy. It maintains a `PREFER_SPECIALIZED_TOOLS` blocklist:
 
 ```python
-PREFER_SPECIALIZED_TOOLS = {"ls", "cat", "grep", "rg", "find", "head", "tail"}
+PREFER_SPECIALIZED_TOOLS = {"ls", "find", "grep", "rg", "sed", "awk"}
 ```
 
-If the model tries to run `grep pattern .` or `cat file.py` as a standalone command, Bash returns an error saying "Use the dedicated tools instead." However, piped usage like `git log | grep fix` is allowed, since `grep` is not the segment leader.
+If the model tries to run `grep pattern .` or `sed -i ...` as a standalone command, Bash returns an error saying "Use the dedicated tools instead." However, piped usage like `git log | grep fix` is allowed, since `grep` is not the segment leader.
 
 ### Tool List
 
@@ -258,12 +246,9 @@ If the model tries to run `grep pattern .` or `cat file.py` as a standalone comm
 | | `LS` | List directory contents |
 | | `Read` | Read file content with metadata for optimistic locking |
 | **File Modification** | `Write` | Full-file rewrite with atomic write + optimistic locking + dry-run mode |
+| | `Delete` | Safe file/directory deletion with guardrails and atomic trash move |
 | | `Edit` | Single-snippet surgical replacement with conflict detection + backup |
-| | `MultiEdit` | Batch multiple independent edits in one file atomically |
-| **Execution** | `Bash` | Shell commands with command policy validation (blocks interactive/destructive/privileged commands) |
-| | `background_run` | Start long-running commands asynchronously |
-| | `background_check` | Inspect background task status and output |
-| | `background_cancel` | Cancel a running background task |
+| **Execution** | `Bash` | Shell commands with command policy validation and `block_until_ms` backgrounding |
 | **Planning** | `TodoWrite` | Lightweight declarative progress tracking |
 | | `task_create` | Create a persistent task with dependency graph |
 | | `task_update` | Update task status/fields/dependencies |
@@ -344,19 +329,19 @@ A **declarative, in-session** progress tracker for lightweight task management:
 - **Auto-Recap Generation** — generates a compact status line (e.g. `[2/5] In progress: xxx. Pending: yyy; zzz.`) for context efficiency.
 - **Persistent Snapshots** — todo states are saved as timestamped JSON files under `memory/todos/`.
 
-### Background Execution (BackgroundTool)
+### Background Execution via Bash
 
-**Source**: `code/tools/builtin/background.py`
+**Source**: `code/tools/builtin/bash.py`
 
-Enables **non-blocking parallel execution** of long-running commands:
+Enables **non-blocking parallel execution** of long-running commands through `Bash`:
 
-1. **`background_run`** — spawns a shell command in a daemon thread. Returns immediately with a task ID so the agent can continue reasoning.
+1. **`block_until_ms`** — each `Bash` call waits up to `block_until_ms` (default `30000`). If the process is still running, it is moved to background and the call returns immediately.
 
-2. **Notification Injection** — The `BackgroundManager` maintains a notification queue. Before each model call, `CodeAgent._before_model_call()` drains completed notifications and injects them as `<background-results>` messages. The model learns about build/test outcomes without polling.
+2. **Immediate Background Mode** — set `block_until_ms: 0` to start a command in the background without waiting.
 
-3. **Task Integration** — Background tasks can be linked to persistent tasks via `task_id`. If `complete_task_on_success=True`, the background manager automatically marks the linked task as `completed` when the command exits with code 0.
+3. **Terminal Files** — backgrounded runs return `terminal_file` (for example `memory/terminals/7.txt`). The file includes a running header (`pid`, `running_for_seconds`) and completion footer (`exit_code`, `elapsed_ms`).
 
-4. **Lifecycle Management** — `background_check` inspects status/output, `background_cancel` sends SIGTERM. Records are persisted as JSON files under `memory/background/` and survive process restarts (interrupted tasks are marked as `interrupted`).
+4. **Status Tracking** — each terminal run is persisted under `memory/terminals/` so status and output can be polled while the agent continues other work.
 
 ---
 
@@ -405,16 +390,7 @@ bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 | **MBPP+**      | 378 | 374 | **98.9%** | 53.6s  | 2026-03-22 |
 | **HumanEval+** | 164 | 159 | **96.9%** | 64.29s | 2026-03-22 |
 | **ClassEval**  | 100 | 90  | **90.0%** | 471.7s | 2026-03-22 |
-| **AIME**       | 30  | 24  | **90.0%** | 236.5s | 2026-03-22 |
-
-> Model: **Qwen3-Coder-Next-FP8**
-
-| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
-|-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**      | 378 |   |   |   | 2026-03-xx |
-| **HumanEval+** | 164 |   |   |   | 2026-03-xx |
-| **ClassEval**  | 100 |   |   |   | 2026-03-xx |
-| **AIME**       | 30  |   |   |   | 2026-03-xx |
+| **AIME**       | 30  | 24  | **80.0%** | 236.5s | 2026-03-22 |
 
 ---
 

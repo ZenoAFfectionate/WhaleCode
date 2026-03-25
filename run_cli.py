@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import selectors
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -20,8 +22,7 @@ CODE_DIR = PROJECT_ROOT / "code"
 
 try:
     from rich.align import Align
-    from rich.console import Console, Group
-    from rich.live import Live
+    from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.rule import Rule
@@ -30,7 +31,7 @@ try:
 
     RICH_AVAILABLE = True
 except ImportError:
-    Align = Console = Group = Live = Markdown = Panel = Rule = Table = Text = None
+    Align = Console = Markdown = Panel = Rule = Table = Text = None
     RICH_AVAILABLE = False
 
 try:
@@ -44,10 +45,81 @@ try:
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:
     PromptSession = HTML = FileHistory = KeyBindings = Keys = PromptStyle = None
-PROMPT_TOOLKIT_AVAILABLE = False
+    PROMPT_TOOLKIT_AVAILABLE = False
 
 
 TODO_MUTATING_ACTIONS = {"create", "update", "bulk_create", "delete"}
+
+
+class InputBuffer:
+    """Thread-safe buffer for user input during agent execution."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items: list[str] = []
+
+    def add(self, text: str) -> None:
+        with self._lock:
+            self._items.append(text)
+
+    def drain(self) -> list[str]:
+        """Return and clear all buffered messages."""
+        with self._lock:
+            items = list(self._items)
+            self._items.clear()
+            return items
+
+    def has_pending(self) -> bool:
+        with self._lock:
+            return len(self._items) > 0
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+def _collect_buffered_input(
+    thread: threading.Thread, buffer: InputBuffer, ui: "CLIUI"
+) -> None:
+    """Collect user input lines from stdin while *thread* is alive.
+
+    Uses ``selectors`` for non-blocking reads so the main thread can
+    periodically check whether the agent thread has finished.
+    """
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(sys.stdin, selectors.EVENT_READ)
+    except (ValueError, OSError):
+        # stdin is not selectable (e.g. redirected / not a real FD)
+        thread.join()
+        return
+
+    try:
+        while thread.is_alive():
+            events = sel.select(timeout=0.3)
+            if events:
+                try:
+                    line = sys.stdin.readline()
+                except (EOFError, OSError):
+                    break
+                if not line:  # EOF
+                    break
+                text = line.strip()
+                if text:
+                    buffer.add(text)
+                    ui.info(
+                        f"  [queued for next turn] {text[:60]}{'...' if len(text) > 60 else ''}"
+                    )
+    except KeyboardInterrupt:
+        pass  # User interrupted; we still join the thread below
+    finally:
+        try:
+            sel.unregister(sys.stdin)
+        except Exception:
+            pass
+        sel.close()
+    # Ensure thread is fully joined before returning
+    thread.join(timeout=5)
 
 
 def _get_version() -> str:
@@ -117,11 +189,16 @@ def bootstrap_package() -> None:
 class CLIUI:
     """Small rendering helper with optional Rich support."""
 
+    TASK_MARKERS = {
+        "completed": ("✔", "green"),
+        "in_progress": ("►", "bold yellow"),
+        "pending": ("◻", "dim"),
+        "cancelled": ("✘", "dim red"),
+    }
+
     def __init__(self, use_rich: bool = True):
         self.use_rich = bool(use_rich and RICH_AVAILABLE)
         self.console = Console(record=True) if self.use_rich else None
-        self._live: Optional[Live] = None
-        self._live_agent = None
 
     def print(self, message: str = "") -> None:
         if self.use_rich:
@@ -199,11 +276,16 @@ class CLIUI:
 
             left_aligned = Align(left_parts, align="center")
 
-            # --- Right panel content (placeholder for now) ---
+            # --- Right panel content ---
+            tool_count = len(agent.tool_registry.list_tools()) if agent.tool_registry else 0
             right_parts = Text()
             right_parts.append("\n")
-            right_parts.append("Recent activity\n", style="bold white")
-            right_parts.append("No recent activity\n", style="dim")
+            right_parts.append("  Runtime\n", style="bold white")
+            right_parts.append(f"  Provider    {provider}\n", style="dim")
+            right_parts.append(f"  Workspace   {_pretty_path(workspace)}\n", style="dim")
+            right_parts.append(f"  Tools       {tool_count} registered\n", style="dim")
+            session_on = bool(getattr(agent, "session_store", None))
+            right_parts.append(f"  Session     {'enabled' if session_on else 'disabled'}\n", style="dim")
 
             # --- Two-column table with vertical divider ---
             # Use a custom box that only draws inner vertical lines
@@ -260,33 +342,17 @@ class CLIUI:
 
     def render_task_status(self, agent) -> None:
         """Render a compact task status bar from the TodoWrite tool's task files."""
-        todo_tool = None
-        if hasattr(agent, 'tool_registry') and agent.tool_registry:
-            todo_tool = agent.tool_registry.get_tool("TodoWrite")
-        if not todo_tool or not hasattr(todo_tool, 'task_manager'):
-            return
-
-        try:
-            tasks = todo_tool.task_manager.list_all()
-        except Exception:
-            return
+        tasks = self._get_task_list(agent)
         if not tasks:
             return
 
         max_label_len = 30
-        markers = {
-            "completed": ("✔", "green"),
-            "in_progress": ("◼", "bold yellow"),
-            "pending": ("◻", "dim"),
-            "cancelled": ("✘", "dim red"),
-        }
-
         lines = []
         for t in tasks:
             label = t["subject"]
             if len(label) > max_label_len:
                 label = label[: max_label_len - 1] + "…"
-            marker, style = markers.get(t["status"], ("?", "dim"))
+            marker, style = self.TASK_MARKERS.get(t["status"], ("?", "dim"))
             if self.use_rich:
                 lines.append(f"  [{style}]{marker} {label}[/{style}]")
             else:
@@ -310,91 +376,55 @@ class CLIUI:
                 print(line)
             print("---")
 
-    def _build_task_panel(self, agent):
-        """Build a Rich renderable showing live task progress.
-
-        Returns an empty Text when no tasks exist so the Live panel
-        occupies zero vertical space.
-        """
-        if not self.use_rich:
-            return Text("")
-
-        todo_tool = None
-        if hasattr(agent, "tool_registry") and agent.tool_registry:
-            todo_tool = agent.tool_registry.get_tool("TodoWrite")
-        if not todo_tool or not hasattr(todo_tool, "task_manager"):
-            return Text("")
-
-        try:
-            tasks = todo_tool.task_manager.list_all()
-        except Exception:
-            return Text("")
+    def render_inline_task_progress(self, agent) -> None:
+        """Print a compact one-line task progress during agent execution."""
+        tasks = self._get_task_list(agent)
         if not tasks:
-            return Text("")
-
-        max_label_len = 40
-        markers = {
-            "completed": ("✔", "green"),
-            "in_progress": ("►", "bold yellow"),
-            "pending": ("◻", "dim"),
-            "cancelled": ("✘", "dim red"),
-        }
+            return
 
         total = len(tasks)
         done = sum(1 for t in tasks if t["status"] == "completed")
+        in_progress = [t for t in tasks if t["status"] == "in_progress"]
+        current = in_progress[0]["subject"][:40] if in_progress else ""
 
-        lines = Text()
-        for i, t in enumerate(tasks):
-            label = t["subject"]
-            if len(label) > max_label_len:
-                label = label[: max_label_len - 1] + "…"
-            marker, style = markers.get(t["status"], ("?", "dim"))
-            lines.append(f"  {marker} ", style=style)
-            lines.append(label, style=style)
-            if i < total - 1:
-                lines.append("\n")
+        if self.use_rich:
+            line = f"[dim cyan]Tasks [{done}/{total}][/dim cyan]"
+            if current:
+                line += f" [bold yellow]► {current}[/bold yellow]"
+            self.console.print(line)
+        else:
+            line = f"Tasks [{done}/{total}]"
+            if current:
+                line += f" ► {current}"
+            print(line)
 
-        return Panel(
-            lines,
-            title=f"Tasks [{done}/{total}]",
-            title_align="left",
-            border_style="cyan",
-            padding=(0, 1),
-            width=self.console.width if self.console else 80,
+    def all_tasks_completed(self, agent) -> bool:
+        """Return True when tasks exist and every one is completed or cancelled."""
+        tasks = self._get_task_list(agent)
+        return bool(tasks) and all(
+            t["status"] in {"completed", "cancelled"} for t in tasks
         )
 
-    def start_live(self, agent) -> None:
-        """Start a pinned Live task panel at the bottom of the terminal."""
-        if not self.use_rich or self._live is not None:
-            return
-        self._live_agent = agent
-        renderable = self._build_task_panel(agent)
-        self._live = Live(
-            renderable,
-            console=self.console,
-            refresh_per_second=4,
-            vertical_overflow="visible",
-            transient=True,
+    def has_active_tasks(self, agent) -> bool:
+        """Return True when there are tasks that are not all completed."""
+        tasks = self._get_task_list(agent)
+        return bool(tasks) and not all(
+            t["status"] in {"completed", "cancelled"} for t in tasks
         )
-        self._live.start()
 
-    def stop_live(self) -> None:
-        """Stop the pinned Live task panel."""
-        if self._live is not None:
-            try:
-                self._live.stop()
-            except Exception:
-                pass
-            self._live = None
-            self._live_agent = None
-
-    def refresh_live(self) -> None:
-        """Re-render the Live task panel with current task state."""
-        if self._live is not None and self._live_agent is not None:
-            try:
-                self._live.update(self._build_task_panel(self._live_agent))
-            except Exception:
-                pass
+    @staticmethod
+    def _get_task_list(agent) -> list[dict]:
+        """Return the current task list from the agent's TodoWrite tool, or []."""
+        registry = getattr(agent, "tool_registry", None)
+        if not registry:
+            return []
+        todo_tool = registry.get_tool("TodoWrite")
+        if not todo_tool or not hasattr(todo_tool, "task_manager"):
+            return []
+        try:
+            return todo_tool.task_manager.list_all()
+        except Exception:
+            return []
 
     def render_assistant(self, text: str) -> None:
         if self.use_rich:
@@ -403,35 +433,33 @@ class CLIUI:
             print(text)
 
     def render_summary(self, elapsed_s: float, agent=None) -> None:
-        if self.use_rich:
-            time_part = f"⌚ Completed in {elapsed_s:.2f}s"
-
-            if agent is not None:
-                prompt_t = getattr(agent, '_turn_prompt_tokens', 0)
-                comp_t = getattr(agent, '_turn_completion_tokens', 0)
-                total_t = getattr(agent, '_total_tokens', 0)
-                ctx_window = getattr(agent.config, 'context_window', 0)
-                ctx_used = getattr(agent, '_last_prompt_tokens', 0)
-
-                if total_t > 0:
-                    token_parts = [
-                        f"[green]⬆{prompt_t:,}[/green]",
-                        f"[yellow]⬇{comp_t:,}[/yellow]",
-                    ]
-                    if ctx_window > 0 and ctx_used > 0:
-                        pct = ctx_used * 100 / ctx_window
-                        token_parts.append(
-                            f"[cyan]📊 {ctx_used:,} / {ctx_window:,} ({pct:.0f}%)[/cyan]"
-                        )
-                    self.console.print(
-                        f"[dim]{time_part}    |    {' · '.join(token_parts)}[/dim]"
-                    )
-                else:
-                    self.console.print(f"[dim cyan]{time_part}[/dim cyan]")
-            else:
-                self.console.print(f"[dim cyan]{time_part}[/dim cyan]")
-        else:
+        if not self.use_rich:
             print(f"[completed in {elapsed_s:.2f}s]")
+            return
+
+        time_part = f"⌚ Completed in {elapsed_s:.2f}s"
+        total_t = getattr(agent, "_total_tokens", 0) if agent else 0
+
+        if total_t > 0:
+            prompt_t = getattr(agent, "_turn_prompt_tokens", 0)
+            comp_t = getattr(agent, "_turn_completion_tokens", 0)
+            ctx_window = getattr(agent.config, "context_window", 0)
+            ctx_used = getattr(agent, "_last_prompt_tokens", 0)
+
+            token_parts = [
+                f"[green]⬆{prompt_t:,}[/green]",
+                f"[yellow]⬇{comp_t:,}[/yellow]",
+            ]
+            if ctx_window > 0 and ctx_used > 0:
+                pct = ctx_used * 100 / ctx_window
+                token_parts.append(
+                    f"[cyan]📊 {ctx_used:,} / {ctx_window:,} ({pct:.0f}%)[/cyan]"
+                )
+            self.console.print(
+                f"[dim]{time_part}    |    {' · '.join(token_parts)}[/dim]"
+            )
+        else:
+            self.console.print(f"[dim cyan]{time_part}[/dim cyan]")
 
     def render_rule(self, title: str) -> None:
         if self.use_rich:
@@ -439,33 +467,33 @@ class CLIUI:
         else:
             print(title)
 
+    _LOG_BLOCK_STYLES = {
+        "action":     ("Tool Call",        "bright_green", "🎬"),
+        "thinking":   ("Thinking",         "bright_blue",  "💭"),
+        "observation":("Observation",      "bright_cyan",  "👀"),
+        "info":       ("Info",             "cyan",         "ℹ️"),
+        "background": ("Background Update","magenta",      "📬"),
+        "warning":    ("Warning",          "yellow",       "⚠️"),
+        "error":      ("Error",            "red",          "❌"),
+    }
+
     def render_log_block(self, kind: str, content: str) -> None:
         content = content.rstrip()
         if not content:
             return
 
+        title, border, icon = self._LOG_BLOCK_STYLES.get(kind, (None, None, ""))
+
         if not self.use_rich:
-            print(content)
+            prefix = f"[{title or kind}] " if title else ""
+            print(f"{prefix}{content}")
             return
 
-        # Wrap in Text() to prevent Rich from interpreting [] as markup tags.
-        # Tool call IDs like [call_abc123] would otherwise be silently consumed.
         safe = Text(content)
-
-        if kind == "action":
-            self.console.print(Panel(safe, title="Tool Call", border_style="bright_green", width=self.console.width))
-        elif kind == "thinking":
-            self.console.print(Panel(safe, title="Thinking", border_style="bright_blue", width=self.console.width))
-        elif kind == "observation":
-            self.console.print(Panel(safe, title="Observation", border_style="bright_cyan", width=self.console.width))
-        elif kind == "background":
-            self.console.print(Panel(safe, title="Background Update", border_style="magenta", width=self.console.width))
-        elif kind == "warning":
-            self.console.print(Panel(safe, title="Warning", border_style="yellow", width=self.console.width))
-        elif kind == "error":
-            self.console.print(Panel(safe, title="Error", border_style="red", width=self.console.width))
+        if title:
+            self.console.print(Panel(safe, title=title, border_style=border, width=self.console.width))
         else:
-            self.console.print(Text.assemble(("", "dim"), safe))
+            self.console.print(safe)
 
     def render_tools(self, agent) -> None:
         tools = sorted(agent.tool_registry.get_all_tools(), key=lambda item: item.name)
@@ -486,9 +514,7 @@ class CLIUI:
 
     def render_history(self, history: Iterable, limit: Optional[int] = None) -> None:
         all_items = list(history)
-        items = list(all_items)
-        if limit is not None and limit > 0:
-            items = items[-limit:]
+        items = all_items[-limit:] if limit and limit > 0 else all_items
         if not items:
             self.warning("History is empty.")
             return
@@ -546,15 +572,21 @@ class CLICodeAgentMixin:
 
     ui: CLIUI
 
+    # Events that are intentionally suppressed in the CLI.
+    _IGNORED_EVENTS = frozenset({
+        "agent_start",      # Don't echo user input back
+        "step_start",       # Rendered implicitly by tool calls
+        "direct_response",  # Rendered via render_assistant
+        "final_answer",     # Rendered via render_assistant
+        "timeout",          # Rendered by the agent loop itself
+    })
+
     def _reset_todo_turn_tracking(self) -> None:
         self._todo_changed_this_turn = False
         self._todo_mutating_call_ids = set()
         self._todo_mutating_call_without_id = False
 
-    def _todo_changed_in_turn(self) -> bool:
-        return bool(getattr(self, "_todo_changed_this_turn", False))
-
-    def _console(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
+    def _console(self, message: str = "", *, end: str = "\n") -> None:
         if end == "" and hasattr(self, "_streaming_line_buffer"):
             self._streaming_line_buffer += message
             return
@@ -570,22 +602,18 @@ class CLICodeAgentMixin:
             self.ui.print("")
 
     def _render_event(self, event_type: str, payload: dict) -> None:
-        if event_type == "agent_start":
-            self.ui.render_log_block("info", f"🤖 {self.name} processing: {payload.get('input_text', '')}")
-        elif event_type == "step_start":
-            pass
-        elif event_type == "compaction_notice":
+        if event_type in self._IGNORED_EVENTS:
+            return
+
+        if event_type == "compaction_notice":
             self.ui.render_log_block("warning", "[auto-compact triggered]")
         elif event_type == "llm_error":
             self.ui.render_log_block("error", f"LLM call failed: {payload.get('error', '')}")
-        elif event_type == "direct_response":
-            return None
         elif event_type == "builtin_tool":
             tool_name = payload.get("tool_name")
             result_content = str(payload.get("result_content", ""))
             if tool_name == "Thought":
-                content = result_content.removeprefix("Reasoning: ") if result_content.startswith("Reasoning: ") else result_content
-                self.ui.render_log_block("thinking", content)
+                self.ui.render_log_block("thinking", result_content.removeprefix("Reasoning: "))
             elif tool_name != "Finish":
                 self.ui.render_log_block("info", f"{tool_name}: {result_content}")
         elif event_type == "tool_call":
@@ -625,16 +653,12 @@ class CLICodeAgentMixin:
                     is_success = status != "error" and not content.startswith("❌")
                     if is_success:
                         self._todo_changed_this_turn = True
-                        self.ui.refresh_live()
+                        self.ui.render_inline_task_progress(self)
 
                 if tool_call_id and tool_call_id in tracked_ids:
                     tracked_ids.discard(tool_call_id)
                 elif tracked_wo_id:
                     self._todo_mutating_call_without_id = False
-        elif event_type == "final_answer":
-            return None
-        elif event_type == "timeout":
-            pass
         elif event_type == "stream_chunk":
             self._streaming_line_buffer += payload.get("chunk", "")
         elif event_type == "stream_newline":
@@ -652,7 +676,6 @@ class CLICodeAgentMixin:
             self._console(
                 payload.get("message", ""),
                 end=payload.get("end", "\n"),
-                flush=payload.get("flush", False),
             )
         else:
             super()._render_event(event_type, payload)
@@ -772,9 +795,6 @@ def create_agent(args, ui: CLIUI):
     else:
         # New chat starts with fresh tasks instead of stale persisted ones.
         clear_todo_tasks(agent)
-
-    # Always run with unlimited reasoning steps in CLI mode.
-    agent.max_steps = 0
 
     return agent, workspace
 
@@ -944,26 +964,48 @@ def load_session_and_tasks(agent, raw_value: Optional[str], fallback_name: str, 
         return False
 
 
-
-
-def run_agent_turn(agent, prompt: str, ui: CLIUI) -> str:
+def run_agent_turn(
+    agent, prompt: str, ui: CLIUI, input_buffer: InputBuffer | None = None
+) -> str:
     if hasattr(agent, "_reset_todo_turn_tracking"):
         agent._reset_todo_turn_tracking()
 
     start_time = time.time()
 
-    # Start the pinned Live task panel during agent execution.
-    ui.start_live(agent)
-    try:
-        response = agent.run(prompt)
-    finally:
-        ui.stop_live()
+    # Run agent in a background thread so the main thread can collect
+    # buffered user input without blocking.
+    result_holder: list[str | None] = [None]
+    error_holder: list[BaseException | None] = [None]
 
-    # Always render final task status (static) after the turn.
+    def _agent_work():
+        try:
+            result_holder[0] = agent.run(prompt)
+        except BaseException as exc:
+            error_holder[0] = exc
+
+    thread = threading.Thread(target=_agent_work, daemon=True)
+    thread.start()
+
+    if input_buffer is not None and sys.stdin.isatty():
+        _collect_buffered_input(thread, input_buffer, ui)
+    else:
+        thread.join()
+
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+    response = result_holder[0] or ""
+
+    # Render final task status (static) after the turn.
     ui.render_task_status(agent)
-    ui.render_assistant(response or "")
+
+    # If all tasks are now completed, clear them so they won't show again.
+    if ui.all_tasks_completed(agent):
+        clear_todo_tasks(agent)
+
+    ui.render_assistant(response)
     ui.render_summary(time.time() - start_time, agent=agent)
-    return response or ""
+    return response
 
 
 def print_help(ui: CLIUI) -> None:
@@ -1017,7 +1059,7 @@ def build_prompt_reader(history_file: Path):
         _PASTE_THRESHOLD = 0.15  # 150 ms
         _last_text_change = [0.0]
 
-        def _on_text_changed(buf):
+        def _on_text_changed(_buf):
             _last_text_change[0] = time.monotonic()
 
         bindings = KeyBindings()
@@ -1085,11 +1127,151 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
     history_file.parent.mkdir(parents=True, exist_ok=True)
     read_prompt = build_prompt_reader(history_file)
 
+    input_buffer = InputBuffer()
+
+    # -- Command handlers --
+
+    def _cmd_help(raw, lowered):
+        print_help(ui)
+
+    def _cmd_info(raw, lowered):
+        show_runtime_info(agent, workspace, ui)
+
+    def _cmd_tools(raw, lowered):
+        ui.render_tools(agent)
+
+    def _cmd_pwd(raw, lowered):
+        ui.info(f"Current working directory: {getattr(agent, 'working_dir', workspace)}")
+
+    def _cmd_cd(raw, lowered):
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            ui.warning("Usage: /cd <path>")
+            return
+        try:
+            requested = Path(parts[1].strip()).expanduser()
+            current_dir = Path(getattr(agent, "working_dir", workspace))
+            resolved = requested.resolve() if requested.is_absolute() else (current_dir / requested).resolve()
+            agent.set_working_dir(str(resolved))
+            ui.success(f"Working directory updated: {agent.working_dir}")
+        except Exception as exc:
+            ui.error(f"cd failed: {exc}")
+
+    def _cmd_history(raw, lowered):
+        parts = raw.split(maxsplit=1)
+        limit = None
+        if len(parts) > 1:
+            try:
+                limit = int(parts[1].strip())
+            except ValueError:
+                ui.warning("Usage: /history [n]")
+                return
+        ui.render_history(agent.get_history(), limit=limit)
+
+    def _cmd_log(raw, lowered):
+        if not ui.use_rich:
+            ui.warning("/log requires rich mode (run without --plain).")
+            return
+        text = ui.console.export_text(clear=False)
+        if not text.strip():
+            ui.info("No output recorded yet.")
+            return
+        pager = shutil.which("less") or shutil.which("more")
+        if pager:
+            proc = subprocess.Popen(
+                [pager, "-R"] if "less" in pager else [pager],
+                stdin=subprocess.PIPE,
+            )
+            try:
+                proc.communicate(input=text.encode("utf-8", errors="replace"))
+            except BrokenPipeError:
+                pass
+        else:
+            print(text)
+
+    def _cmd_clear(raw, lowered):
+        agent.clear_history()
+        ui.success("History cleared.")
+
+    def _cmd_save(raw, lowered):
+        parts = raw.split(maxsplit=1)
+        name = normalize_session_name(parts[1].strip()) if len(parts) > 1 else normalize_session_name(args.session_name)
+        try:
+            saved_path = agent.save_session(name)
+            maybe_save_task_snapshot(agent, Path(saved_path), ui=ui)
+            ui.success(f"Saved session: {saved_path}")
+        except Exception as exc:
+            ui.error(f"Save failed: {exc}")
+
+    def _cmd_load(raw, lowered):
+        parts = raw.split(maxsplit=1)
+        load_session_and_tasks(
+            agent,
+            parts[1].strip() if len(parts) > 1 else None,
+            args.session_name,
+            ui,
+        )
+
+    def _cmd_sessions(raw, lowered):
+        if not getattr(agent, "session_store", None):
+            ui.error("Session persistence is not enabled.")
+            return
+        try:
+            ui.render_sessions(agent.session_store.list_sessions())
+        except Exception as exc:
+            ui.error(f"Failed to list sessions: {exc}")
+
+    def _cmd_compact(raw, lowered):
+        parts = raw.split(maxsplit=1)
+        focus = parts[1].strip() if len(parts) > 1 else None
+        try:
+            result = agent.compact(focus=focus)
+            ui.success(result)
+        except Exception as exc:
+            ui.error(f"Compact failed: {exc}")
+
+    # Exact-match commands (lowered == key)
+    _exact_cmds = {
+        "/help": _cmd_help,
+        "/info": _cmd_info,
+        "/model": _cmd_info,
+        "/tools": _cmd_tools,
+        "/pwd": _cmd_pwd,
+        "/log": _cmd_log,
+        "/clear": _cmd_clear,
+        "/sessions": _cmd_sessions,
+    }
+
+    # Prefix-match commands (lowered.startswith(key))
+    _prefix_cmds = [
+        ("/cd", _cmd_cd),
+        ("/history", _cmd_history),
+        ("/save", _cmd_save),
+        ("/load", _cmd_load),
+        ("/resume", _cmd_load),
+        ("/compact", _cmd_compact),
+    ]
+
+    def _dispatch_command(raw: str, lowered: str) -> bool:
+        """Try to handle *raw* as a slash command. Returns True if handled."""
+        handler = _exact_cmds.get(lowered)
+        if handler:
+            handler(raw, lowered)
+            return True
+        for prefix, handler in _prefix_cmds:
+            if lowered.startswith(prefix):
+                handler(raw, lowered)
+                return True
+        return False
+
+    # -- Main loop --
+
     ui.render_banner(agent, workspace)
 
     while True:
         try:
-            ui.render_task_status(agent)
+            if ui.has_active_tasks(agent):
+                ui.render_task_status(agent)
             user_input = read_prompt()
         except EOFError:
             ui.print()
@@ -1109,114 +1291,36 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             clear_todo_tasks(agent)
             return 0
 
-        if lowered == "/help":
-            print_help(ui)
-            continue
-        if lowered in {"/info", "/model"}:
-            show_runtime_info(agent, workspace, ui)
-            continue
-        if lowered == "/tools":
-            ui.render_tools(agent)
-            continue
-        if lowered == "/pwd":
-            ui.info(f"Current working directory: {getattr(agent, 'working_dir', workspace)}")
-            continue
-        if lowered.startswith("/cd"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                ui.warning("Usage: /cd <path>")
-                continue
-            new_dir = parts[1].strip()
-            try:
-                requested = Path(new_dir).expanduser()
-                current_dir = Path(getattr(agent, "working_dir", workspace))
-                resolved = requested.resolve() if requested.is_absolute() else (current_dir / requested).resolve()
-                agent.set_working_dir(str(resolved))
-                ui.success(f"Working directory updated: {agent.working_dir}")
-            except Exception as exc:
-                ui.error(f"cd failed: {exc}")
-            continue
-        if lowered.startswith("/history"):
-            parts = user_input.split(maxsplit=1)
-            limit = None
-            if len(parts) > 1:
-                try:
-                    limit = int(parts[1].strip())
-                except ValueError:
-                    ui.warning("Usage: /history [n]")
-                    continue
-            ui.render_history(agent.get_history(), limit=limit)
-            continue
-        if lowered == "/log":
-            if ui.use_rich:
-                text = ui.console.export_text(clear=False)
-                if not text.strip():
-                    ui.info("No output recorded yet.")
-                    continue
-                pager = shutil.which("less") or shutil.which("more")
-                if pager:
-                    proc = subprocess.Popen(
-                        [pager, "-R"] if "less" in pager else [pager],
-                        stdin=subprocess.PIPE,
-                    )
-                    try:
-                        proc.communicate(input=text.encode("utf-8", errors="replace"))
-                    except BrokenPipeError:
-                        pass
-                else:
-                    print(text)
-            else:
-                ui.warning("/log requires rich mode (run without --plain).")
-            continue
-        if lowered == "/clear":
-            agent.clear_history()
-            ui.success("History cleared.")
-            continue
-        if lowered.startswith("/save"):
-            parts = user_input.split(maxsplit=1)
-            session_name = normalize_session_name(parts[1].strip()) if len(parts) > 1 else normalize_session_name(args.session_name)
-            try:
-                saved_path = agent.save_session(session_name)
-                maybe_save_task_snapshot(agent, Path(saved_path), ui=ui)
-                ui.success(f"Saved session: {saved_path}")
-            except Exception as exc:
-                ui.error(f"Save failed: {exc}")
-            continue
-        if lowered.startswith("/load") or lowered.startswith("/resume"):
-            parts = user_input.split(maxsplit=1)
-            load_session_and_tasks(
-                agent,
-                parts[1].strip() if len(parts) > 1 else None,
-                args.session_name,
-                ui,
-            )
-            continue
-        if lowered == "/sessions":
-            if not getattr(agent, "session_store", None):
-                ui.error("Session persistence is not enabled.")
-                continue
-            try:
-                ui.render_sessions(agent.session_store.list_sessions())
-            except Exception as exc:
-                ui.error(f"Failed to list sessions: {exc}")
-            continue
-        if lowered.startswith("/compact"):
-            parts = user_input.split(maxsplit=1)
-            focus = parts[1].strip() if len(parts) > 1 else None
-            try:
-                result = agent.compact(focus=focus)
-                ui.success(result)
-            except Exception as exc:
-                ui.error(f"Compact failed: {exc}")
+        if _dispatch_command(user_input, lowered):
             continue
 
+        # Not a command — send to agent.
         try:
             ui.print()
-            run_agent_turn(agent, user_input, ui)
+            run_agent_turn(agent, user_input, ui, input_buffer=input_buffer)
         except KeyboardInterrupt:
             ui.warning("Interrupted.")
         except Exception as exc:
             ui.error(f"Error: {exc}")
+
+        # Drain any input that was buffered while the agent was running
+        # and auto-send each one as a new turn.
+        while input_buffer.has_pending():
+            buffered = input_buffer.drain()
+            combined = "\n".join(buffered)
+            if not combined.strip():
+                break
+            ui.info(f"[auto-sending buffered input]")
+            try:
+                ui.print()
+                run_agent_turn(agent, combined, ui, input_buffer=input_buffer)
+            except KeyboardInterrupt:
+                ui.warning("Interrupted.")
+                input_buffer.clear()
+                break
+            except Exception as exc:
+                ui.error(f"Error: {exc}")
+                break
 
 
 def main() -> int:

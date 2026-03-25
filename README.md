@@ -323,7 +323,6 @@ Whale Code includes a built-in benchmark suite to evaluate the coding agent on f
 | **HumanEval+** | `data/HEVP/` | 164 | pass@1 | Function-generation tasks with 80× more tests than original HumanEval |
 | **ClassEval** | `data/CLEV/` | 100 | pass@1 | Class-level code generation requiring multi-method implementation |
 | **AIME** | `data/AIME/` | — | accuracy | Math competition problems solved via agent-written Python programs |
-| **SWE-bench Verified** | `data/SWEV/` | 500 | resolve rate | Real GitHub issues requiring multi-file codebase navigation and editing |
 
 > **Note on SWE-bench**: SWE-bench uses a **two-phase evaluation**:
 > 1. **Phase 1 — Agent inference** (`run_swev.sh`): The agent reads the issue, navigates the repo, and produces a patch (git diff). Results are saved as a predictions JSONL file.
@@ -351,10 +350,10 @@ bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**      | 378 | 374 | **98.9%** | 53.62s | 2026-03-22 |
-| **HumanEval+** | 164 | 159 | **96.9%** | 64.29s | 2026-03-22 |
-| **ClassEval**  | 100 | 94  | **94.0%** | 139.5s | 2026-03-22 |
-| **AIME**       | 30  | 24  | **80.0%** | 236.5s | 2026-03-22 |
+| **MBPP+**      | 378 | 375 | **99.2%** | 30.52s | 2026-03-24 |
+| **HumanEval+** | 164 | 159 | **96.9%** | 32.71s | 2026-03-24 |
+| **ClassEval**  | 100 | 94  | **94.0%** | 139.5s | 2026-03-24 |
+| **AIME**       | 30  | 25  | **83.3%** | 171.1s | 2026-03-24 |
 
 ---
 

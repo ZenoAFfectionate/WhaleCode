@@ -1,37 +1,37 @@
-"""工具系统"""
+"""Tool system exports."""
 
 from .base import Tool, ToolParameter, tool_action
 from .registry import ToolRegistry, global_registry
 from .response import ToolResponse, ToolStatus
 from .errors import ToolErrorCode
 
-# 内置工具
+# Built-in tools
 from .builtin.bash import BashTool
 from .builtin.file_tools import ListFilesTool, ReadTool, WriteTool, DeleteTool, EditTool
 from .builtin.glob_tool import GlobTool
 from .builtin.grep_tool import GrepTool
-from .builtin.todowrite_tool import TodoWriteTool, TaskManager
+from .builtin.todowrite_tool import TodoSessionStore, TodoWriteTool
 from .builtin.skill_tool import SkillTool
 from .builtin.ask_user import AskUserTool
 from .builtin.web_tool import WebSearchTool, WebFetchTool
 
-# 子代理机制
+# Sub-agent filtering
 from .tool_filter import ToolFilter, ReadOnlyFilter, FullAccessFilter, CustomFilter
 
 __all__ = [
-    # 基础工具系统
+    # Core tool system
     "Tool",
     "ToolParameter",
     "tool_action",
     "ToolRegistry",
     "global_registry",
 
-    # 工具响应协议
+    # Tool response protocol
     "ToolResponse",
     "ToolStatus",
     "ToolErrorCode",
 
-    # 内置工具
+    # Built-in tools
     "BashTool",
     "ListFilesTool",
     "ReadTool",
@@ -41,13 +41,13 @@ __all__ = [
     "GlobTool",
     "GrepTool",
     "TodoWriteTool",
-    "TaskManager",
+    "TodoSessionStore",
     "SkillTool",
     "AskUserTool",
     "WebSearchTool",
     "WebFetchTool",
 
-    # 子代理机制
+    # Sub-agent filtering
     "ToolFilter",
     "ReadOnlyFilter",
     "FullAccessFilter",

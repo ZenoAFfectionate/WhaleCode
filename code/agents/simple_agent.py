@@ -65,7 +65,7 @@ class SimpleAgent(Agent):
             Final response
         """
         from datetime import datetime
-        from hello_agents.observability import TraceLogger
+        from ..observability import TraceLogger
 
         session_start_time = datetime.now()
 
@@ -266,30 +266,11 @@ class SimpleAgent(Agent):
         return final_response
 
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """Build the message list"""
-        messages = []
-
-        # Add system prompt
-        if self.system_prompt:
-            messages.append({
-                "role": "system",
-                "content": self.system_prompt
-            })
-
-        # Add historical messages
-        for msg in self._history:
-            messages.append({
-                "role": msg.role,
-                "content": msg.content
-            })
-
-        # Add user question
-        messages.append({
-            "role": "user",
-            "content": input_text
-        })
-
-        return messages
+        """Build a model-compatible transcript from persisted history."""
+        return self.history_manager.build_llm_messages(
+            system_prompt=self.system_prompt,
+            latest_user_input=input_text,
+        )
 
     def add_tool(self, tool, auto_expand: bool = True) -> None:
         """
@@ -337,16 +318,7 @@ class SimpleAgent(Agent):
         Yields:
             Agent response chunks
         """
-        # Build the message list
-        messages = []
-        
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        
-        for msg in self._history:
-            messages.append({"role": msg.role, "content": msg.content})
-        
-        messages.append({"role": "user", "content": input_text})
+        messages = self._build_messages(input_text)
         
         # Stream call to LLM
         full_response = ""
@@ -389,16 +361,7 @@ class SimpleAgent(Agent):
         )
 
         try:
-            # Build the message list
-            messages = []
-
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-
-            for msg in self._history:
-                messages.append({"role": msg.role, "content": msg.content})
-
-            messages.append({"role": "user", "content": input_text})
+            messages = self._build_messages(input_text)
 
             # LLM stream call
             full_response = ""

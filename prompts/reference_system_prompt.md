@@ -30,7 +30,7 @@ The agent has access to the following tools (defined in JSON Schema format):
 - **ReadLints** - Read linter errors for files/directories
 
 ### Task Management
-- **TodoWrite** - Create/update structured task lists with statuses (`pending`, `in_progress`, `completed`, `cancelled`)
+- **TodoWrite** - Replace the full session todo list with statuses (`pending`, `in_progress`, `completed`, `cancelled`)
 
 ### External
 - **WebSearch** - Search the web for real-time information
@@ -321,7 +321,7 @@ Avoid phrases like "You're absolutely right" or excessive validation.
 - Mark complete IMMEDIATELY after finishing
 - Only ONE task in_progress at a time
 - Complete current tasks before starting new ones
-- Batch todo updates with other tool calls
+- Replace the full todo list on each TodoWrite call
 ```
 
 ---

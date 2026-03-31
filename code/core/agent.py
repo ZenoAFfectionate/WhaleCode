@@ -1,16 +1,15 @@
 """Agent基类"""
 
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any, Union, TYPE_CHECKING, AsyncGenerator
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, AsyncGenerator
 import asyncio
 from .message import Message
 from .llm import HelloAgentsLLM
 from .config import Config
-from .lifecycle import AgentEvent, EventType, LifecycleHook, ExecutionContext
+from .lifecycle import AgentEvent, EventType, LifecycleHook
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
-    from ..observability.trace_logger import TraceLogger
     from ..tools.tool_filter import ToolFilter
 
 
@@ -19,7 +18,6 @@ class Agent(ABC):
 
     集成能力：
     - HistoryManager: 历史管理与压缩
-    - ObservationTruncator: 工具输出截断
     - TraceLogger: 可观测性（JSONL + HTML）
     - ToolRegistry: 工具管理（可选）
     - SkillLoader: 知识外化（可选）
@@ -46,19 +44,11 @@ class Agent(ABC):
         self.tool_registry = tool_registry
 
         # 新增：上下文工程组件
-        from hello_agents.context.history import HistoryManager
-        from hello_agents.context.truncator import ObservationTruncator
+        from ..context.history import HistoryManager
 
         self.history_manager = HistoryManager(
             min_retain_rounds=self.config.min_retain_rounds,
             compression_threshold=self.config.compression_threshold
-        )
-
-        self.truncator = ObservationTruncator(
-            max_lines=self.config.tool_output_max_lines,
-            max_bytes=self.config.tool_output_max_bytes,
-            truncate_direction=self.config.tool_output_truncate_direction,
-            output_dir=self.config.tool_output_dir
         )
 
         # 新增：Token 计数器（缓存 + 增量计算）
@@ -66,8 +56,12 @@ class Agent(ABC):
         self.token_counter = TokenCounter(model=self.llm.model)
         self._history_token_count = 0  # 缓存历史 Token 数
 
+        # 统一暴露截断器，便于工具层和测试使用相同的上下文能力
+        from ..context.truncator import ObservationTruncator
+        self.truncator = ObservationTruncator()
+
         # 新增：可观测性组件
-        from hello_agents.observability import TraceLogger
+        from ..observability import TraceLogger
 
         self.trace_logger: Optional[TraceLogger] = None
         if self.config.trace_enabled:
@@ -82,13 +76,13 @@ class Agent(ABC):
                 {
                     "agent_name": self.name,
                     "agent_type": self.__class__.__name__,
-                    "config": self.config.dict()
+                    "config": self.config.model_dump() if hasattr(self.config, "model_dump") else self.config.dict()
                 }
             )
 
         # 新增：Skills 知识外化组件
         from pathlib import Path
-        from hello_agents.skills import SkillLoader
+        from ..skills import SkillLoader
 
         self.skill_loader: Optional[SkillLoader] = None
         if self.config.skills_enabled:
@@ -97,7 +91,7 @@ class Agent(ABC):
 
             # 自动注册 SkillTool
             if self.config.skills_auto_register and self.tool_registry:
-                from hello_agents.tools.builtin.skill_tool import SkillTool
+                from ..tools.builtin.skill_tool import SkillTool
                 skill_tool = SkillTool(skill_loader=self.skill_loader)
                 self.tool_registry.register_tool(skill_tool)
 
@@ -109,18 +103,17 @@ class Agent(ABC):
         if self.config.session_enabled:
             self.session_store = SessionStore(session_dir=self.config.session_dir)
 
+        self.session_id = SessionStore.generate_session_id()
+
         # 会话元数据（用于保存）
         self._session_metadata = {
+            "session_id": self.session_id,
             "created_at": datetime.now().isoformat(),
             "total_tokens": 0,
             "total_steps": 0,
             "duration_seconds": 0
         }
         self._start_time = datetime.now()
-
-        # 新增：子代理机制组件
-        if self.config.subagent_enabled and self.tool_registry:
-            self._register_task_tool()
 
         # 新增：TodoWrite 进度管理组件
         if self.config.todowrite_enabled and self.tool_registry:
@@ -328,14 +321,21 @@ class Agent(ABC):
     def _should_compress(self) -> bool:
         """判断是否需要压缩历史
 
-        基于缓存的 Token 数判断（高性能）
-        使用增量计算，避免重复遍历历史
+        优先基于缓存 Token 数判断；同时增加轮次上限兜底，
+        避免在短消息、高上下文窗口场景下历史永远不压缩。
 
         Returns:
             是否需要压缩
         """
         threshold = int(self.config.context_window * self.config.compression_threshold)
-        return self._history_token_count > threshold
+        if self._history_token_count > threshold:
+            return True
+
+        round_limit = getattr(self.config, "max_rounds_before_compression", 0)
+        if round_limit and self.history_manager.estimate_rounds() >= round_limit:
+            return True
+
+        return False
 
     def _compress_history(self):
         """压缩历史
@@ -392,14 +392,11 @@ class Agent(ABC):
         """
         from ..context.compactor import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
 
-        # 1. Extract the history segment to compress
-        boundaries = self.history_manager.find_round_boundaries()
-        if len(boundaries) <= self.config.min_retain_rounds:
+        # 1. Extract the history segment to compress using the shared HistoryManager logic
+        split = self.history_manager.get_compression_split(history)
+        if split is None:
             return self._generate_simple_summary(history)
-
-        # Keep the most recent N rounds, compress the rest
-        keep_from_index = boundaries[-self.config.min_retain_rounds]
-        to_compress = history[:keep_from_index]
+        to_compress, _retained = split
 
         if not to_compress:
             return self._generate_simple_summary(history)
@@ -420,14 +417,17 @@ class Agent(ABC):
                 {"role": "user", "content": summary_prompt}
             ]
 
-            summary = self.llm.invoke(
+            summary_response = self.llm.invoke(
                 messages,
                 temperature=self.config.summary_temperature,
                 max_tokens=min(self.config.summary_max_tokens, 2048)
             )
 
-            return f"""## Archived Session Summary ({len(to_compress)} messages)
-{summary}
+            summary_text = getattr(summary_response, "content", str(summary_response)).strip()
+            if not summary_text:
+                return self._generate_simple_summary(history)
+
+            return f"""{summary_text}
 
 ---
 (Compressed, retaining the most recent {self.config.min_retain_rounds} complete rounds)"""
@@ -535,7 +535,7 @@ class Agent(ABC):
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "输入文本"
+                                "description": "Input text"
                             }
                         },
                         "required": ["input"]
@@ -613,16 +613,59 @@ class Agent(ABC):
 
         return converted
 
-    def _truncate_output(self, tool_name: str, text: str) -> str:
-        """Apply observation truncation if truncator is available.
+    def _format_tool_response_text(self, _tool_name: str, response) -> str:
+        """Render a ToolResponse into the final observation string."""
+        from ..tools.response import ToolStatus
 
-        Uses ``self.truncator`` (initialized from Config) to enforce
-        ``tool_output_max_lines`` / ``tool_output_max_bytes``.
-        """
-        if not hasattr(self, "truncator") or self.truncator is None:
-            return text
-        result = self.truncator.truncate(tool_name=tool_name, output=text)
-        return result.get("preview", text)
+        if response.status == ToolStatus.ERROR:
+            error_code = response.error_info.get("code", "UNKNOWN") if response.error_info else "UNKNOWN"
+            return f"❌ Error [{error_code}]: {response.text}"
+        if response.status == ToolStatus.PARTIAL:
+            return f"⚠️ Partial success: {response.text}"
+        return response.text
+
+    def _prepare_tool_registry_input(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Normalize agent-side tool arguments before registry dispatch."""
+        if not self.tool_registry:
+            return arguments
+
+        if self.tool_registry.get_tool(tool_name):
+            return self._convert_parameter_types(tool_name, arguments)
+
+        if self.tool_registry.get_function(tool_name):
+            return arguments.get("input", "")
+
+        return arguments
+
+    def _execute_tool_response(self, tool_name: str, arguments: Dict[str, Any]):
+        """Execute a tool through ToolRegistry and return the raw ToolResponse."""
+        from ..tools.errors import ToolErrorCode
+        from ..tools.response import ToolResponse
+
+        if not self.tool_registry:
+            return ToolResponse.error(
+                code=ToolErrorCode.INTERNAL_ERROR,
+                message="Tool registry is not configured.",
+                context={"tool_name": tool_name, "input": arguments},
+            )
+
+        payload = self._prepare_tool_registry_input(tool_name, arguments)
+        return self.tool_registry.execute_tool(tool_name, payload)
+
+    async def _aexecute_tool_response(self, tool_name: str, arguments: Dict[str, Any]):
+        """Async variant of _execute_tool_response()."""
+        from ..tools.errors import ToolErrorCode
+        from ..tools.response import ToolResponse
+
+        if not self.tool_registry:
+            return ToolResponse.error(
+                code=ToolErrorCode.INTERNAL_ERROR,
+                message="Tool registry is not configured.",
+                context={"tool_name": tool_name, "input": arguments},
+            )
+
+        payload = self._prepare_tool_registry_input(tool_name, arguments)
+        return await self.tool_registry.aexecute_tool(tool_name, payload)
 
     def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具调用并返回字符串结果
@@ -638,50 +681,33 @@ class Agent(ABC):
         Returns:
             工具执行结果（字符串格式）
         """
-        if not self.tool_registry:
-            return "❌ 错误：未配置工具注册表"
-
-        # 1. 尝试执行 Tool 对象
-        tool = self.tool_registry.get_tool(tool_name)
-        if tool:
-            try:
-                typed_arguments = self._convert_parameter_types(tool_name, arguments)
-                response = tool.run_with_timing(typed_arguments)
-
-                # 根据状态添加前缀
-                from ..tools.response import ToolStatus
-                if response.status == ToolStatus.ERROR:
-                    error_code = response.error_info.get("code", "UNKNOWN") if response.error_info else "UNKNOWN"
-                    return f"❌ 错误 [{error_code}]: {response.text}"
-                elif response.status == ToolStatus.PARTIAL:
-                    return f"⚠️ 部分成功: {response.text}"
-                else:
-                    return self._truncate_output(tool_name, response.text)
-            except Exception as exc:
-                return f"❌ 工具调用失败：{exc}"
-
-        # 2. 尝试执行函数工具
-        func = self.tool_registry.get_function(tool_name)
-        if func:
-            try:
-                input_text = arguments.get("input", "")
-                response = self.tool_registry.execute_tool(tool_name, input_text)
-
-                # 根据状态添加前缀
-                from ..tools.response import ToolStatus
-                if response.status == ToolStatus.ERROR:
-                    error_code = response.error_info.get("code", "UNKNOWN") if response.error_info else "UNKNOWN"
-                    return f"❌ 错误 [{error_code}]: {response.text}"
-                elif response.status == ToolStatus.PARTIAL:
-                    return f"⚠️ 部分成功: {response.text}"
-                else:
-                    return self._truncate_output(tool_name, response.text)
-            except Exception as exc:
-                return f"❌ 工具调用失败：{exc}"
-
-        return f"❌ 错误：未找到工具 '{tool_name}'"
+        response = self._execute_tool_response(tool_name, arguments)
+        return self._format_tool_response_text(tool_name, response)
 
     # ==================== 会话持久化能力 ====================
+
+    def _get_todowrite_tool(self):
+        """Return the registered TodoWrite tool if present."""
+        if not self.tool_registry:
+            return None
+        return self.tool_registry.get_tool("TodoWrite")
+
+    def _capture_todowrite_state(self) -> Optional[Dict[str, Any]]:
+        tool = self._get_todowrite_tool()
+        if not tool or not hasattr(tool, "export_state"):
+            return None
+        return tool.export_state()
+
+    def _restore_todowrite_state(self, todo_state: Optional[Dict[str, Any]]) -> None:
+        tool = self._get_todowrite_tool()
+        if not tool:
+            return
+
+        if hasattr(tool, "bind_session"):
+            tool.bind_session(self.session_id)
+
+        if todo_state is not None and hasattr(tool, "import_state"):
+            tool.import_state(todo_state)
 
     def _auto_save(self):
         """自动保存会话（静默失败）"""
@@ -689,18 +715,21 @@ class Agent(ABC):
             return
 
         try:
+            self._session_metadata["session_id"] = self.session_id
             self.session_store.save(
                 agent_config=self._get_agent_config(),
                 history=self.history_manager.get_history(),
                 tool_schema_hash=self._compute_tool_schema_hash(),
                 read_cache=self._get_read_cache(),
                 metadata=self._session_metadata,
-                session_name="session-auto"
+                session_name="session-auto",
+                session_id=self.session_id,
+                todo_state=self._capture_todowrite_state(),
             )
         except Exception as e:
             # 自动保存失败不影响主流程
             if self.config.debug:
-                print(f"⚠️ 自动保存失败: {e}")
+                print(f"⚠️ Auto-save failed: {e}")
 
     def save_session(self, session_name: str) -> str:
         """手动保存会话
@@ -715,11 +744,12 @@ class Agent(ABC):
             RuntimeError: 会话持久化未启用
         """
         if not self.session_store:
-            raise RuntimeError("会话持久化未启用，请在 Config 中设置 session_enabled=True")
+            raise RuntimeError("Session persistence is not enabled. Set session_enabled=True in Config.")
 
         # 更新元数据
         from datetime import datetime
         self._session_metadata["duration_seconds"] = (datetime.now() - self._start_time).total_seconds()
+        self._session_metadata["session_id"] = self.session_id
 
         filepath = self.session_store.save(
             agent_config=self._get_agent_config(),
@@ -727,7 +757,9 @@ class Agent(ABC):
             tool_schema_hash=self._compute_tool_schema_hash(),
             read_cache=self._get_read_cache(),
             metadata=self._session_metadata,
-            session_name=session_name
+            session_name=session_name,
+            session_id=self.session_id,
+            todo_state=self._capture_todowrite_state(),
         )
 
         return filepath
@@ -744,7 +776,7 @@ class Agent(ABC):
             FileNotFoundError: 文件不存在
         """
         if not self.session_store:
-            raise RuntimeError("会话持久化未启用，请在 Config 中设置 session_enabled=True")
+            raise RuntimeError("Session persistence is not enabled. Set session_enabled=True in Config.")
 
         # 加载会话数据
         session_data = self.session_store.load(filepath)
@@ -758,7 +790,7 @@ class Agent(ABC):
             )
 
             if not config_check["consistent"]:
-                print("⚠️ 环境配置不一致：")
+                print("⚠️ Environment configuration mismatch:")
                 for warning in config_check["warnings"]:
                     print(f"  - {warning}")
 
@@ -769,8 +801,8 @@ class Agent(ABC):
             )
 
             if tool_check["changed"]:
-                print(f"⚠️ 工具定义已变化")
-                print(f"  建议：{tool_check['recommendation']}")
+                print("⚠️ Tool definitions have changed.")
+                print(f"  Recommendation: {tool_check['recommendation']}")
 
         # 恢复历史
         from .message import Message
@@ -780,12 +812,20 @@ class Agent(ABC):
 
         # 恢复元数据
         self._session_metadata = session_data.get("metadata", {})
+        self.session_id = (
+            session_data.get("session_id")
+            or self._session_metadata.get("session_id")
+            or self.session_id
+        )
+        self._session_metadata["session_id"] = self.session_id
 
         # 恢复 Read 工具缓存
         if self.tool_registry and session_data.get("read_cache"):
             self.tool_registry.read_metadata_cache = session_data["read_cache"]
 
-        print(f"✅ 会话已恢复：{session_data.get('session_id', 'unknown')}")
+        self._restore_todowrite_state(session_data.get("todo_state"))
+
+        print(f"✅ Session restored: {self.session_id}")
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """列出所有可用会话
@@ -892,7 +932,6 @@ class Agent(ABC):
                 }
             }
         """
-        from datetime import datetime
         import time
 
         # 1. 保存当前状态
@@ -1116,14 +1155,6 @@ class Agent(ABC):
 
         return "\n".join(summary_parts)
 
-    def _register_task_tool(self):
-        """注册子代理任务分发工具
-
-        Subagent mechanism — currently not active for CodeAgent.
-        Kept as placeholder for future multi-agent work.
-        """
-        pass
-
     def _register_todowrite_tool(self):
         """注册 TodoWriteTool（进度管理工具）
 
@@ -1131,9 +1162,14 @@ class Agent(ABC):
         """
         from ..tools.builtin.todowrite_tool import TodoWriteTool
 
+        if self.tool_registry.get_tool("TodoWrite") is not None:
+            self._restore_todowrite_state(None)
+            return
+
         todo_tool = TodoWriteTool(
             project_root=str(self.working_dir) if hasattr(self, 'working_dir') else ".",
-            persistence_dir=self.config.todowrite_persistence_dir
+            persistence_dir=self.config.todowrite_persistence_dir,
+            session_id=self.session_id,
         )
 
         self.tool_registry.register_tool(todo_tool)

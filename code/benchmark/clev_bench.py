@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import shutil
-import tempfile
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -27,10 +28,10 @@ complete, correct method bodies.
 1. Read `solution.py` — understand the class skeleton: every method signature, \
 docstring, `__init__`, and existing imports.
 2. Implement every method according to its docstring using Edit or Write.
-3. Run `python3 tests.py` via Bash to verify against the test suite.
-4. If tests fail, carefully analyze the error output, fix the code, and re-run \
-`python3 tests.py`. Repeat until all tests pass.
-5. Once all tests pass, call `Finish` with a brief summary.
+3. When ready, call `Finish` to submit your current implementation.
+4. The benchmark runner will execute hidden tests outside the workspace and send \
+back controlled feedback if another revision is needed.
+5. Revise `solution.py` based on that feedback and submit again.
 
 **Rules**
 - You MUST implement every method. Never refuse or say you cannot.
@@ -43,8 +44,7 @@ docstring, `__init__`, and existing imports.
 Read the test name and error message carefully — do not guess blindly.
 - If you have tried the same fix multiple times without progress, reconsider \
 your approach from scratch.
-- The workspace contains only `solution.py` and `tests.py`. There are no other \
-files to read.
+- The workspace contains only `solution.py`. There are no local benchmark tests to run.
 """
 
 _CLEV_SYSTEM_PROMPT = (
@@ -54,12 +54,13 @@ _CLEV_SYSTEM_PROMPT = (
 )
 
 
-_CLEV_TESTS_PY_WRAPPER = """\
-import sys, os, unittest, inspect, re
-sys.path.insert(0, os.environ["_HIDDEN_TEST_DIR"])
+_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
 
-from solution import *
-from _test_data import *
+
+_CLEV_HOST_EVAL_SUFFIX = """\
+import inspect
+import sys
+import unittest
 
 
 def _extract_context(test):
@@ -73,9 +74,16 @@ def _extract_context(test):
             if not s or s.startswith("def ") or s.startswith("self.assert") or s.startswith("#"):
                 continue
             context.append(f"  > {s}")
-        return "\\n".join(context)
+        return "\\n".join(context[:8])
     except Exception:
         return ""
+
+
+def _trim_traceback(tb, max_lines=28):
+    lines = tb.strip().splitlines()
+    if len(lines) <= max_lines:
+        return "\\n".join(lines)
+    return "\\n".join(lines[-max_lines:])
 
 
 if __name__ == "__main__":
@@ -87,29 +95,80 @@ if __name__ == "__main__":
     total = result.testsRun
     failed = len(result.failures)
     errors = len(result.errors)
+    report_budget = 3
+    emitted = 0
 
-    if result.failures:
-        for test, tb in result.failures:
+    for label, bucket in (("FAIL", result.failures), ("ERROR", result.errors)):
+        for test, tb in bucket:
+            if emitted >= report_budget:
+                break
             ctx = _extract_context(test)
-            print(f"[FAIL] {test}")
+            print(f"[{label}] {test}")
             if ctx:
                 print(ctx)
-            print(tb)
+            print(_trim_traceback(tb))
+            emitted += 1
 
-    if result.errors:
-        for test, tb in result.errors:
-            ctx = _extract_context(test)
-            print(f"[ERROR] {test}")
-            if ctx:
-                print(ctx)
-            print(tb)
+    omitted = failed + errors - emitted
+    if omitted > 0:
+        print(f"[{omitted} additional failing tests omitted]")
 
     print(f"{total - failed - errors}/{total} passed")
     if not result.failures and not result.errors:
-        print("All tests passed!")
+        print("All hidden tests passed!")
 
     sys.exit(0 if not result.failures and not result.errors else 1)
 """
+
+
+def _minimal_child_env() -> Dict[str, str]:
+    env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _truncate_feedback(text: str, max_lines: int = 100, max_chars: int = 14000) -> str:
+    if not text:
+        return text
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["[feedback truncated]"]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip() + "\n[feedback truncated]"
+    return clipped
+
+
+def _evaluate_solution(
+    workspace: Path,
+    solution_file: Path,
+    fallback_solution: str,
+    test_code: str,
+    timeout: int,
+) -> tuple[bool, str]:
+    solution_code = solution_file.read_text(encoding="utf-8") if solution_file.exists() else fallback_solution
+    verify_code = (
+        f"{solution_code}\n\n"
+        f"{test_code}\n\n"
+        f"{_CLEV_HOST_EVAL_SUFFIX}\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", verify_code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(workspace),
+            env=_minimal_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"TIMEOUT: hidden evaluation exceeded {timeout}s."
+    except Exception as exc:
+        return False, f"ERROR: host-side evaluation failed: {exc}"
+
+    output = (result.stdout + result.stderr).strip()
+    return result.returncode == 0, output or ("All hidden tests passed!" if result.returncode == 0 else "Hidden evaluation failed.")
 
 
 class ClassEvalBenchmark(BenchmarkRunner):
@@ -127,17 +186,15 @@ class ClassEvalBenchmark(BenchmarkRunner):
 
     benchmark_name = "classeval"
 
+    def __init__(self, *args, max_submission_rounds: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_submission_rounds = max(1, int(max_submission_rounds))
+
     def _get_system_prompt(self) -> str:
         return _CLEV_SYSTEM_PROMPT
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        tasks = []
-        with open(self.data_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    tasks.append(json.loads(line))
-        return tasks
+        return self._load_jsonl_tasks()
 
     def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
@@ -145,84 +202,109 @@ class ClassEvalBenchmark(BenchmarkRunner):
         test_code = task["test"]
         class_name = task["class_name"]
 
-        workspace = Path(tempfile.mkdtemp(prefix=f"clev_{task_id}_"))
-        hidden_dir = Path(tempfile.mkdtemp(prefix=f"clev_{task_id}_hidden_"))
+        workspace = self._make_workspace(f"clev_{task_id}_")
+        agent = None
+        agent_response = ""
+        prompt_history: List[str] = []
+        result: Optional[Dict[str, Any]] = None
         try:
-            # solution.py — the only file the agent needs to edit
             solution_file = workspace / "solution.py"
             solution_file.write_text(skeleton, encoding="utf-8")
 
-            # _test_data.py — stored outside workspace (agent cannot access)
-            (hidden_dir / "_test_data.py").write_text(
-                f"from solution import *\n\n"
-                f"{test_code}\n",
-                encoding="utf-8",
-            )
-
-            # tests.py — lightweight wrapper
-            (workspace / "tests.py").write_text(_CLEV_TESTS_PY_WRAPPER, encoding="utf-8")
-
-            # Set env vars for the hidden dir and PYTHONPATH
-            import os
-            os.environ["_HIDDEN_TEST_DIR"] = str(hidden_dir)
-            os.environ["PYTHONPATH"] = str(workspace)
-
-            # Run the agent
             agent = self._create_agent(workspace)
-            agent_prompt = (
+            initial_prompt = (
                 f"Implement all methods in the class `{class_name}` in `solution.py`.\n\n"
+                f"Submission policy:\n"
+                f"- Hidden tests are evaluated only by the benchmark runner.\n"
+                f"- Do not create your own uncontrolled benchmark loop.\n"
+                f"- Each time you call `Finish`, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
                 f"Steps:\n"
                 f"1. Read `solution.py` to understand the class skeleton — method signatures, "
                 f"docstrings, and `__init__`.\n"
                 f"2. Implement every method according to its docstring. Update `__init__` "
                 f"if you need additional instance attributes.\n"
-                f"3. Run `python3 tests.py` to verify. If tests fail, analyze the error, "
-                f"fix your code, and re-run until all tests pass.\n"
-                f"4. Call `Finish` when done.\n\n"
+                f"3. Perform lightweight self-checks if useful, but do not rely on local benchmark tests.\n"
+                f"4. Call `Finish` when you want a controlled submission.\n\n"
                 f"Important:\n"
                 f"- Do NOT change the class name, method signatures, or docstrings.\n"
                 f"- Pay attention to the docstring examples — they reveal expected behavior.\n"
-                f"- Only `solution.py` and `tests.py` exist in the workspace.\n"
+                f"- The workspace contains only `solution.py`.\n"
             )
 
             start = time.time()
-            try:
-                agent_response = agent.run(agent_prompt)
-            except Exception as exc:
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "error": f"Agent error: {exc}",
-                    "agent_response": "",
-                    "elapsed_s": round(time.time() - start, 2),
-                }
+            agent_response = ""
+            feedback = None
+            passed = False
+            output = ""
+            rounds_used = 0
+
+            for round_idx in range(1, self.max_submission_rounds + 1):
+                rounds_used = round_idx
+                prompt_text = initial_prompt if round_idx == 1 else (
+                    f"Controlled hidden-test feedback for submission round {round_idx - 1}:\n\n"
+                    f"{feedback}\n\n"
+                    f"Revise `solution.py` based on this feedback.\n"
+                    f"- Failing test names are reliable.\n"
+                    f"- The returned context lines are selected from the hidden test body but omit direct assertions.\n"
+                    f"- Tracebacks are truncated to the most relevant portion.\n"
+                    f"When ready, call `Finish` again.\n"
+                )
+                prompt_history.append(prompt_text)
+
+                agent_response, error_result = self._run_agent_prompt(
+                    agent=agent,
+                    task_id=task_id,
+                    prompt_text=prompt_text,
+                    start_time=start,
+                    error_extra={"submission_rounds": round_idx},
+                )
+                if error_result is not None:
+                    result = error_result
+                    return result
+
+                if not solution_file.exists():
+                    result = self._missing_output_result(
+                        task_id,
+                        path_label="solution.py",
+                        start_time=start,
+                        agent_response=agent_response,
+                        extra={"submission_rounds": round_idx},
+                    )
+                    return result
+
+                passed, output = _evaluate_solution(
+                    workspace=workspace,
+                    solution_file=solution_file,
+                    fallback_solution=skeleton,
+                    test_code=test_code,
+                    timeout=self.timeout,
+                )
+                if passed:
+                    break
+                feedback = _truncate_feedback(output)
+
             elapsed = round(time.time() - start, 2)
 
-            # Read the (possibly modified) solution
-            solution_code = solution_file.read_text(encoding="utf-8") if solution_file.exists() else skeleton
-
-            # Build the verification script (independent of agent)
-            verify_code = (
-                f"{solution_code}\n\n"
-                f"{test_code}\n\n"
-                f"if __name__ == '__main__':\n"
-                f"    unittest.main()\n"
+            result = self._build_result(
+                task_id,
+                passed=passed,
+                error=output if not passed else None,
+                agent_response=agent_response,
+                elapsed_s=elapsed,
+                extra={"submission_rounds": rounds_used},
             )
-            verify_script = workspace / "verify.py"
-            verify_script.write_text(verify_code, encoding="utf-8")
-
-            passed, output = self._run_script_in_sandbox(verify_script, cwd=workspace)
-
-            return {
-                "task_id": task_id,
-                "passed": passed,
-                "error": output if not passed else None,
-                "agent_response": (agent_response or "")[:500],
-                "elapsed_s": elapsed,
-            }
+            return result
         finally:
+            self._save_task_trajectory(
+                task=task,
+                workspace=workspace,
+                agent=agent,
+                prompt_texts=prompt_history,
+                result=result,
+                artifact_paths=["solution.py"],
+                extra={"class_name": class_name},
+            )
             shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(hidden_dir, ignore_errors=True)
 
 
 def main():
@@ -234,28 +316,23 @@ def main():
         default=str(_PROJECT_ROOT / "data" / "CLEV" / "test.jsonl"),
         help="Path to ClassEval JSONL file",
     )
-    parser.add_argument("--output-dir", default=str(_PROJECT_ROOT / "data" / "_results"))
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=64)
-    parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
-    parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
-    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
-    parser.add_argument("--dry-run", action="store_true")
+    BenchmarkRunner.add_shared_run_args(
+        parser,
+        default_temperature=1.0,
+        default_max_steps=64,
+        default_timeout=120,
+    )
+    parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = ClassEvalBenchmark(
         data_path=args.data_path,
         output_dir=args.output_dir,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
         temperature=args.temperature,
         max_steps=args.max_steps,
+        max_submission_rounds=args.max_submission_rounds,
         timeout=args.timeout,
+        trajectory_dir=args.trajectory_dir,
     )
 
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)

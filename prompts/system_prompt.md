@@ -51,7 +51,7 @@ The agent has access to the following tools (parameters defined in JSON Schema a
 - **Bash** - Execute non-interactive shell commands with `command`, `working_directory`, `block_until_ms`, and `description`
 
 ### Planning & Progress
-- **TodoWrite** - Lightweight declarative progress tracking with single-thread enforcement
+- **TodoWrite** - Session-scoped replace-all todo planning with single in-progress enforcement
 
 ### User Interaction
 - **AskUser** - Ask the user a clarifying question and wait for an answer
@@ -172,6 +172,7 @@ Rules:
 - Mark complete IMMEDIATELY after finishing
 - Only ONE task in_progress at a time
 - Complete current tasks before starting new ones
+- Replace the entire todo list each time; never send partial patches
 - Do NOT create generic placeholder tasks like "Setup project", "Write code", or "Write tests".
 - Task subjects must be specific to the user's actual request and repository context.
 ```

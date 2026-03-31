@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ..context.compactor import (
+    COMPACTION_ACKNOWLEDGEMENT,
+    COMPACTION_PREFIX,
+    COMPACTION_SUMMARY_HEADING,
+)
 from ..core.config import Config
 from ..core.llm import HelloAgentsLLM
-from ..core.message import Message
 from ..observability.trace_logger import TraceLogger
 from ..tools.registry import ToolRegistry
 from .react_agent import ReActAgent
@@ -55,6 +58,9 @@ class CodeAgent(ReActAgent):
         self._trace_enabled = bool(effective_config.trace_enabled)
         effective_config.trace_enabled = False
         effective_config.subagent_enabled = False
+        effective_config.todowrite_enabled = bool(
+            register_default_tools and enable_task_tool and effective_config.todowrite_enabled
+        )
 
         registry = tool_registry or ToolRegistry()
 
@@ -82,7 +88,6 @@ class CodeAgent(ReActAgent):
         from ..tools.builtin.file_tools import DeleteTool, EditTool, ListFilesTool, ReadTool, WriteTool
         from ..tools.builtin.glob_tool import GlobTool
         from ..tools.builtin.grep_tool import GrepTool
-        from ..tools.builtin.todowrite_tool import TodoWriteTool
         from ..tools.builtin.web_tool import WebSearchTool, WebFetchTool
 
         self.tool_registry.register_tool(
@@ -130,16 +135,17 @@ class CodeAgent(ReActAgent):
             BashTool(project_root=str(self.project_root), working_dir=str(self.working_dir))
         )
         self.tool_registry.register_tool(AskUserTool(interactive=self.interactive))
-        self.tool_registry.register_tool(WebSearchTool())
-        self.tool_registry.register_tool(WebFetchTool())
 
-        if enable_task_tool:
+        if WebSearchTool.is_enabled_by_default():
             self.tool_registry.register_tool(
-                TodoWriteTool(
-                    project_root=str(self.project_root),
-                    persistence_dir="memory/tasks",
-                )
+                WebSearchTool(project_root=str(self.project_root))
             )
+        if WebFetchTool.is_enabled_by_default():
+            self.tool_registry.register_tool(
+                WebFetchTool(project_root=str(self.project_root))
+            )
+        if enable_task_tool and self.config.todowrite_enabled and self.tool_registry.get_tool("TodoWrite") is None:
+            self._register_todowrite_tool()
 
     def set_working_dir(self, working_dir: str) -> None:
         """Update the agent and file tools to a new working directory."""
@@ -154,8 +160,9 @@ class CodeAgent(ReActAgent):
             if hasattr(tool, "working_dir"):
                 tool.working_dir = new_working_dir
 
-    def _before_model_call(self, messages: List[Dict[str, object]], current_step: int) -> None:
-        super()._before_model_call(messages, current_step)
+    def _parallel_user_tool_execution_enabled(self) -> bool:
+        """CodeAgent uses the shared concurrent tool executor in sync run()."""
+        return True
 
     # ------------------------------------------------------------------
     # Context compaction (public API)
@@ -173,7 +180,7 @@ class CodeAgent(ReActAgent):
         Returns:
             Status message.
         """
-        messages = self._build_messages_from_history()
+        messages = self._build_workspace_messages()
         if not messages:
             return "Nothing to compact."
 
@@ -189,13 +196,9 @@ class CodeAgent(ReActAgent):
             f"(saved {before_tokens - after_tokens})"
         )
 
-    def _build_messages_from_history(self) -> List[Dict]:
-        """Reconstruct an OpenAI-format message list from HistoryManager.
-
-        Mirrors _build_messages: single system message at position 0,
-        summaries and system history entries use user role.
-        """
-        messages: List[Dict] = []
+    def _build_workspace_messages(self, input_text: Optional[str] = None) -> List[Dict[str, str]]:
+        """Build a single-system-message transcript with optional new user input."""
+        messages: List[Dict[str, str]] = []
 
         system_parts: List[str] = []
         if self.system_prompt:
@@ -232,6 +235,9 @@ class CodeAgent(ReActAgent):
                     }
                 )
 
+        if input_text is not None:
+            messages.append({"role": "user", "content": input_text})
+
         return messages
 
     def _replace_history_from_messages(self, messages: List[Dict]) -> None:
@@ -244,19 +250,31 @@ class CodeAgent(ReActAgent):
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            # Map system summary back to summary role
-            if role == "system" and content.startswith("[Context compacted"):
+            if role == "system":
+                continue
+            if role == "assistant" and content == COMPACTION_ACKNOWLEDGEMENT:
+                continue
+            if role == "user" and isinstance(content, str) and content.startswith(COMPACTION_PREFIX):
+                content = self._extract_compaction_summary(content)
                 role = "summary"
-            elif role == "system":
-                continue  # skip system prompts (reconstructed on each turn)
 
-            if role in {"user", "assistant", "summary"}:
-                m = Message(content, role)
-                self.history_manager.append(m)
-                self._history_token_count += self.token_counter.count_message(m)
+            if role not in {"user", "assistant", "summary"}:
+                continue
+
+            message = Message(content, role)
+            self.history_manager.append(message)
+            self._history_token_count += self.token_counter.count_message(message)
+
+    @staticmethod
+    def _extract_compaction_summary(content: str) -> str:
+        """Strip compaction wrappers and keep only the durable summary text."""
+        if COMPACTION_SUMMARY_HEADING not in content:
+            return content
+        _, _, summary = content.partition(COMPACTION_SUMMARY_HEADING)
+        return summary.lstrip("\n").strip()
 
     def run(self, input_text: str, **kwargs) -> str:
-        """Run with async path for parallel tool execution."""
+        """Run with the shared ReActAgent contract and CodeAgent tracing metadata."""
         self.trace_logger = None
 
         if self._trace_enabled:
@@ -276,8 +294,18 @@ class CodeAgent(ReActAgent):
             )
 
         try:
-            result = asyncio.run(self._arun_impl(input_text, **kwargs))
-            return result
+            return super().run(input_text, **kwargs)
+        except KeyboardInterrupt:
+            if self.trace_logger and not self.trace_logger.jsonl_file.closed:
+                try:
+                    self.trace_logger.log_event(
+                        "session_end",
+                        {"status": "interrupted", "message": "run aborted by interruption"},
+                    )
+                    self.trace_logger.finalize()
+                except Exception:
+                    pass
+            raise
         except Exception:
             if self.trace_logger and not self.trace_logger.jsonl_file.closed:
                 try:
@@ -292,10 +320,6 @@ class CodeAgent(ReActAgent):
         finally:
             self.trace_logger = None
 
-    async def _arun_impl(self, input_text: str, **kwargs) -> str:
-        """Internal async implementation that delegates to ReActAgent.arun()."""
-        return await ReActAgent.arun(self, input_text, **kwargs)
-
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
         """Build messages with workspace context and preserved conversation history.
 
@@ -303,50 +327,7 @@ class CodeAgent(ReActAgent):
         position 0 so that models whose chat template forbids mid-conversation
         system messages (e.g. Qwen served via vLLM) work correctly.
         """
-        messages: List[Dict[str, str]] = []
-
-        # --- single system message (merge prompt + workspace info) ---
-        system_parts: List[str] = []
-        if self.system_prompt:
-            system_parts.append(self.system_prompt)
-        system_parts.append(
-            f"Workspace root: {self.project_root}\n"
-            f"Current working directory: {self.working_dir}\n"
-            "All file paths must stay within the workspace root."
-        )
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-
-        # --- conversation history ---
-        for message in self.get_history():
-            if message.role == "summary":
-                # Summaries are injected as user messages to avoid
-                # system messages appearing after non-system messages.
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[Conversation summary]\n{message.content}",
-                    }
-                )
-            elif message.role == "system":
-                # Historic system notes -> user role for compatibility
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[System note]\n{message.content}",
-                    }
-                )
-            elif message.role in {"user", "assistant"}:
-                messages.append({"role": message.role, "content": message.content})
-            elif message.role == "tool":
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Previous tool result:\n{message.content}",
-                    }
-                )
-
-        messages.append({"role": "user", "content": input_text})
-        return messages
+        return self._build_workspace_messages(input_text)
 
     def _create_subagent(self, agent_type: str = "code") -> "CodeAgent":
         """Create a fresh sub-agent with isolated tool state."""

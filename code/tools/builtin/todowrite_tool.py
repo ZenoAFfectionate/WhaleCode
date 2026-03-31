@@ -1,164 +1,27 @@
-"""TodoWrite — Unified task management tool.
+"""TodoWrite - session-scoped planning state with replace-all updates.
 
-Single tool that handles create, update, list, get, and bulk_create via an
-``action`` parameter.  Persists tasks as JSON files with dependency graph
-(blockedBy / blocks) so state survives context compression and restarts.
-
-Statuses: pending → in_progress → completed | cancelled
+The tool exposes a single `todos` parameter. Each invocation replaces the
+entire todo list for the current session and persists it atomically as one JSON
+snapshot. This keeps the LLM interface simple while preserving state across
+context compaction, auto-save, and explicit session restore.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from ..base import Tool, ToolParameter
-from ..response import ToolResponse
 from ..errors import ToolErrorCode
+from ..response import ToolResponse
 from ._code_utils import atomic_write
 
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
-_LEGACY_PLACEHOLDER_SUBJECTS = {"Setup project", "Write code", "Write tests"}
-
-
-class TaskManager:
-    """Persistent task graph stored as one JSON file per task."""
-
-    def __init__(self, tasks_dir: Path):
-        self.dir = Path(tasks_dir).expanduser().resolve()
-        self.dir.mkdir(parents=True, exist_ok=True)
-
-    def create(self, subject: str, description: str = "") -> dict:
-        task = {
-            "id": self._next_id(),
-            "subject": subject,
-            "description": description,
-            "status": "pending",
-            "blockedBy": [],
-            "blocks": [],
-            "owner": "",
-        }
-        self._save(task)
-        return task
-
-    def get(self, task_id: int) -> dict:
-        return self._load(task_id)
-
-    def update(
-        self,
-        task_id: int,
-        *,
-        status: Optional[str] = None,
-        subject: Optional[str] = None,
-        description: Optional[str] = None,
-        owner: Optional[str] = None,
-        add_blocked_by: Optional[List[int]] = None,
-        add_blocks: Optional[List[int]] = None,
-    ) -> dict:
-        task = self._load(task_id)
-
-        if subject is not None:
-            task["subject"] = subject
-        if description is not None:
-            task["description"] = description
-        if owner is not None:
-            task["owner"] = owner
-
-        if status is not None:
-            if status not in VALID_STATUSES:
-                raise ValueError(
-                    f"Invalid status '{status}'. Allowed: {', '.join(sorted(VALID_STATUSES))}"
-                )
-            task["status"] = status
-
-        # Dependency edges (bidirectional)
-        for dep_id in add_blocked_by or []:
-            self._load(dep_id)  # ensure exists
-            if dep_id not in task["blockedBy"]:
-                task["blockedBy"].append(dep_id)
-            dep = self._load(dep_id)
-            if task_id not in dep["blocks"]:
-                dep["blocks"].append(task_id)
-                self._save(dep)
-
-        for blocked_id in add_blocks or []:
-            self._load(blocked_id)  # ensure exists
-            if blocked_id not in task["blocks"]:
-                task["blocks"].append(blocked_id)
-            blocked = self._load(blocked_id)
-            if task_id not in blocked["blockedBy"]:
-                blocked["blockedBy"].append(task_id)
-                self._save(blocked)
-
-        self._save(task)
-
-        if status == "completed":
-            self._clear_dependency(task_id)
-            task = self._load(task_id)
-
-        return task
-
-    def list_all(self, status: Optional[str] = None) -> List[dict]:
-        tasks = []
-        for f in sorted(self.dir.glob("task_*.json")):
-            task = json.loads(f.read_text(encoding="utf-8"))
-            if status and status != "all" and task["status"] != status:
-                continue
-            tasks.append(task)
-        return tasks
-
-    def delete(self, task_id: int) -> dict:
-        """Delete a task and remove it from all dependency lists."""
-        task = self._load(task_id)
-        # Remove from other tasks' blockedBy/blocks
-        for f in self.dir.glob("task_*.json"):
-            other = json.loads(f.read_text(encoding="utf-8"))
-            changed = False
-            if task_id in other.get("blockedBy", []):
-                other["blockedBy"].remove(task_id)
-                changed = True
-            if task_id in other.get("blocks", []):
-                other["blocks"].remove(task_id)
-                changed = True
-            if changed:
-                self._save(other)
-        # Remove task file
-        path = self.dir / f"task_{task_id}.json"
-        path.unlink(missing_ok=True)
-        return task
-
-
-    def _load(self, task_id: int) -> dict:
-        path = self.dir / f"task_{task_id}.json"
-        if not path.exists():
-            raise ValueError(f"Task {task_id} not found")
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    def _save(self, task: dict) -> None:
-        atomic_write(
-            self.dir / f"task_{task['id']}.json",
-            json.dumps(task, ensure_ascii=False, indent=2) + "\n",
-        )
-
-    def _next_id(self) -> int:
-        ids = []
-        for f in self.dir.glob("task_*.json"):
-            try:
-                ids.append(int(f.stem.split("_")[1]))
-            except (IndexError, ValueError):
-                continue
-        return (max(ids) + 1) if ids else 1
-
-    def _clear_dependency(self, completed_id: int) -> None:
-        """Remove completed_id from all other tasks' blockedBy lists."""
-        for f in self.dir.glob("task_*.json"):
-            task = json.loads(f.read_text(encoding="utf-8"))
-            if completed_id in task.get("blockedBy", []):
-                task["blockedBy"].remove(completed_id)
-                self._save(task)
-
-
+VALID_PRIORITIES = {"high", "medium", "low"}
+TERMINAL_STATUSES = {"completed", "cancelled"}
 
 _STATUS_MARKER = {
     "pending": "[ ]",
@@ -167,327 +30,275 @@ _STATUS_MARKER = {
     "cancelled": "[-]",
 }
 
+_LEGACY_TOP_LEVEL_KEYS = {
+    "action",
+    "task_id",
+    "subject",
+    "description",
+    "status",
+    "blocked_by",
+    "blocks",
+    "owner",
+    "tasks",
+    "summary",
+}
 
-def _format_task_list(tasks: List[dict]) -> str:
-    if not tasks:
-        return "No tasks."
-    lines = []
-    for t in tasks:
-        blocked = f"  blocked_by={t['blockedBy']}" if t.get("blockedBy") else ""
-        blocks = f"  blocks={t['blocks']}" if t.get("blocks") else ""
-        owner = f"  owner={t['owner']}" if t.get("owner") else ""
-        lines.append(
-            f"{_STATUS_MARKER.get(t['status'], '[?]')} #{t['id']} {t['subject']}"
-            f"{blocked}{blocks}{owner}"
-        )
+
+class TodoValidationError(ValueError):
+    """Raised when a todo snapshot is malformed or violates state rules."""
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _compute_stats(todos: List[dict]) -> Dict[str, int]:
+    stats = {status: 0 for status in sorted(VALID_STATUSES)}
+    for todo in todos:
+        stats[todo["status"]] += 1
+    stats["total"] = len(todos)
+    return stats
+
+
+def _format_todos(todos: List[dict]) -> str:
+    if not todos:
+        return "No todos."
+
+    lines: List[str] = []
+    for todo in todos:
+        priority = f" [{todo['priority']}]" if todo["priority"] != "medium" else ""
+        lines.append(f"{_STATUS_MARKER[todo['status']]} {todo['content']}{priority}")
     return "\n".join(lines)
 
 
-def _format_task_detail(task: dict) -> str:
-    return (
-        f"Task #{task['id']}: {task['subject']}\n"
-        f"  Status: {task['status']}\n"
-        f"  Description: {task.get('description') or '[empty]'}\n"
-        f"  Blocked by: {task['blockedBy'] or 'none'}\n"
-        f"  Blocks: {task['blocks'] or 'none'}\n"
-        f"  Owner: {task.get('owner') or '[unassigned]'}"
-    )
+def _format_recap(todos: List[dict]) -> str:
+    stats = _compute_stats(todos)
+    if stats["total"] == 0:
+        return "Todos [0/0 completed]"
 
+    completed = stats["completed"]
+    total = stats["total"]
+    parts = [f"Todos [{completed}/{total} completed]"]
 
-def _format_recap(tasks: List[dict]) -> str:
-    """One-line progress summary."""
-    total = len(tasks)
-    if total == 0:
-        return "📋 [0/0] No tasks"
-    completed = sum(1 for t in tasks if t["status"] == "completed")
-    in_progress = [t for t in tasks if t["status"] == "in_progress"]
-    pending = [t for t in tasks if t["status"] == "pending" and not t.get("blockedBy")]
-
-    if completed == total:
-        return f"✅ [{completed}/{total}] All tasks completed!"
-
-    parts = [f"📋 [{completed}/{total}]"]
+    in_progress = [todo["content"] for todo in todos if todo["status"] == "in_progress"]
     if in_progress:
-        parts.append(f"In progress: #{in_progress[0]['id']} {in_progress[0]['subject']}")
-    if pending:
-        names = [f"#{t['id']}" for t in pending[:3]]
-        parts.append(f"Ready: {', '.join(names)}")
+        parts.append(f"In progress: {in_progress[0]}")
+
+    ready = [todo["content"] for todo in todos if todo["status"] == "pending"]
+    if ready:
+        parts.append(f"Pending: {', '.join(ready[:3])}")
+
     return " | ".join(parts)
 
 
+class TodoSessionStore:
+    """Atomically persisted todo snapshots keyed by session id."""
+
+    def __init__(self, state_dir: Path):
+        self.dir = Path(state_dir).expanduser().resolve()
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def path_for(self, session_id: str) -> Path:
+        return self.dir / f"session-{session_id}.json"
+
+    def load_state(self, session_id: str) -> Dict[str, Any]:
+        path = self.path_for(session_id)
+        if not path.exists():
+            return self._empty_state(session_id)
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        todos = self._normalize_todos(data.get("todos", []))
+        updated_at = data.get("updated_at")
+        return {
+            "session_id": session_id,
+            "updated_at": updated_at,
+            "todos": todos,
+            "stats": _compute_stats(todos),
+        }
+
+    def replace_all(self, session_id: str, todos: List[dict]) -> Dict[str, Any]:
+        previous = self.load_state(session_id)["todos"]
+        normalized = self._normalize_todos(todos, previous_todos=previous)
+        state = {
+            "session_id": session_id,
+            "updated_at": _utcnow_iso(),
+            "todos": normalized,
+            "stats": _compute_stats(normalized),
+        }
+        atomic_write(self.path_for(session_id), json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        return state
+
+    def import_state(self, session_id: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        todos = [] if not state else state.get("todos", [])
+        return self.replace_all(session_id, todos)
+
+    @staticmethod
+    def _empty_state(session_id: str) -> Dict[str, Any]:
+        todos: List[dict] = []
+        return {
+            "session_id": session_id,
+            "updated_at": None,
+            "todos": todos,
+            "stats": _compute_stats(todos),
+        }
+
+    @staticmethod
+    def _normalize_todos(
+        todos: Any,
+        *,
+        previous_todos: Optional[List[dict]] = None,
+    ) -> List[dict]:
+        if not isinstance(todos, list):
+            raise TodoValidationError("todos must be an array of todo objects")
+
+        normalized: List[dict] = []
+        seen_contents: set[str] = set()
+        in_progress_count = 0
+        previous_status = {todo["content"]: todo["status"] for todo in previous_todos or []}
+
+        for index, raw in enumerate(todos):
+            if not isinstance(raw, dict):
+                raise TodoValidationError(f"todos[{index}] must be an object")
+
+            content = str(raw.get("content") or "").strip()
+            if not content:
+                raise TodoValidationError(f"todos[{index}].content is required")
+            if content in seen_contents:
+                raise TodoValidationError(f"Duplicate todo content is not allowed: {content!r}")
+
+            status = str(raw.get("status") or "").strip().lower()
+            if status not in VALID_STATUSES:
+                allowed = ", ".join(sorted(VALID_STATUSES))
+                raise TodoValidationError(f"Invalid status for {content!r}: {status!r}. Allowed: {allowed}")
+
+            priority = str(raw.get("priority", "medium") or "medium").strip().lower()
+            if priority not in VALID_PRIORITIES:
+                allowed = ", ".join(sorted(VALID_PRIORITIES))
+                raise TodoValidationError(f"Invalid priority for {content!r}: {priority!r}. Allowed: {allowed}")
+
+            previous = previous_status.get(content)
+            if previous in TERMINAL_STATUSES and status != previous:
+                raise TodoValidationError(
+                    f"Todo {content!r} is already {previous} and cannot transition back to {status}"
+                )
+
+            if status == "in_progress":
+                in_progress_count += 1
+
+            seen_contents.add(content)
+            normalized.append(
+                {
+                    "content": content,
+                    "status": status,
+                    "priority": priority,
+                }
+            )
+
+        if in_progress_count > 1:
+            raise TodoValidationError("Only one todo may be in_progress at a time")
+
+        return normalized
 
 
 class TodoWriteTool(Tool):
-    """Unified task management tool with dependency graph.
-
-    Actions: create, update, list, get, bulk_create, delete
-    Statuses: pending, in_progress, completed, cancelled
-    """
+    """Replace the entire todo list for the current session."""
 
     def __init__(
         self,
         project_root: str = ".",
-        persistence_dir: str = "memory/tasks",
+        persistence_dir: str = "memory/todos",
+        session_id: Optional[str] = None,
     ):
         super().__init__(
             name="TodoWrite",
             description=(
-                "Manage tasks with dependencies. Single tool for all task operations.\n\n"
-                "Actions:\n"
-                "- create: Create a task. Params: subject (required), description, blocked_by\n"
-                "- update: Update a task. Params: task_id (required), status, subject, description, owner, blocked_by, blocks\n"
-                "- list: List tasks. Params: status (optional filter: all/pending/in_progress/completed/cancelled)\n"
-                "- get: Get task details. Params: task_id (required)\n"
-                "- bulk_create: Create multiple tasks. Params: tasks (array of {subject, description, blocked_by})\n"
-                "- delete: Remove a task. Params: task_id (required)\n\n"
-                "Statuses: pending → in_progress → completed | cancelled\n"
-                "Dependencies: Use blocked_by=[1,2] to declare ordering. "
-                "Completing a task auto-unblocks dependents."
+                "Replace the entire todo list for the current session.\n\n"
+                "Parameters:\n"
+                "- todos: Required array of todo objects. Each object must contain:\n"
+                "  - content: brief task description\n"
+                "  - status: pending, in_progress, completed, or cancelled\n"
+                "  - priority: optional high, medium, or low (defaults to medium)\n\n"
+                "Rules:\n"
+                "- Always send the complete current todo list, not a partial patch.\n"
+                "- Keep at most one todo in_progress.\n"
+                "- Completed/cancelled todos are terminal and cannot be reopened with the same content.\n"
+                "- Legacy action-based parameters are not supported."
             ),
             expandable=False,
         )
         root = Path(project_root).expanduser().resolve()
-        self.task_manager = TaskManager(root / persistence_dir)
-        self._purge_legacy_placeholder_tasks()
+        self.store = TodoSessionStore(root / persistence_dir)
+        self.session_id = session_id or f"local-{uuid4().hex[:8]}"
 
-    def _purge_legacy_placeholder_tasks(self) -> None:
-        """Remove legacy seeded placeholder tasks if they match exact old pattern.
+    def bind_session(self, session_id: str) -> None:
+        self.session_id = session_id
 
-        This is intentionally strict to avoid deleting user-authored tasks.
-        It only removes tasks that look exactly like old boilerplate seeds:
-        - subject in: Setup project / Write code / Write tests
-        - status is pending
-        - no deps (blockedBy/blocks)
-        - no owner
-        - empty description
-        """
-        try:
-            tasks = self.task_manager.list_all()
-            removable = []
-            for task in tasks:
-                subject = str(task.get("subject", "")).strip()
-                if subject not in _LEGACY_PLACEHOLDER_SUBJECTS:
-                    continue
-                if task.get("status") != "pending":
-                    continue
-                if task.get("blockedBy"):
-                    continue
-                if task.get("blocks"):
-                    continue
-                if str(task.get("owner", "")).strip():
-                    continue
-                if str(task.get("description", "")).strip():
-                    continue
-                removable.append(task)
+    def export_state(self) -> Dict[str, Any]:
+        return self.store.load_state(self.session_id)
 
-            for task in sorted(removable, key=lambda item: int(item.get("id", 0)), reverse=True):
-                self.task_manager.delete(int(task["id"]))
-        except Exception:
-            # Non-critical compatibility cleanup; never block tool startup.
-            pass
+    def import_state(self, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        imported = self.store.import_state(self.session_id, state)
+        return imported
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter(
-                name="action",
-                type="string",
-                description="Operation: create, update, list, get, bulk_create, delete",
+                name="todos",
+                type="array",
+                description=(
+                    'The full replacement todo list. Example: [{"content": "Inspect failing tests", '
+                    '"status": "in_progress", "priority": "high"}, {"content": "Apply fix", '
+                    '"status": "pending"}]'
+                ),
                 required=True,
-            ),
-            ToolParameter(
-                name="task_id",
-                type="integer",
-                description="Task ID (for update, get, delete)",
-                required=False,
-            ),
-            ToolParameter(
-                name="subject",
-                type="string",
-                description="Task title (for create, update)",
-                required=False,
-            ),
-            ToolParameter(
-                name="description",
-                type="string",
-                description="Task description (for create, update)",
-                required=False,
-            ),
-            ToolParameter(
-                name="status",
-                type="string",
-                description="Task status: pending, in_progress, completed, cancelled (for update); or filter for list",
-                required=False,
-            ),
-            ToolParameter(
-                name="blocked_by",
-                type="array",
-                description="Task IDs that must complete before this task (for create, update)",
-                required=False,
-            ),
-            ToolParameter(
-                name="blocks",
-                type="array",
-                description="Task IDs this task blocks (for update)",
-                required=False,
-            ),
-            ToolParameter(
-                name="owner",
-                type="string",
-                description="Owner label (for update)",
-                required=False,
-            ),
-            ToolParameter(
-                name="tasks",
-                type="array",
-                description='Array of task objects for bulk_create: [{"subject": "...", "description": "...", "blocked_by": [...]}, ...]',
-                required=False,
-            ),
+            )
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        action = (parameters.get("action") or "").strip().lower()
-
-        dispatch = {
-            "create": self._action_create,
-            "update": self._action_update,
-            "list": self._action_list,
-            "get": self._action_get,
-            "bulk_create": self._action_bulk_create,
-            "delete": self._action_delete,
-        }
-
-        handler = dispatch.get(action)
-        if not handler:
+        legacy_keys = sorted(_LEGACY_TOP_LEVEL_KEYS.intersection(parameters.keys()))
+        if legacy_keys:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message=f"Unknown action '{action}'. Use: {', '.join(sorted(dispatch))}",
+                message=(
+                    "TodoWrite now only accepts the `todos` array. "
+                    f"Legacy parameters are not supported: {', '.join(legacy_keys)}"
+                ),
             )
 
+        todos = parameters.get("todos")
+        if todos is None:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="todos is required",
+            )
+
+        if isinstance(todos, str):
+            try:
+                todos = json.loads(todos)
+            except json.JSONDecodeError as exc:
+                return ToolResponse.error(
+                    code=ToolErrorCode.INVALID_PARAM,
+                    message=f"Invalid todos JSON: {exc}",
+                )
+
         try:
-            return handler(parameters)
-        except ValueError as exc:
-            code = ToolErrorCode.NOT_FOUND if "not found" in str(exc).lower() else ToolErrorCode.INVALID_PARAM
-            return ToolResponse.error(code=code, message=str(exc))
+            state = self.store.replace_all(self.session_id, todos)
+        except TodoValidationError as exc:
+            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message=str(exc))
         except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
                 message=f"TodoWrite failed: {exc}",
             )
 
-
-    def _action_create(self, params: Dict[str, Any]) -> ToolResponse:
-        subject = (params.get("subject") or "").strip()
-        if not subject:
-            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message="subject is required for create")
-
-        description = params.get("description", "")
-        task = self.task_manager.create(subject, description)
-
-        blocked_by = params.get("blocked_by")
-        if blocked_by:
-            task = self.task_manager.update(task["id"], add_blocked_by=self._to_int_list(blocked_by))
-
-        recap = _format_recap(self.task_manager.list_all())
+        text = _format_todos(state["todos"])
+        recap = _format_recap(state["todos"])
         return ToolResponse.success(
-            text=f"Created #{task['id']}: {task['subject']}\n{recap}",
-            data={"task": task},
+            text=f"{text}\n\n{recap}",
+            data={
+                "session_id": state["session_id"],
+                "todos": state["todos"],
+                "stats": state["stats"],
+                "updated_at": state["updated_at"],
+            },
         )
-
-    def _action_update(self, params: Dict[str, Any]) -> ToolResponse:
-        task_id = params.get("task_id")
-        if task_id is None:
-            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message="task_id is required for update")
-
-        task = self.task_manager.update(
-            int(task_id),
-            status=params.get("status"),
-            subject=params.get("subject"),
-            description=params.get("description"),
-            owner=params.get("owner"),
-            add_blocked_by=self._to_int_list(params.get("blocked_by")),
-            add_blocks=self._to_int_list(params.get("blocks")),
-        )
-
-        recap = _format_recap(self.task_manager.list_all())
-        return ToolResponse.success(
-            text=f"Updated #{task['id']}\n{_format_task_detail(task)}\n{recap}",
-            data={"task": task},
-        )
-
-    def _action_list(self, params: Dict[str, Any]) -> ToolResponse:
-        status_filter = params.get("status", "all")
-        if status_filter and status_filter != "all" and status_filter not in VALID_STATUSES:
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"Invalid status filter '{status_filter}'. Use: all, {', '.join(sorted(VALID_STATUSES))}",
-            )
-        tasks = self.task_manager.list_all(status=status_filter)
-        recap = _format_recap(self.task_manager.list_all())
-        return ToolResponse.success(
-            text=f"{_format_task_list(tasks)}\n\n{recap}",
-            data={"tasks": tasks},
-        )
-
-    def _action_get(self, params: Dict[str, Any]) -> ToolResponse:
-        task_id = params.get("task_id")
-        if task_id is None:
-            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message="task_id is required for get")
-        task = self.task_manager.get(int(task_id))
-        return ToolResponse.success(
-            text=_format_task_detail(task),
-            data={"task": task},
-        )
-
-    def _action_bulk_create(self, params: Dict[str, Any]) -> ToolResponse:
-        tasks_data = params.get("tasks", [])
-        if isinstance(tasks_data, str):
-            try:
-                tasks_data = json.loads(tasks_data)
-            except json.JSONDecodeError as e:
-                return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message=f"Invalid tasks JSON: {e}")
-
-        if not isinstance(tasks_data, list) or not tasks_data:
-            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message="tasks must be a non-empty array")
-
-        created = []
-        for item in tasks_data:
-            subject = (item.get("subject") or "").strip()
-            if not subject:
-                continue
-            task = self.task_manager.create(subject, item.get("description", ""))
-            blocked_by = item.get("blocked_by")
-            if blocked_by:
-                task = self.task_manager.update(task["id"], add_blocked_by=self._to_int_list(blocked_by))
-            created.append(task)
-
-        recap = _format_recap(self.task_manager.list_all())
-        names = [f"#{t['id']} {t['subject']}" for t in created]
-        return ToolResponse.success(
-            text=f"Created {len(created)} tasks:\n" + "\n".join(names) + f"\n\n{recap}",
-            data={"tasks": created},
-        )
-
-    def _action_delete(self, params: Dict[str, Any]) -> ToolResponse:
-        task_id = params.get("task_id")
-        if task_id is None:
-            return ToolResponse.error(code=ToolErrorCode.INVALID_PARAM, message="task_id is required for delete")
-        task = self.task_manager.delete(int(task_id))
-        recap = _format_recap(self.task_manager.list_all())
-        return ToolResponse.success(
-            text=f"Deleted #{task['id']}: {task['subject']}\n{recap}",
-            data={"task": task},
-        )
-
-
-    @staticmethod
-    def _to_int_list(value) -> Optional[List[int]]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                return None
-        if isinstance(value, list):
-            return [int(v) for v in value]
-        return None

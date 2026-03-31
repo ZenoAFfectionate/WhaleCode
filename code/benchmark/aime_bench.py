@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +15,45 @@ try:
     from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
 except ImportError:
     from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+
+
+_VALID_AIME_YEARS = {"24", "25", "26"}
+
+
+def _normalize_year(year: Optional[str]) -> Optional[str]:
+    if year is None:
+        return None
+    value = str(year).strip()
+    if len(value) == 4 and value.startswith("20"):
+        value = value[2:]
+    if value not in _VALID_AIME_YEARS:
+        raise ValueError(f"Unsupported AIME year: {year!r}. Expected one of 24, 25, 26.")
+    return value
+
+
+def _infer_year_from_path(data_path: Path) -> Optional[str]:
+    match = re.search(r"test_(\d{2})\.jsonl$", str(data_path))
+    if not match:
+        return None
+    year = match.group(1)
+    return year if year in _VALID_AIME_YEARS else None
+
+
+def _resolve_data_path(year: Optional[str], data_path: Optional[str]) -> tuple[Path, Optional[str]]:
+    normalized_year = _normalize_year(year)
+
+    if data_path:
+        path = Path(data_path)
+        inferred_year = _infer_year_from_path(path)
+        if normalized_year and inferred_year and normalized_year != inferred_year:
+            raise ValueError(
+                f"Year mismatch: --year {normalized_year} does not match data path {path.name}."
+            )
+        return path, normalized_year or inferred_year
+
+    effective_year = normalized_year or "24"
+    path = _PROJECT_ROOT / "data" / "AIME" / f"test_{effective_year}.jsonl"
+    return path, effective_year
 
 
 class AIMEBenchmark(BenchmarkRunner):
@@ -88,7 +125,6 @@ sympy, math, fractions, itertools, functools, collections, numpy, decimal, cmath
         + _AIME_ADDENDUM
     )
 
-    # Template for solution.py — includes a sanity-check wrapper
     _SOLUTION_TEMPLATE = """\
 # AIME Solution — answer must be an integer from 0 to 999.
 # Write your solution below. Assign the final answer to `answer`.
@@ -106,24 +142,29 @@ if not (0 <= answer <= 999):
 print(answer)
 """
 
+    def __init__(self, *args, year: Optional[str] = None, **kwargs):
+        self.year = _normalize_year(year)
+        super().__init__(*args, **kwargs)
+        if self.year is None:
+            self.year = _infer_year_from_path(self.data_path)
+        if self.year is not None:
+            self.benchmark_name = f"aime_{self.year}"
+
     def _get_system_prompt(self):
         return self._MATH_SYSTEM_PROMPT
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        tasks = []
-        with open(self.data_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    task = json.loads(line)
-                    task.setdefault("task_id", f"AIME_{task.get('id', 0)}")
-                    tasks.append(task)
-        return tasks
+        prefix = f"AIME_{self.year}" if self.year else "AIME"
+        return self._load_jsonl_tasks(
+            task_transform=lambda task: {
+                **task,
+                "task_id": task.get("task_id") or f"{prefix}_{task.get('id', 0)}",
+            }
+        )
 
     @staticmethod
     def _extract_answer(output: str) -> Optional[int]:
         """Extract the last integer printed by the solution."""
-        # Find all integers in the output (including negative)
         integers = re.findall(r"-?\d+", output)
         if integers:
             try:
@@ -137,13 +178,15 @@ print(answer)
         problem = task["problem"]
         expected_answer = int(task["answer"])
 
-        workspace = Path(tempfile.mkdtemp(prefix=f"aime_{task_id}_"))
+        workspace = self._make_workspace(f"aime_{task_id}_")
+        agent = None
+        agent_response = ""
+        agent_prompt = ""
+        result: Optional[Dict[str, Any]] = None
         try:
-            # Pre-populate solution.py with sanity-check template
             solution_file = workspace / "solution.py"
             solution_file.write_text(self._SOLUTION_TEMPLATE, encoding="utf-8")
 
-            # Run the agent
             agent = self._create_agent(workspace)
             agent_prompt = (
                 f"Solve this AIME problem. The answer is an integer from 0 to 999.\n\n"
@@ -161,31 +204,27 @@ print(answer)
             )
 
             start = time.time()
-            try:
-                agent_response = agent.run(agent_prompt)
-            except Exception as exc:
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "expected": expected_answer,
-                    "actual": None,
-                    "error": f"Agent error: {exc}",
-                    "agent_response": "",
-                    "elapsed_s": round(time.time() - start, 2),
-                }
+            agent_response, error_result = self._run_agent_prompt(
+                agent=agent,
+                task_id=task_id,
+                prompt_text=agent_prompt,
+                start_time=start,
+                error_extra={"expected": expected_answer, "actual": None},
+            )
+            if error_result is not None:
+                result = error_result
+                return result
             elapsed = round(time.time() - start, 2)
 
-            # Run the solution
             if not solution_file.exists():
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "expected": expected_answer,
-                    "actual": None,
-                    "error": "solution.py not found after agent run",
-                    "agent_response": (agent_response or "")[:500],
-                    "elapsed_s": elapsed,
-                }
+                result = self._missing_output_result(
+                    task_id,
+                    path_label="solution.py",
+                    elapsed_s=elapsed,
+                    agent_response=agent_response,
+                    extra={"expected": expected_answer, "actual": None},
+                )
+                return result
 
             success, output = self._run_script_in_sandbox(
                 solution_file, cwd=workspace, timeout=self.timeout
@@ -194,16 +233,28 @@ print(answer)
             actual_answer = self._extract_answer(output) if success else None
             passed = actual_answer == expected_answer
 
-            return {
-                "task_id": task_id,
-                "passed": passed,
-                "expected": expected_answer,
-                "actual": actual_answer,
-                "error": output if not passed else None,
-                "agent_response": (agent_response or "")[:500],
-                "elapsed_s": elapsed,
-            }
+            result = self._build_result(
+                task_id,
+                passed=passed,
+                error=output if not passed else None,
+                agent_response=agent_response,
+                elapsed_s=elapsed,
+                extra={
+                    "expected": expected_answer,
+                    "actual": actual_answer,
+                },
+            )
+            return result
         finally:
+            self._save_task_trajectory(
+                task=task,
+                workspace=workspace,
+                agent=agent,
+                prompt_texts=[agent_prompt] if agent_prompt else [],
+                result=result,
+                artifact_paths=["solution.py"],
+                extra={"expected_answer": expected_answer},
+            )
             shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -212,32 +263,40 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run AIME benchmark")
     parser.add_argument(
-        "--data-path",
-        default=str(_PROJECT_ROOT / "data" / "AIME" / "test.jsonl"),
-        help="Path to AIME JSONL file",
+        "--year",
+        default=None,
+        help="AIME year to run: 24, 25, or 26. If omitted, defaults to 24 unless --data-path is set.",
     )
-    parser.add_argument("--output-dir", default=str(_PROJECT_ROOT / "data" / "_results"))
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=128)
-    parser.add_argument("--timeout", type=int, default=120, help="Longer timeout for math computations")
-    parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
-    parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
-    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help="Path to AIME JSONL file. If omitted, resolves to data/AIME/test_<year>.jsonl.",
+    )
+    BenchmarkRunner.add_shared_run_args(
+        parser,
+        default_temperature=1.0,
+        default_max_steps=128,
+        default_timeout=120,
+        timeout_help="Longer timeout for math computations",
+    )
     args = parser.parse_args()
 
+    try:
+        data_path, effective_year = _resolve_data_path(args.year, args.data_path)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if not data_path.exists():
+        parser.error(f"AIME data file not found: {data_path}")
+
     bench = AIMEBenchmark(
-        data_path=args.data_path,
+        year=effective_year,
+        data_path=str(data_path),
         output_dir=args.output_dir,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
         temperature=args.temperature,
         max_steps=args.max_steps,
         timeout=args.timeout,
+        trajectory_dir=args.trajectory_dir,
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

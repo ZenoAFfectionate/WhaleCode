@@ -1,305 +1,309 @@
-"""ContextBuilder - GSSC Pipeline Implementation
+"""Structured context building helpers.
 
-Implements the Gather-Select-Structure-Compress context building process:
-1. Gather: Collect candidate information from multiple sources (history, tool results)
-2. Select: Filter based on priority, relevance, and diversity
-3. Structure: Organize into a structured context template
-4. Compress: Compress and normalize within the budget
-
-Note: MemoryTool and RAGTool have been removed. If you need to use them, please implement them yourself.
+The builder follows a small Gather-Select-Structure-Compress pipeline and is
+kept intentionally lightweight so it can be reused by agents without forcing
+extra model calls.
 """
+
+from __future__ import annotations
+
 import math
-import tiktoken
+import re
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..core.message import Message
+
+_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]", re.IGNORECASE)
+_DEFAULT_OUTPUT_SECTION = "\n".join(
+    [
+        "[Output]",
+        "Please answer in the following format:",
+        "1. Conclusion (concise and clear)",
+        "2. Basis (list supporting evidence and sources)",
+        "3. Risks and Assumptions (if any)",
+        "4. Next Steps (if applicable)",
+    ]
+)
+
+
+@lru_cache(maxsize=1)
+def _get_default_encoding():
+    try:
+        import tiktoken
+
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
+
+
+def count_tokens(text: str) -> int:
+    """Estimate token count using ``tiktoken`` when available."""
+    payload = text or ""
+    if not payload:
+        return 0
+
+    encoding = _get_default_encoding()
+    if encoding is not None:
+        try:
+            return len(encoding.encode(payload))
+        except Exception:
+            pass
+    return max(1, len(payload) // 4)
+
+
+def _tokenize_for_relevance(text: str) -> Set[str]:
+    """Tokenize English words and individual CJK characters for simple relevance scoring."""
+    return {token.lower() for token in _TOKEN_PATTERN.findall(text or "")}
 
 
 @dataclass
 class ContextPacket:
-    """Context information packet"""
+    """A candidate context block used by the builder."""
+
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
     token_count: int = 0
-    relevance_score: float = 0.0  # 0.0-1.0
-    
-    def __post_init__(self):
-        """Automatically calculate token count"""
-        if self.token_count == 0:
+    relevance_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.token_count <= 0:
             self.token_count = count_tokens(self.content)
 
 
 @dataclass
 class ContextConfig:
-    """Context build configuration"""
-    max_tokens: int = 8000  # Total budget
-    reserve_ratio: float = 0.15  # Generation margin (10-20%)
-    min_relevance: float = 0.3   # Minimum relevance threshold
-    enable_mmr: bool = True  # Enable Maximum Marginal Relevance (diversity)
-    mmr_lambda: float = 0.7  # MMR balance parameter (0=pure diversity, 1=pure relevance)
-    system_prompt_template: str = ""  # System prompt template
-    enable_compression: bool = True  # Enable compression
-    
+    """Configuration for the lightweight context builder."""
+
+    max_tokens: int = 8000
+    reserve_ratio: float = 0.15
+    min_relevance: float = 0.3
+    enable_mmr: bool = True
+    mmr_lambda: float = 0.7
+    enable_compression: bool = True
+    history_limit: int = 10
+
     def get_available_tokens(self) -> int:
-        """Get available token budget (deducting margin)"""
         return int(self.max_tokens * (1 - self.reserve_ratio))
 
 
 class ContextBuilder:
-    """Context Builder - GSSC Pipeline
+    """Build a structured context string from history and auxiliary packets."""
 
-    Note: MemoryTool and RAGTool have been removed. This class is temporarily unavailable.
-
-    Usage example:
-    ```python
-    builder = ContextBuilder(
-        config=ContextConfig(max_tokens=8000)
-    )
-
-    context = builder.build(
-        user_query="User query",
-        conversation_history=[...],
-        system_instructions="System instructions"
-    )
-    ```
-    """
-
-    def __init__(
-        self,
-        config: Optional[ContextConfig] = None
-    ):
+    def __init__(self, config: Optional[ContextConfig] = None):
         self.config = config or ContextConfig()
-        self._encoding = tiktoken.get_encoding("cl100k_base")
-    
+
     def build(
         self,
         user_query: str,
         conversation_history: Optional[List[Message]] = None,
         system_instructions: Optional[str] = None,
-        additional_packets: Optional[List[ContextPacket]] = None
+        additional_packets: Optional[List[ContextPacket]] = None,
     ) -> str:
-        """Build the complete context
-        
-        Args:
-            user_query: User query
-            conversation_history: Conversation history
-            system_instructions: System instructions
-            additional_packets: Additional context packets
-            
-        Returns:
-            Structured context string
-        """
-        # 1. Gather: Collect candidate information
         packets = self._gather(
             user_query=user_query,
             conversation_history=conversation_history or [],
             system_instructions=system_instructions,
-            additional_packets=additional_packets or []
+            additional_packets=additional_packets or [],
         )
-        
-        # 2. Select: Filter and sort
         selected_packets = self._select(packets, user_query)
-        
-        # 3. Structure: Organize into a structured template
-        structured_context = self._structure(
-            selected_packets=selected_packets,
-            user_query=user_query,
-            system_instructions=system_instructions
-        )
-        
-        # 4. Compress: Compress and normalize (if over budget)
-        final_context = self._compress(structured_context)
-        
-        return final_context
-    
+        structured_context = self._structure(selected_packets=selected_packets, user_query=user_query)
+        return self._compress(structured_context)
+
     def _gather(
         self,
         user_query: str,
         conversation_history: List[Message],
         system_instructions: Optional[str],
-        additional_packets: List[ContextPacket]
+        additional_packets: List[ContextPacket],
     ) -> List[ContextPacket]:
-        """Gather: Collect candidate information"""
-        packets = []
-        
-        # P0: System instructions (strong constraint)
+        packets: List[ContextPacket] = []
+
         if system_instructions:
-            packets.append(ContextPacket(
-                content=system_instructions,
-                metadata={"type": "instructions"}
-            ))
+            packets.append(
+                ContextPacket(content=system_instructions, metadata={"type": "instructions", "priority": 0})
+            )
 
-        # Note: MemoryTool and RAGTool have been removed
-        # If you need memory and knowledge base features, please implement them yourself
-
-        # P3: Conversation history (supplementary material)
         if conversation_history:
-            # Keep only the most recent N items
-            recent_history = conversation_history[-10:]
-            history_text = "\n".join([
-                f"[{msg.role}] {msg.content}"
-                for msg in recent_history
-            ])
-            packets.append(ContextPacket(
-                content=history_text,
-                metadata={"type": "history", "count": len(recent_history)}
-            ))
+            recent_history = conversation_history[-self.config.history_limit :]
+            history_text = "\n".join(message.to_text() for message in recent_history)
+            packets.append(
+                ContextPacket(
+                    content=history_text,
+                    metadata={"type": "history", "count": len(recent_history), "priority": 3},
+                )
+            )
 
-        # Add additional packets
         packets.extend(additional_packets)
-
         return packets
-    
-    def _select(
-        self,
-        packets: List[ContextPacket],
-        user_query: str
-    ) -> List[ContextPacket]:
-        """Select: Filtering based on score and budget"""
-        # 1) Calculate relevance (keyword overlap)
-        query_tokens = set(user_query.lower().split())
-        for packet in packets:
-            content_tokens = set(packet.content.lower().split())
-            if len(query_tokens) > 0:
-                overlap = len(query_tokens & content_tokens)
-                packet.relevance_score = overlap / len(query_tokens)
-            else:
-                packet.relevance_score = 0.0
-        
-        # 2) Calculate recency (exponential decay)
-        def recency_score(ts: datetime) -> float:
-            delta = max((datetime.now() - ts).total_seconds(), 0)
-            tau = 3600  # 1 hour time scale, can be exposed to config
-            return math.exp(-delta / tau)
-        
-        # 3) Calculate composite score: 0.7*relevance + 0.3*recency
-        scored_packets: List[Tuple[float, ContextPacket]] = []
-        for p in packets:
-            rec = recency_score(p.timestamp)
-            score = 0.7 * p.relevance_score + 0.3 * rec
-            scored_packets.append((score, p))
-        
-        # 4) Extract system instructions separately, fixed inclusion
-        system_packets = [p for (_, p) in scored_packets if p.metadata.get("type") == "instructions"]
-        remaining = [p for (s, p) in sorted(scored_packets, key=lambda x: x[0], reverse=True)
-                     if p.metadata.get("type") != "instructions"]
-        
-        # 5) Filter by min_relevance (for non-system packets)
-        filtered = [p for p in remaining if p.relevance_score >= self.config.min_relevance]
-        
-        # 6) Fill according to budget
-        available_tokens = self.config.get_available_tokens()
+
+    def _select(self, packets: List[ContextPacket], user_query: str) -> List[ContextPacket]:
+        if not packets:
+            return []
+
+        query_tokens = _tokenize_for_relevance(user_query)
+        scored_packets = [self._score_packet(packet, query_tokens) for packet in packets]
+
+        system_packets = [packet for packet in scored_packets if packet.metadata.get("type") == "instructions"]
+        candidate_packets = [
+            packet
+            for packet in scored_packets
+            if packet.metadata.get("type") != "instructions" and packet.relevance_score >= self.config.min_relevance
+        ]
+        candidate_packets.sort(key=self._packet_rank, reverse=True)
+
         selected: List[ContextPacket] = []
         used_tokens = 0
-        
-        # Put system instructions first (unsorted)
-        for p in system_packets:
-            if used_tokens + p.token_count <= available_tokens:
-                selected.append(p)
-                used_tokens += p.token_count
-        
-        # Then add the rest based on score
-        for p in filtered:
-            if used_tokens + p.token_count > available_tokens:
+        available_tokens = self.config.get_available_tokens()
+
+        for packet in system_packets:
+            if used_tokens + packet.token_count > available_tokens:
                 continue
-            selected.append(p)
-            used_tokens += p.token_count
-        
+            selected.append(packet)
+            used_tokens += packet.token_count
+
+        remaining_budget = max(0, available_tokens - used_tokens)
+        if self.config.enable_mmr:
+            selected.extend(self._select_with_mmr(candidate_packets, remaining_budget, query_tokens))
+        else:
+            for packet in candidate_packets:
+                if packet.token_count > remaining_budget:
+                    continue
+                selected.append(packet)
+                remaining_budget -= packet.token_count
+
         return selected
-    
-    def _structure(
+
+    def _score_packet(self, packet: ContextPacket, query_tokens: Set[str]) -> ContextPacket:
+        content_tokens = _tokenize_for_relevance(packet.content)
+        relevance = self._compute_relevance(query_tokens, content_tokens)
+        score = 0.7 * relevance + 0.3 * self._compute_recency(packet.timestamp)
+        return replace(
+            packet,
+            relevance_score=relevance,
+            metadata={**packet.metadata, "_content_tokens": content_tokens, "_rank_score": score},
+        )
+
+    def _compute_relevance(self, query_tokens: Set[str], content_tokens: Set[str]) -> float:
+        if not query_tokens:
+            return 0.0
+        overlap = len(query_tokens & content_tokens)
+        return overlap / len(query_tokens)
+
+    @staticmethod
+    def _compute_recency(timestamp: datetime) -> float:
+        delta_seconds = max((datetime.now() - timestamp).total_seconds(), 0.0)
+        return math.exp(-delta_seconds / 3600.0)
+
+    @staticmethod
+    def _packet_rank(packet: ContextPacket) -> Tuple[float, float]:
+        rank_score = packet.metadata.get("_rank_score", packet.relevance_score)
+        return (rank_score, -packet.token_count)
+
+    def _select_with_mmr(
         self,
-        selected_packets: List[ContextPacket],
-        user_query: str,
-        system_instructions: Optional[str]
-    ) -> str:
-        """Structure: Organize into a structured context template"""
-        sections = []
-        
-        # [Role & Policies] - System instructions
-        p0_packets = [p for p in selected_packets if p.metadata.get("type") == "instructions"]
-        if p0_packets:
-            role_section = "[Role & Policies]\n"
-            role_section += "\n".join([p.content for p in p0_packets])
-            sections.append(role_section)
-        
-        # [Task] - Current task
+        packets: Sequence[ContextPacket],
+        available_tokens: int,
+        query_tokens: Set[str],
+    ) -> List[ContextPacket]:
+        selected: List[ContextPacket] = []
+        selected_token_sets: List[Set[str]] = []
+        remaining = list(packets)
+
+        while remaining and available_tokens > 0:
+            best_index = -1
+            best_score = float("-inf")
+            for index, packet in enumerate(remaining):
+                if packet.token_count > available_tokens:
+                    continue
+
+                content_tokens = self._packet_tokens(packet)
+                diversity_penalty = 0.0
+                if selected_token_sets:
+                    diversity_penalty = max(
+                        self._token_similarity(content_tokens, selected_tokens)
+                        for selected_tokens in selected_token_sets
+                    )
+
+                relevance = self._compute_relevance(query_tokens, content_tokens)
+                mmr_score = self.config.mmr_lambda * relevance - (1 - self.config.mmr_lambda) * diversity_penalty
+                mmr_score += 0.1 * self._compute_recency(packet.timestamp)
+
+                if mmr_score > best_score:
+                    best_index = index
+                    best_score = mmr_score
+
+            if best_index < 0:
+                break
+
+            chosen = remaining.pop(best_index)
+            selected.append(chosen)
+            chosen_tokens = self._packet_tokens(chosen)
+            selected_token_sets.append(chosen_tokens)
+            available_tokens -= chosen.token_count
+
+        return selected
+
+    @staticmethod
+    def _packet_tokens(packet: ContextPacket) -> Set[str]:
+        cached = packet.metadata.get("_content_tokens")
+        if isinstance(cached, set):
+            return cached
+        return _tokenize_for_relevance(packet.content)
+
+    @staticmethod
+    def _token_similarity(left: Set[str], right: Set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        intersection = len(left & right)
+        union = len(left | right)
+        return intersection / union if union else 0.0
+
+    def _structure(self, selected_packets: List[ContextPacket], user_query: str) -> str:
+        sections: List[str] = []
+
+        instructions = [packet.content for packet in selected_packets if packet.metadata.get("type") == "instructions"]
+        if instructions:
+            sections.append("[Role & Policies]\n" + "\n".join(instructions))
+
         sections.append(f"[Task]\nUser Query: {user_query}")
-        
-        # [State] - Task state
-        p1_packets = [p for p in selected_packets if p.metadata.get("type") == "task_state"]
-        if p1_packets:
-            state_section = "[State]\nKey Progress and Pending Issues:\n"
-            state_section += "\n".join([p.content for p in p1_packets])
-            sections.append(state_section)
-        
-        # [Evidence] - Factual evidence
-        p2_packets = [
-            p for p in selected_packets
-            if p.metadata.get("type") in {"related_memory", "knowledge_base", "retrieval", "tool_result"}
+
+        task_state = [packet.content for packet in selected_packets if packet.metadata.get("type") == "task_state"]
+        if task_state:
+            sections.append("[State]\nKey Progress and Pending Issues:\n" + "\n".join(task_state))
+
+        evidence = [
+            packet.content
+            for packet in selected_packets
+            if packet.metadata.get("type") in {"related_memory", "knowledge_base", "retrieval", "tool_result"}
         ]
-        if p2_packets:
-            evidence_section = "[Evidence]\nFacts and References:\n"
-            for p in p2_packets:
-                evidence_section += f"\n{p.content}\n"
-            sections.append(evidence_section)
-        
-        # [Context] - Supplementary material (history, etc.)
-        p3_packets = [p for p in selected_packets if p.metadata.get("type") == "history"]
-        if p3_packets:
-            context_section = "[Context]\nConversation History and Background:\n"
-            context_section += "\n".join([p.content for p in p3_packets])
-            sections.append(context_section)
-        
-        # [Output] - Output constraints
-        output_section = """[Output]
-                            Please answer in the following format:
-                            1. Conclusion (concise and clear)
-                            2. Basis (list supporting evidence and sources)
-                            3. Risks and Assumptions (if any)
-                            4. Next Steps (if applicable)"""
-        sections.append(output_section)
-        
-        return "\n\n".join(sections)
-    
+        if evidence:
+            sections.append("[Evidence]\nFacts and References:\n" + "\n\n".join(evidence))
+
+        history = [packet.content for packet in selected_packets if packet.metadata.get("type") == "history"]
+        if history:
+            sections.append("[Context]\nConversation History and Background:\n" + "\n".join(history))
+
+        sections.append(_DEFAULT_OUTPUT_SECTION)
+        return "\n\n".join(section.strip() for section in sections if section.strip())
+
     def _compress(self, context: str) -> str:
-        """Compress: Compress and normalize"""
         if not self.config.enable_compression:
             return context
-        
-        current_tokens = count_tokens(context)
+
         available_tokens = self.config.get_available_tokens()
-        
-        if current_tokens <= available_tokens:
+        if count_tokens(context) <= available_tokens:
             return context
-        
-        # Simple truncation strategy (keep the first N tokens)
-        # In practice, an LLM can be used for high-fidelity summarization
-        print(f"⚠️ Context exceeds budget ({current_tokens} > {available_tokens}), performing truncation")
-        
-        # Truncate by paragraph, preserving structure
-        lines = context.split("\n")
-        compressed_lines = []
+
+        kept_lines: List[str] = []
         used_tokens = 0
-        
-        for line in lines:
+        for line in context.splitlines():
             line_tokens = count_tokens(line)
-            if used_tokens + line_tokens > available_tokens:
+            if kept_lines and used_tokens + line_tokens > available_tokens:
                 break
-            compressed_lines.append(line)
+            kept_lines.append(line)
             used_tokens += line_tokens
-        
-        return "\n".join(compressed_lines)
-
-
-def count_tokens(text: str) -> int:
-    """Calculate text token count (using tiktoken)"""
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        return len(encoding.encode(text))
-    except Exception:
-        # Fallback plan: rough estimation (1 token ≈ 4 characters)
-        return len(text) // 4
+        return "\n".join(kept_lines)

@@ -1,131 +1,341 @@
-"""File Operation Tools - Supporting Optimistic Locking
+"""Workspace file tools with bounded reads and safer optimistic locking."""
 
-Provides standard file reading, writing, and editing capabilities:
-- ReadTool: Read file + Metadata caching
-- WriteTool: Write file + Conflict detection + Atomic write
-- DeleteTool: Safe delete for files/directories + Atomic move to trash
-- EditTool: Precise replacement + Conflict detection + Backup
-"""
+from __future__ import annotations
 
 import os
 import shutil
-from pathlib import Path
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from ..base import Tool, ToolParameter
-from ..response import ToolResponse
 from ..errors import ToolErrorCode
+from ..response import ToolResponse
 from ._code_utils import (
+    DiagnosticsResult,
+    EditAmbiguousError,
+    EditMatchError,
+    EditNotFoundError,
+    FormatterResult,
     atomic_write,
     detect_line_ending,
+    ensure_working_dir,
     format_numbered_lines,
     is_binary_file,
     make_diff_preview,
     normalize_line_endings,
     read_text_file,
+    read_text_window,
+    relative_display,
+    replace_with_flexible_match,
+    resolve_path,
+    run_diagnostics,
+    run_formatter,
 )
 
 if TYPE_CHECKING:
     from ..registry import ToolRegistry
 
 
-def _display_path(project_root: Path, full_path: Path) -> str:
-    """Returns a display path relative to the project_root."""
-    try:
-        rel = full_path.relative_to(project_root)
-        text = str(rel).replace(os.sep, '/')
-        return text or "."
-    except ValueError:
-        return str(full_path).replace(os.sep, '/')
+DEFAULT_READ_LIMIT = 2000
+DEFAULT_LIST_LIMIT = 200
+MAX_READ_BYTES = 50 * 1024
+MAX_READ_LINE_LENGTH = 2000
+
+_FILE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+@dataclass(frozen=True)
+class FileState:
+    """Filesystem snapshot used for optimistic locking."""
+
+    mtime_ms: int
+    ctime_ms: int
+    size_bytes: int
+    encoding: Optional[str] = None
 
 
 def _format_diff_section(diff_preview: str, diff_truncated: bool) -> str:
-    """Format unified diff preview text."""
     lines = ["", "Unified diff preview:", diff_preview]
     if diff_truncated:
         lines.append("[diff preview truncated]")
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
-def _require_prior_read(
-    registry: Optional['ToolRegistry'],
-    rel_path: str,
-) -> Optional[ToolResponse]:
-    """Return an error response if the file has not been Read yet, else None."""
-    if registry is not None and rel_path not in registry.read_metadata_cache:
-        return ToolResponse.error(
-            code=ToolErrorCode.INVALID_PARAM,
-            message=(
-                f"You must Read '{rel_path}' before editing. "
-                f"Call the Read tool first to see current content."
-            ),
-        )
-    return None
+def _snapshot_file(path: Path, encoding: Optional[str] = None) -> FileState:
+    stat = path.stat()
+    return FileState(
+        mtime_ms=int(stat.st_mtime * 1000),
+        ctime_ms=int(stat.st_ctime * 1000),
+        size_bytes=stat.st_size,
+        encoding=encoding,
+    )
 
 
-def _no_change_response(
-    action_text: str,
-    rel_path: str,
-    mtime_ms: int,
-    size_bytes: int,
-) -> ToolResponse:
-    """Unified no-change response to facilitate agent reasoning."""
+def _metadata_payload(state: FileState) -> Dict[str, Any]:
+    return {
+        "file_mtime_ms": state.mtime_ms,
+        "file_ctime_ms": state.ctime_ms,
+        "file_size_bytes": state.size_bytes,
+        "expected_mtime_ms": state.mtime_ms,
+        "expected_ctime_ms": state.ctime_ms,
+        "expected_size_bytes": state.size_bytes,
+    }
+
+
+def _metadata_text(state: FileState) -> str:
+    return (
+        f"Metadata: file_mtime_ms={state.mtime_ms}, "
+        f"file_ctime_ms={state.ctime_ms}, "
+        f"file_size_bytes={state.size_bytes}, "
+        f"expected_mtime_ms={state.mtime_ms}, "
+        f"expected_ctime_ms={state.ctime_ms}, "
+        f"expected_size_bytes={state.size_bytes}"
+    )
+
+
+def _no_change_response(action_text: str, rel_path: str, state: FileState) -> ToolResponse:
     return ToolResponse.partial(
         text=(
             f"{action_text}: {rel_path}\n"
-            f"No actual textual changes.\n"
-            f"Metadata: file_mtime_ms={mtime_ms}, file_size_bytes={size_bytes}, "
-            f"expected_mtime_ms={mtime_ms}, expected_size_bytes={size_bytes}\n"
-            f"Unified diff preview:\n[no textual diff]"
+            "No actual textual changes.\n"
+            f"{_metadata_text(state)}\n"
+            "Unified diff preview:\n[no textual diff]"
         ),
         data={
             "path": rel_path,
             "modified": False,
-            "file_mtime_ms": mtime_ms,
-            "file_size_bytes": size_bytes,
-            "expected_mtime_ms": mtime_ms,
-            "expected_size_bytes": size_bytes,
             "diff_preview": "[no textual diff]",
             "diff_truncated": False,
+            **_metadata_payload(state),
         },
     )
 
 
-class ReadTool(Tool):
-    """File Read Tool
+def _post_process_failed(formatter: FormatterResult, diagnostics: DiagnosticsResult) -> bool:
+    formatter_failed = formatter.attempted and not formatter.success
+    diagnostics_failed = diagnostics.attempted and not diagnostics.success
+    return formatter_failed or diagnostics_failed
 
-    Features:
-    - Read file content (supports offset/limit)
-    - List directory contents (when path is a directory)
-    - Automatically retrieve file metadata (mtime, size)
-    - Cache metadata in ToolRegistry (for optimistic locking)
-    - Cross-platform compatibility (Windows/Linux)
 
-    Parameters:
-    - path: File or directory path (relative to project_root)
-    - offset: Starting line number (optional, default 0, valid for files only)
-    - limit: Maximum number of lines (optional, default 2000, valid for files only)
-    """
-    
+def _formatter_summary(result: FormatterResult) -> Optional[str]:
+    if not result.attempted:
+        return None
+    if result.success:
+        change_text = "changed file" if result.changed else "no changes"
+        return f"Formatter: {result.tool} ({change_text})"
+    return f"Formatter failed: {result.tool or 'unknown'} ({result.skipped_reason or 'execution failed'})"
+
+
+def _diagnostics_summary(result: DiagnosticsResult) -> List[str]:
+    if not result.attempted:
+        return []
+    if not result.success:
+        return [f"Diagnostics failed: {result.tool or 'unknown'} ({result.skipped_reason or 'execution failed'})"]
+
+    if result.total == 0:
+        return [f"Diagnostics: {result.tool} reported no issues."]
+
+    lines = [
+        f"Diagnostics: {result.tool} reported {result.total} issue{'s' if result.total != 1 else ''}"
+        + (" (showing first 20)" if result.truncated else "")
+    ]
+    for item in result.diagnostics:
+        code = f"[{item.code}] " if item.code else ""
+        lines.append(f"  {item.severity.upper()} L{item.line}:C{item.column} {code}{item.message}")
+    return lines
+
+
+def _format_range(offset: int, shown: int, total: int, label: str) -> str:
+    if total == 0:
+        return f"{label}: empty / 0"
+    if shown == 0:
+        return f"{label}: no entries at offset {offset + 1} / {total}"
+    return f"{label}: {offset + 1}-{offset + shown} / {total}"
+
+
+@contextmanager
+def _path_lock(path: Path) -> Iterator[None]:
+    key = str(path)
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.setdefault(key, threading.RLock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+class _WorkspaceFileTool(Tool):
+    """Shared path and optimistic-lock helpers."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: str,
+        project_root: str = ".",
+        working_dir: Optional[str] = None,
+        registry: Optional["ToolRegistry"] = None,
+    ):
+        super().__init__(name=name, description=description, expandable=False)
+        self.project_root = Path(project_root).expanduser().resolve()
+        self.working_dir = ensure_working_dir(self.project_root, working_dir)
+        self.registry = registry
+
+    def _resolve_path(self, path: str) -> Path:
+        return resolve_path(self.project_root, self.working_dir, path)
+
+    def _display_path(self, path: Path) -> str:
+        return relative_display(self.project_root, path)
+
+    def _get_cached_metadata(self, rel_path: str) -> Optional[Dict[str, Any]]:
+        if self.registry is None:
+            return None
+        getter = getattr(self.registry, "get_read_metadata", None)
+        if callable(getter):
+            return getter(rel_path)
+        return getattr(self.registry, "read_metadata_cache", {}).get(rel_path)
+
+    def _cache_state(self, rel_path: str, state: FileState) -> None:
+        if self.registry is None:
+            return
+        cache = getattr(self.registry, "cache_read_metadata", None)
+        if callable(cache):
+            payload = _metadata_payload(state)
+            if state.encoding:
+                payload["encoding"] = state.encoding
+            cache(rel_path, payload)
+
+    def _clear_cached_state(self, rel_path: str, recursive: bool = False) -> None:
+        if self.registry is None:
+            return
+        if not recursive:
+            clear = getattr(self.registry, "clear_read_cache", None)
+            if callable(clear):
+                clear(rel_path)
+            return
+
+        cache = getattr(self.registry, "read_metadata_cache", None)
+        if not isinstance(cache, dict):
+            return
+        prefix = f"{rel_path}/"
+        for key in list(cache):
+            if key == rel_path or key.startswith(prefix):
+                cache.pop(key, None)
+
+    def _require_prior_read(self, rel_path: str) -> Optional[ToolResponse]:
+        if self.registry is None:
+            return None
+        if self._get_cached_metadata(rel_path) is None:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=(
+                    f"You must Read '{rel_path}' before editing. "
+                    "Call the Read tool first to see current content."
+                ),
+            )
+        return None
+
+    def _expected_state_from_parameters(self, parameters: Dict[str, Any], rel_path: str) -> Dict[str, Any]:
+        cached = self._get_cached_metadata(rel_path) or {}
+        expected_mtime_ms = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
+        expected_ctime_ms = parameters.get("expected_ctime_ms", parameters.get("file_ctime_ms"))
+        expected_size_bytes = parameters.get("expected_size_bytes", parameters.get("file_size_bytes"))
+
+        if expected_mtime_ms is None:
+            expected_mtime_ms = cached.get("file_mtime_ms")
+        if expected_ctime_ms is None:
+            expected_ctime_ms = cached.get("file_ctime_ms")
+        if expected_size_bytes is None:
+            expected_size_bytes = cached.get("file_size_bytes")
+
+        return {
+            "expected_mtime_ms": expected_mtime_ms,
+            "expected_ctime_ms": expected_ctime_ms,
+            "expected_size_bytes": expected_size_bytes,
+        }
+
+    def _check_expected_state(
+        self,
+        *,
+        rel_path: str,
+        current_state: FileState,
+        expected_state: Dict[str, Any],
+    ) -> Optional[ToolResponse]:
+        expected_mtime_ms = expected_state.get("expected_mtime_ms")
+        expected_ctime_ms = expected_state.get("expected_ctime_ms")
+        expected_size_bytes = expected_state.get("expected_size_bytes")
+
+        if expected_mtime_ms is not None and current_state.mtime_ms != expected_mtime_ms:
+            return ToolResponse.error(
+                code=ToolErrorCode.CONFLICT,
+                message=(
+                    f"File changed since last read. expected_mtime_ms={expected_mtime_ms}, "
+                    f"actual_mtime_ms={current_state.mtime_ms}."
+                ),
+                context={
+                    "path": rel_path,
+                    "expected_mtime_ms": expected_mtime_ms,
+                    "actual_mtime_ms": current_state.mtime_ms,
+                },
+            )
+
+        if expected_ctime_ms is not None and current_state.ctime_ms != expected_ctime_ms:
+            return ToolResponse.error(
+                code=ToolErrorCode.CONFLICT,
+                message=(
+                    f"File changed since last read. expected_ctime_ms={expected_ctime_ms}, "
+                    f"actual_ctime_ms={current_state.ctime_ms}."
+                ),
+                context={
+                    "path": rel_path,
+                    "expected_ctime_ms": expected_ctime_ms,
+                    "actual_ctime_ms": current_state.ctime_ms,
+                },
+            )
+
+        if expected_size_bytes is not None and current_state.size_bytes != expected_size_bytes:
+            return ToolResponse.error(
+                code=ToolErrorCode.CONFLICT,
+                message=(
+                    f"File size changed since last read. expected_size_bytes={expected_size_bytes}, "
+                    f"actual_size_bytes={current_state.size_bytes}."
+                ),
+                context={
+                    "path": rel_path,
+                    "expected_size_bytes": expected_size_bytes,
+                    "actual_size_bytes": current_state.size_bytes,
+                },
+            )
+
+        return None
+
+
+class ReadTool(_WorkspaceFileTool):
+    """Read a text file or inspect a directory."""
+
     def __init__(
         self,
         project_root: str = ".",
         working_dir: Optional[str] = None,
-        registry: Optional['ToolRegistry'] = None
+        registry: Optional["ToolRegistry"] = None,
     ):
         super().__init__(
             name="Read",
             description=(
                 "Read a text file or inspect a directory. Use this before editing so you can "
-                "see the current content and capture optimistic-lock metadata for later Write "
-                "or Edit calls."
+                "see the current content and capture optimistic-lock metadata for later Write, "
+                "Edit, or Delete calls."
             ),
-            expandable=False
+            project_root=project_root,
+            working_dir=working_dir,
+            registry=registry,
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = Path(working_dir).expanduser().resolve() if working_dir else self.project_root
-        self.registry = registry
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -136,274 +346,253 @@ class ReadTool(Tool):
                     "File or directory path relative to the project root. If the path is a "
                     "directory, the tool returns a directory listing instead of file content."
                 ),
-                required=True
+                required=True,
             ),
             ToolParameter(
                 name="offset",
                 type="integer",
                 description=(
-                    "Zero-based starting line offset when reading a file. Use this to continue "
-                    "reading large files in chunks."
+                    "Zero-based starting offset. For files it is the first line to read. "
+                    "For directories it is the first entry to list."
                 ),
                 required=False,
-                default=0
+                default=0,
             ),
             ToolParameter(
                 name="limit",
                 type="integer",
                 description=(
-                    "Maximum number of lines to return for a file read. Keep this focused so the "
-                    "agent sees the most relevant slice."
+                    "Maximum number of lines or directory entries to return. "
+                    "Use a focused window for large files or folders."
                 ),
                 required=False,
-                default=2000
-            )
+                default=DEFAULT_READ_LIMIT,
+            ),
         ]
-    
+
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """Execute file read or directory listing"""
         path = parameters.get("path")
         offset = parameters.get("offset", 0)
-        limit = parameters.get("limit", 2000)
+        limit = parameters.get("limit", DEFAULT_READ_LIMIT)
 
-        if not path:
+        if not path or not isinstance(path, str):
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: path"
+                message="Missing required parameter: path",
             )
-
         if not isinstance(offset, int) or offset < 0:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Parameter offset must be an integer greater than or equal to 0"
+                message="Parameter offset must be an integer greater than or equal to 0",
             )
-
         if not isinstance(limit, int) or limit < 1:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Parameter limit must be an integer greater than or equal to 1"
+                message="Parameter limit must be an integer greater than or equal to 1",
             )
 
         try:
-            # Resolve path
             full_path = self._resolve_path(path)
+        except ValueError:
+            return ToolResponse.error(
+                code=ToolErrorCode.ACCESS_DENIED,
+                message=f"Path '{path}' is outside the project root, access denied",
+            )
 
+        try:
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"Path '{path}' does not exist"
+                    message=f"Path '{path}' does not exist",
                 )
 
-            # If it's a directory, return directory listing
             if full_path.is_dir():
-                return self._list_directory(_display_path(self.project_root, full_path), full_path)
+                return self._list_directory(full_path=full_path, offset=offset, limit=limit)
 
             if is_binary_file(full_path):
                 return ToolResponse.error(
                     code=ToolErrorCode.BINARY_FILE,
-                    message=f"File '{path}' is a binary file and cannot be read as text"
+                    message=f"File '{path}' is a binary file and cannot be read as text",
                 )
 
-            # Read file (with encoding fallback)
-            content, encoding = read_text_file(full_path)
-            lines = content.splitlines()
+            try:
+                window = read_text_window(
+                    full_path,
+                    offset=offset,
+                    limit=limit,
+                    max_bytes=MAX_READ_BYTES,
+                    max_line_length=MAX_READ_LINE_LENGTH,
+                )
+            except ValueError as exc:
+                return ToolResponse.error(
+                    code=ToolErrorCode.INVALID_PARAM,
+                    message=str(exc),
+                )
 
-            # Apply offset and limit
-            total_lines = len(lines)
-            if offset > 0:
-                lines = lines[offset:]
-            if limit > 0:
-                lines = lines[:limit]
+            state = _snapshot_file(full_path, encoding=window.encoding)
+            rel_path = self._display_path(full_path)
+            self._cache_state(rel_path, state)
 
-            selected_content = '\n'.join(lines)
-
-            # Get file metadata (for optimistic locking)
-            mtime = os.path.getmtime(full_path)
-            size = os.path.getsize(full_path)
-            file_mtime_ms = int(mtime * 1000)
-            file_size_bytes = size
-            rel_path = _display_path(self.project_root, full_path)
-
-            # Cache metadata to ToolRegistry
-            if self.registry:
-                self.registry.cache_read_metadata(rel_path, {
-                    "file_mtime_ms": file_mtime_ms,
-                    "file_size_bytes": file_size_bytes
-                })
-
-            if lines:
-                numbered = format_numbered_lines(selected_content, start_line=offset + 1)
-            else:
-                numbered = "[empty file]"
-
+            numbered = format_numbered_lines(window.content, start_line=offset + 1)
             text_lines = [
                 f"File: {rel_path}",
-                f"Encoding: {encoding}",
-                f"Line range: {offset + 1}-{offset + len(lines)} / {total_lines}",
-                (
-                    f"Metadata: file_mtime_ms={file_mtime_ms}, "
-                    f"file_size_bytes={file_size_bytes}, "
-                    f"expected_mtime_ms={file_mtime_ms}, "
-                    f"expected_size_bytes={file_size_bytes}"
-                ),
+                f"Encoding: {window.encoding}",
+                _format_range(offset, window.shown_lines, window.total_lines, "Line range"),
+                _metadata_text(state),
                 "",
                 numbered,
             ]
 
-            return ToolResponse.success(
-                text='\n'.join(text_lines),
-                data={
-                    "path": rel_path,
-                    "content": selected_content,
-                    "lines": len(lines),
-                    "total_lines": total_lines,
-                    "file_mtime_ms": file_mtime_ms,
-                    "file_size_bytes": file_size_bytes,
-                    "expected_mtime_ms": file_mtime_ms,
-                    "expected_size_bytes": file_size_bytes,
-                    "offset": offset,
-                    "limit": limit
-                }
-            )
-        except ValueError:
-            return ToolResponse.error(
-                code=ToolErrorCode.ACCESS_DENIED,
-                message=f"Path '{path}' is outside the project root, access denied"
-            )
-        
+            if window.truncated:
+                notes = []
+                if window.truncated_by_bytes:
+                    notes.append(f"Output capped at {MAX_READ_BYTES // 1024} KB.")
+                if window.truncated_long_lines:
+                    notes.append(f"Some long lines were truncated to {MAX_READ_LINE_LENGTH} characters.")
+                if window.next_offset is not None:
+                    notes.append(f"Use offset={window.next_offset} to continue.")
+                if notes:
+                    text_lines.extend(["", " ".join(notes)])
+
+            data = {
+                "path": rel_path,
+                "content": window.content,
+                "lines": window.shown_lines,
+                "total_lines": window.total_lines,
+                "offset": offset,
+                "limit": limit,
+                "encoding": window.encoding,
+                "truncated": window.truncated,
+                "truncated_by_bytes": window.truncated_by_bytes,
+                "truncated_long_lines": window.truncated_long_lines,
+                "next_offset": window.next_offset,
+                **_metadata_payload(state),
+            }
+            response_factory = ToolResponse.partial if window.truncated else ToolResponse.success
+            return response_factory(text="\n".join(text_lines), data=data)
+
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"No permission to read '{path}'"
+                message=f"No permission to read '{path}'",
             )
-        except Exception as e:
+        except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to read file: {str(e)}"
+                message=f"Failed to read file: {exc}",
             )
 
-    def _list_directory(self, path: str, full_path: Path) -> ToolResponse:
-        """List directory contents (Windows and Linux compatible)"""
+    def _list_directory(self, *, full_path: Path, offset: int, limit: int) -> ToolResponse:
         try:
-            entries = []
-            total_files = 0
-            total_dirs = 0
-
-            # Get all entries in the directory
-            for entry in sorted(full_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-                try:
-                    # Get entry information
-                    is_dir = entry.is_dir()
-                    name = entry.name
-
-                    # Get size and modification time
-                    if is_dir:
-                        size_str = "<DIR>"
-                        total_dirs += 1
-                    else:
-                        try:
-                            size = entry.stat().st_size
-                            size_str = self._format_size(size)
-                            total_files += 1
-                        except:
-                            size_str = "?"
-
-                    # Get modification time
-                    try:
-                        mtime = entry.stat().st_mtime
-                        mtime_str = self._format_time(mtime)
-                    except:
-                        mtime_str = "?"
-
-                    # Use forward slash as path separator (cross-platform compatibility)
-                    relative_path = str(entry.relative_to(self.project_root)).replace(os.sep, '/')
-
-                    entries.append({
-                        "name": name,
-                        "type": "directory" if is_dir else "file",
-                        "size": size_str,
-                        "mtime": mtime_str,
-                        "path": relative_path
-                    })
-                except Exception:
-                    # Skip inaccessible entries
-                    continue
-
-            # Construct output text
-            if not entries:
-                text = f"Directory '{path}' is empty"
-            else:
-                lines = [f"Directory '{path}' contains {total_files} files, {total_dirs} directories:\n"]
-                for entry in entries:
-                    type_icon = "📁" if entry["type"] == "directory" else "📄"
-                    lines.append(f"{type_icon} {entry['name']:<40} {entry['size']:>10} {entry['mtime']}")
-                text = "\n".join(lines)
-
-            return ToolResponse.success(
-                text=text,
-                data={
-                    "path": path,
-                    "entries": entries,
-                    "total_files": total_files,
-                    "total_dirs": total_dirs,
-                    "is_directory": True
-                }
-            )
+            raw_entries = list(full_path.iterdir())
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"No permission to access directory '{path}'"
+                message=f"No permission to access directory '{self._display_path(full_path)}'",
             )
-        except Exception as e:
+
+        raw_entries.sort(key=lambda item: (not item.is_dir(), item.name.lower()))
+        total_entries = len(raw_entries)
+        if offset > total_entries and not (offset == 0 and total_entries == 0):
             return ToolResponse.error(
-                code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to list directory: {str(e)}"
+                code=ToolErrorCode.INVALID_PARAM,
+                message=f"Offset {offset} is out of range for this directory ({total_entries} entries)",
             )
 
-    def _format_size(self, size: int) -> str:
-        """Format file size"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return f"{size:.1f}{unit}"
-            size /= 1024.0
-        return f"{size:.1f}TB"
+        total_files = 0
+        total_dirs = 0
+        entries = []
+        for entry in raw_entries:
+            is_dir = entry.is_dir()
+            total_dirs += int(is_dir)
+            total_files += int(not is_dir)
+            stat_result = None
+            if not is_dir:
+                try:
+                    stat_result = entry.stat()
+                except OSError:
+                    stat_result = None
+            try:
+                mtime = entry.stat().st_mtime
+                mtime_text = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                mtime_text = "?"
 
-    def _format_time(self, timestamp: float) -> str:
-        """Format timestamp (Windows and Linux compatible)"""
-        from datetime import datetime
-        dt = datetime.fromtimestamp(timestamp)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+            size_text = "<DIR>" if is_dir else (self._format_size(stat_result.st_size) if stat_result else "?")
+            entries.append(
+                {
+                    "name": entry.name,
+                    "type": "directory" if is_dir else "file",
+                    "size": size_text,
+                    "mtime": mtime_text,
+                    "path": self._display_path(entry),
+                }
+            )
 
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve relative path (Windows and Linux compatible)"""
-        # Unify path separators: convert backslashes to forward slashes
-        path = path.replace('\\', '/')
+        selected_entries = entries[offset : offset + limit]
+        truncated = offset + len(selected_entries) < total_entries
+        rel_path = self._display_path(full_path)
 
-        # If it's an absolute path, use it directly
-        if os.path.isabs(path):
-            full_path = Path(path).resolve()
+        if not selected_entries and total_entries == 0:
+            body = "[empty directory]"
         else:
-            # Otherwise, relative to working_dir
-            full_path = (self.working_dir / path).resolve()
+            body_lines = []
+            for entry in selected_entries:
+                marker = "[DIR]" if entry["type"] == "directory" else "[FILE]"
+                body_lines.append(
+                    f"{marker:<6} {entry['name']:<40} {entry['size']:>10} {entry['mtime']}"
+                )
+            body = "\n".join(body_lines) if body_lines else "[no entries in requested window]"
 
-        full_path.relative_to(self.project_root)
-        return full_path
+        text_lines = [
+            f"Directory: {rel_path}",
+            _format_range(offset, len(selected_entries), total_entries, "Entry range"),
+            f"Totals: directories={total_dirs}, files={total_files}",
+            "",
+            body,
+        ]
+        if truncated:
+            text_lines.extend(["", f"Use offset={offset + len(selected_entries)} to continue."])
+
+        data = {
+            "path": rel_path,
+            "entries": selected_entries,
+            "total_entries": total_entries,
+            "total_files": total_files,
+            "total_dirs": total_dirs,
+            "is_directory": True,
+            "offset": offset,
+            "limit": limit,
+            "truncated": truncated,
+            "next_offset": offset + len(selected_entries) if truncated else None,
+        }
+        response_factory = ToolResponse.partial if truncated else ToolResponse.success
+        return response_factory(text="\n".join(text_lines), data=data)
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024.0:
+                return f"{value:.1f}{unit}"
+            value /= 1024.0
+        return f"{value:.1f}TB"
 
 
 class ListFilesTool(ReadTool):
-    """Directory listing tool (compatibility with legacy LS tool naming)"""
+    """Directory listing tool using the historical LS name."""
 
     def __init__(
         self,
         project_root: str = ".",
         working_dir: Optional[str] = None,
-        registry: Optional['ToolRegistry'] = None
+        registry: Optional["ToolRegistry"] = None,
     ):
         super().__init__(project_root=project_root, working_dir=working_dir, registry=registry)
         self.name = "LS"
         self.description = (
-            "List files and folders inside a directory. Prefer this over Read when you need to "
-            "understand project structure, discover file names, or decide what to inspect next."
+            "List files and folders inside a directory. Prefer this over Read when you need "
+            "to understand project structure, discover file names, or decide what to inspect next."
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -411,66 +600,82 @@ class ListFilesTool(ReadTool):
             ToolParameter(
                 name="path",
                 type="string",
-                description="Directory path relative to the project root. Defaults to the current workspace root.",
+                description="Directory path relative to the project root. Defaults to the workspace root.",
                 required=False,
-                default="."
-            )
+                default=".",
+            ),
+            ToolParameter(
+                name="offset",
+                type="integer",
+                description="Zero-based starting directory-entry offset.",
+                required=False,
+                default=0,
+            ),
+            ToolParameter(
+                name="limit",
+                type="integer",
+                description="Maximum number of directory entries to return.",
+                required=False,
+                default=DEFAULT_LIST_LIMIT,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         path = parameters.get("path", ".")
+        offset = parameters.get("offset", 0)
+        limit = parameters.get("limit", DEFAULT_LIST_LIMIT)
+
+        if not isinstance(offset, int) or offset < 0:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="Parameter offset must be an integer greater than or equal to 0",
+            )
+        if not isinstance(limit, int) or limit < 1:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="Parameter limit must be an integer greater than or equal to 1",
+            )
+
         try:
             full_path = self._resolve_path(path)
-            if not full_path.exists():
-                return ToolResponse.error(
-                    code=ToolErrorCode.NOT_FOUND,
-                    message=f"Path '{path}' does not exist"
-                )
-            if not full_path.is_dir():
-                return ToolResponse.error(
-                    code=ToolErrorCode.INVALID_PARAM,
-                    message=f"Path '{path}' is not a directory"
-                )
-            return self._list_directory(_display_path(self.project_root, full_path), full_path)
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"Path '{path}' is outside the project root, access denied"
+                message=f"Path '{path}' is outside the project root, access denied",
             )
 
+        if not full_path.exists():
+            return ToolResponse.error(
+                code=ToolErrorCode.NOT_FOUND,
+                message=f"Path '{path}' does not exist",
+            )
+        if not full_path.is_dir():
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=f"Path '{path}' is not a directory",
+            )
+        return self._list_directory(full_path=full_path, offset=offset, limit=limit)
 
-class WriteTool(Tool):
-    """File Write Tool
 
-    Features:
-    - Create or overwrite a file
-    - Optimistic locking conflict detection (if file exists)
-    - Atomic write (temporary file + rename)
-    - Automatically back up the original file
-
-    Parameters:
-    - path: File path
-    - content: File content
-    - file_mtime_ms: Cached mtime (optional, for conflict detection)
-    """
+class WriteTool(_WorkspaceFileTool):
+    """Create or overwrite a text file."""
 
     def __init__(
         self,
         project_root: str = ".",
         working_dir: Optional[str] = None,
-        registry: Optional['ToolRegistry'] = None
+        registry: Optional["ToolRegistry"] = None,
     ):
         super().__init__(
             name="Write",
             description=(
-                "Create a new file or replace the full contents of an existing file. Use this for "
-                "full-file rewrites, generated files, or when a change is too broad for Edit."
+                "Create a new file or replace the full contents of an existing file. "
+                "Use this for full-file rewrites or generated files."
             ),
-            expandable=False
+            project_root=project_root,
+            working_dir=working_dir,
+            registry=registry,
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = Path(working_dir).expanduser().resolve() if working_dir else self.project_root
-        self.registry = registry
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -478,206 +683,233 @@ class WriteTool(Tool):
                 name="path",
                 type="string",
                 description="Target file path relative to the project root.",
-                required=True
+                required=True,
             ),
             ToolParameter(
                 name="content",
                 type="string",
                 description="The complete new file content to write. This replaces the whole file.",
-                required=True
+                required=True,
             ),
             ToolParameter(
                 name="file_mtime_ms",
                 type="integer",
                 description="Legacy optimistic-lock mtime from a previous Read call.",
-                required=False
+                required=False,
+            ),
+            ToolParameter(
+                name="file_ctime_ms",
+                type="integer",
+                description="Legacy optimistic-lock ctime from a previous Read call.",
+                required=False,
+            ),
+            ToolParameter(
+                name="file_size_bytes",
+                type="integer",
+                description="Legacy optimistic-lock size from a previous Read call.",
+                required=False,
             ),
             ToolParameter(
                 name="expected_mtime_ms",
                 type="integer",
-                description="Preferred optimistic-lock mtime from Read. Pass this when rewriting an existing file.",
-                required=False
+                description="Preferred optimistic-lock mtime from Read.",
+                required=False,
+            ),
+            ToolParameter(
+                name="expected_ctime_ms",
+                type="integer",
+                description="Preferred optimistic-lock ctime from Read.",
+                required=False,
             ),
             ToolParameter(
                 name="expected_size_bytes",
                 type="integer",
                 description="Optional optimistic-lock file size from Read for stricter conflict detection.",
-                required=False
+                required=False,
             ),
             ToolParameter(
                 name="dry_run",
                 type="boolean",
                 description="If true, show the unified diff preview without writing anything to disk.",
                 required=False,
-                default=False
-            )
+                default=False,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """Execute file write"""
         path = parameters.get("path")
         content = parameters.get("content")
-        cached_mtime = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
-        cached_size = parameters.get("expected_size_bytes", parameters.get("file_size_bytes"))
         dry_run = bool(parameters.get("dry_run", False))
 
-        if not path:
+        if not path or not isinstance(path, str):
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: path"
+                message="Missing required parameter: path",
             )
-
         if content is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: content"
+                message="Missing required parameter: content",
+            )
+        if not isinstance(content, str):
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="Parameter content must be a string",
             )
 
         try:
-            # Resolve path
             full_path = self._resolve_path(path)
-            backup_path = None
-            old_content = ""
-            line_ending = "\n"
-
-            # Check if file exists
-            if full_path.exists():
-                if full_path.is_dir():
-                    return ToolResponse.error(
-                        code=ToolErrorCode.IS_DIRECTORY,
-                        message=f"Path '{path}' is a directory, cannot write as a file"
-                    )
-                if is_binary_file(full_path):
-                    return ToolResponse.error(
-                        code=ToolErrorCode.BINARY_FILE,
-                        message=f"File '{path}' is a binary file, refusing to overwrite as text"
-                    )
-
-                # Enforce read-before-write (existing files only)
-                rel_path_early = _display_path(self.project_root, full_path)
-                err = _require_prior_read(self.registry, rel_path_early)
-                if err:
-                    return err
-
-                # Get current file metadata
-                current_mtime = os.path.getmtime(full_path)
-                current_mtime_ms = int(current_mtime * 1000)
-                current_size = os.path.getsize(full_path)
-                old_content, _ = read_text_file(full_path)
-                line_ending = detect_line_ending(old_content)
-
-                # Check optimistic locking conflict
-                if cached_mtime is not None:
-                    if current_mtime_ms != cached_mtime:
-                        return ToolResponse.error(
-                            code=ToolErrorCode.CONFLICT,
-                            message=f"File modified since last read. Current mtime={current_mtime_ms}, cached mtime={cached_mtime}",
-                            context={
-                                "current_mtime_ms": current_mtime_ms,
-                                "cached_mtime_ms": cached_mtime
-                            }
-                        )
-                if cached_size is not None and current_size != cached_size:
-                    return ToolResponse.error(
-                        code=ToolErrorCode.CONFLICT,
-                        message=f"File size changed since last read. Current size={current_size}, cached size={cached_size}",
-                        context={
-                            "current_size_bytes": current_size,
-                            "cached_size_bytes": cached_size
-                        }
-                    )
-
-                # Back up original file
-                if not dry_run:
-                    backup_path = self._backup_file(full_path)
-            else:
-                # Ensure parent directory exists
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-
-            rel_path = _display_path(self.project_root, full_path)
-            normalized_content = normalize_line_endings(content, line_ending) if old_content else content
-
-            if old_content == normalized_content:
-                existing_mtime = int(os.getmtime(full_path) * 1000) if full_path.exists() else 0
-                existing_size = os.path.getsize(full_path) if full_path.exists() else len(normalized_content.encode('utf-8'))
-                return _no_change_response("Write check complete", rel_path, existing_mtime, existing_size)
-
-            diff_preview, diff_truncated = make_diff_preview(old_content, normalized_content, rel_path)
-
-            if not dry_run:
-                # Atomic write
-                atomic_write(full_path, normalized_content)
-
-            size_bytes = len(normalized_content.encode('utf-8'))
-            if dry_run:
-                new_mtime_ms = cached_mtime
-            else:
-                new_mtime_ms = int(os.path.getmtime(full_path) * 1000)
-
-            response_factory = ToolResponse.partial if dry_run else ToolResponse.success
-            return response_factory(
-                text=(
-                    f"{'Dry run: Will write' if dry_run else 'Successfully wrote'} {rel_path} ({size_bytes} bytes)\n"
-                    f"Metadata: file_mtime_ms={new_mtime_ms}, file_size_bytes={size_bytes}, "
-                    f"expected_mtime_ms={new_mtime_ms}, expected_size_bytes={size_bytes}"
-                    + _format_diff_section(diff_preview, diff_truncated)
-                ),
-                data={
-                    "path": rel_path,
-                    "written": True,
-                    "dry_run": dry_run,
-                    "size_bytes": size_bytes,
-                    "file_mtime_ms": new_mtime_ms,
-                    "file_size_bytes": size_bytes,
-                    "expected_mtime_ms": new_mtime_ms,
-                    "expected_size_bytes": size_bytes,
-                    "diff_preview": diff_preview,
-                    "diff_truncated": diff_truncated,
-                    "backup_path": str(backup_path.relative_to(self.working_dir)) if backup_path else None
-                }
-            )
-
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
-                message=f"Path '{path}' is outside the project root, access denied"
+                message=f"Path '{path}' is outside the project root, access denied",
             )
+
+        try:
+            rel_path = self._display_path(full_path)
+            with _path_lock(full_path):
+                old_content = ""
+                encoding = "utf-8"
+                line_ending = "\n"
+                current_state: Optional[FileState] = None
+                backup_path: Optional[Path] = None
+
+                if full_path.exists():
+                    if full_path.is_dir():
+                        return ToolResponse.error(
+                            code=ToolErrorCode.IS_DIRECTORY,
+                            message=f"Path '{path}' is a directory, cannot write as a file",
+                        )
+                    if is_binary_file(full_path):
+                        return ToolResponse.error(
+                            code=ToolErrorCode.BINARY_FILE,
+                            message=f"File '{path}' is a binary file, refusing to overwrite as text",
+                        )
+
+                    require_read_error = self._require_prior_read(rel_path)
+                    if require_read_error:
+                        return require_read_error
+
+                    old_content, encoding = read_text_file(full_path)
+                    line_ending = detect_line_ending(old_content)
+                    current_state = _snapshot_file(full_path, encoding=encoding)
+                    expected_state = self._expected_state_from_parameters(parameters, rel_path)
+                    conflict = self._check_expected_state(
+                        rel_path=rel_path,
+                        current_state=current_state,
+                        expected_state=expected_state,
+                    )
+                    if conflict:
+                        return conflict
+
+                else:
+                    full_path.parent.mkdir(parents=True, exist_ok=True)
+
+                new_content = normalize_line_endings(content, line_ending) if old_content else content
+                if current_state and new_content == old_content:
+                    self._cache_state(rel_path, current_state)
+                    return _no_change_response("Write check complete", rel_path, current_state)
+
+                diff_preview, diff_truncated = make_diff_preview(old_content, new_content, rel_path)
+                predicted_size_bytes = len(new_content.encode(encoding))
+                formatter_result = FormatterResult(
+                    attempted=False,
+                    available=False,
+                    success=False,
+                    skipped_reason="Formatter was not run.",
+                )
+                diagnostics_result = DiagnosticsResult(
+                    attempted=False,
+                    available=False,
+                    success=False,
+                    skipped_reason="Diagnostics were not run.",
+                )
+
+                if not dry_run:
+                    if full_path.exists():
+                        backup_path = self._backup_file(full_path)
+                    atomic_write(full_path, new_content, encoding=encoding)
+                    formatter_result = run_formatter(full_path, self.project_root)
+                    diagnostics_result = run_diagnostics(full_path, self.project_root)
+                    final_content, final_encoding = read_text_file(full_path)
+                    encoding = final_encoding
+                    predicted_size_bytes = len(final_content.encode(encoding))
+                    diff_preview, diff_truncated = make_diff_preview(old_content, final_content, rel_path)
+                    new_state = _snapshot_file(full_path, encoding=encoding)
+                    self._cache_state(rel_path, new_state)
+                else:
+                    new_state = current_state
+
+                text_lines = [
+                    f"{'Dry run: would write' if dry_run else 'Successfully wrote'} {rel_path} ({predicted_size_bytes} bytes)",
+                ]
+                if new_state is not None:
+                    text_lines.append(_metadata_text(new_state))
+                else:
+                    text_lines.append("Metadata: file will be created on actual execution.")
+                if backup_path is not None:
+                    text_lines.append(f"Backup: {self._display_path(backup_path)}")
+                formatter_summary = _formatter_summary(formatter_result)
+                if formatter_summary:
+                    text_lines.append(formatter_summary)
+                text_lines.extend(_diagnostics_summary(diagnostics_result))
+                text_lines.append(_format_diff_section(diff_preview, diff_truncated))
+
+                data = {
+                    "path": rel_path,
+                    "written": not dry_run,
+                    "modified": True,
+                    "dry_run": dry_run,
+                    "size_bytes": predicted_size_bytes,
+                    "diff_preview": diff_preview,
+                    "diff_truncated": diff_truncated,
+                    "backup_path": self._display_path(backup_path) if backup_path else None,
+                    "encoding": encoding,
+                    "formatter": formatter_result.to_dict(),
+                    "diagnostics": diagnostics_result.to_dict(),
+                }
+                if new_state is not None:
+                    data.update(_metadata_payload(new_state))
+                else:
+                    data.update(
+                        {
+                            "file_mtime_ms": None,
+                            "file_ctime_ms": None,
+                            "file_size_bytes": predicted_size_bytes,
+                            "expected_mtime_ms": None,
+                            "expected_ctime_ms": None,
+                            "expected_size_bytes": predicted_size_bytes,
+                        }
+                    )
+
+                response_factory = (
+                    ToolResponse.partial if dry_run or _post_process_failed(formatter_result, diagnostics_result) else ToolResponse.success
+                )
+                return response_factory(text="\n".join(text_lines), data=data)
 
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"No permission to write '{path}'"
+                message=f"No permission to write '{path}'",
             )
-        except Exception as e:
+        except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to write file: {str(e)}"
+                message=f"Failed to write file: {exc}",
             )
 
-    def _backup_file(self, full_path: Path) -> Path:
-        """Back up file"""
+    @staticmethod
+    def _backup_file(full_path: Path) -> Path:
         backup_dir = full_path.parent / ".backups"
         backup_dir.mkdir(exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{full_path.name}.{timestamp}.bak"
-        backup_path = backup_dir / backup_name
-
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = backup_dir / f"{full_path.name}.{timestamp}.bak"
         shutil.copy2(full_path, backup_path)
         return backup_path
 
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve relative path"""
-        if os.path.isabs(path):
-            full_path = Path(path).resolve()
-        else:
-            full_path = (self.working_dir / path).resolve()
-        full_path.relative_to(self.project_root)
-        return full_path
 
-
-class DeleteTool(Tool):
-    """Safe file/directory deletion tool with atomic move-to-trash behavior."""
+class DeleteTool(_WorkspaceFileTool):
+    """Safe delete for files and directories."""
 
     PROTECTED_PARTS = {".git", ".hg", ".svn"}
     MAX_DIR_ENTRIES_WITHOUT_FORCE = 2000
@@ -686,20 +918,18 @@ class DeleteTool(Tool):
         self,
         project_root: str = ".",
         working_dir: Optional[str] = None,
-        registry: Optional['ToolRegistry'] = None,
+        registry: Optional["ToolRegistry"] = None,
     ):
         super().__init__(
             name="Delete",
             description=(
-                "Delete a file or directory safely. Uses an atomic move to an internal trash area first "
-                "to reduce accidental data loss risk. Supports dry-run, recursive directory deletion, and "
-                "optional permanent purge."
+                "Delete a file or directory safely. Uses an atomic move to an internal trash area "
+                "first to reduce accidental data loss risk."
             ),
-            expandable=False,
+            project_root=project_root,
+            working_dir=working_dir,
+            registry=registry,
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = Path(working_dir).expanduser().resolve() if working_dir else self.project_root
-        self.registry = registry
         self.trash_root = (self.project_root / "memory" / ".delete_trash").resolve()
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -734,23 +964,44 @@ class DeleteTool(Tool):
             ToolParameter(
                 name="purge",
                 type="boolean",
-                description=(
-                    "If true, permanently delete from trash after atomic move. "
-                    "Default false keeps recoverable trash copy."
-                ),
+                description="If true, permanently delete from trash after the atomic move.",
                 required=False,
                 default=False,
             ),
             ToolParameter(
+                name="file_mtime_ms",
+                type="integer",
+                description="Legacy optimistic-lock mtime from a previous Read call.",
+                required=False,
+            ),
+            ToolParameter(
+                name="file_ctime_ms",
+                type="integer",
+                description="Legacy optimistic-lock ctime from a previous Read call.",
+                required=False,
+            ),
+            ToolParameter(
+                name="file_size_bytes",
+                type="integer",
+                description="Legacy optimistic-lock size from a previous Read call.",
+                required=False,
+            ),
+            ToolParameter(
                 name="expected_mtime_ms",
                 type="integer",
-                description="Optional optimistic-lock mtime from a previous Read call.",
+                description="Preferred optimistic-lock mtime from Read.",
+                required=False,
+            ),
+            ToolParameter(
+                name="expected_ctime_ms",
+                type="integer",
+                description="Preferred optimistic-lock ctime from Read.",
                 required=False,
             ),
             ToolParameter(
                 name="expected_size_bytes",
                 type="integer",
-                description="Optional optimistic-lock file size from a previous Read call.",
+                description="Optional optimistic-lock file size from Read.",
                 required=False,
             ),
         ]
@@ -761,8 +1012,6 @@ class DeleteTool(Tool):
         force = bool(parameters.get("force", False))
         dry_run = bool(parameters.get("dry_run", False))
         purge = bool(parameters.get("purge", False))
-        expected_mtime_ms = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
-        expected_size_bytes = parameters.get("expected_size_bytes", parameters.get("file_size_bytes"))
 
         if not path or not isinstance(path, str):
             return ToolResponse.error(
@@ -772,6 +1021,13 @@ class DeleteTool(Tool):
 
         try:
             full_path = self._resolve_path(path)
+        except ValueError:
+            return ToolResponse.error(
+                code=ToolErrorCode.ACCESS_DENIED,
+                message=f"Path '{path}' is outside the project root, access denied",
+            )
+
+        try:
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
@@ -785,144 +1041,113 @@ class DeleteTool(Tool):
                     message=protected_error,
                 )
 
-            rel_path = _display_path(self.project_root, full_path)
+            rel_path = self._display_path(full_path)
+            with _path_lock(full_path):
+                if full_path.is_file():
+                    require_read_error = self._require_prior_read(rel_path)
+                    if require_read_error:
+                        return require_read_error
 
-            if full_path.is_file():
-                require_read_error = _require_prior_read(self.registry, rel_path)
-                if require_read_error:
-                    return require_read_error
-
-            stat = full_path.stat()
-            current_mtime_ms = int(stat.st_mtime * 1000)
-            current_size_bytes = stat.st_size if full_path.is_file() else 0
-
-            if expected_mtime_ms is not None and current_mtime_ms != expected_mtime_ms:
-                return ToolResponse.error(
-                    code=ToolErrorCode.CONFLICT,
-                    message=(
-                        f"File changed since last read. expected_mtime_ms={expected_mtime_ms}, "
-                        f"actual_mtime_ms={current_mtime_ms}."
-                    ),
-                    context={
-                        "path": rel_path,
-                        "expected_mtime_ms": expected_mtime_ms,
-                        "actual_mtime_ms": current_mtime_ms,
-                    },
+                stat = full_path.stat()
+                current_state = FileState(
+                    mtime_ms=int(stat.st_mtime * 1000),
+                    ctime_ms=int(stat.st_ctime * 1000),
+                    size_bytes=stat.st_size if full_path.is_file() else 0,
                 )
 
-            if full_path.is_file() and expected_size_bytes is not None and current_size_bytes != expected_size_bytes:
-                return ToolResponse.error(
-                    code=ToolErrorCode.CONFLICT,
-                    message=(
-                        f"File size changed since last read. expected_size_bytes={expected_size_bytes}, "
-                        f"actual_size_bytes={current_size_bytes}."
-                    ),
-                    context={
-                        "path": rel_path,
-                        "expected_size_bytes": expected_size_bytes,
-                        "actual_size_bytes": current_size_bytes,
-                    },
+                expected_state = self._expected_state_from_parameters(parameters, rel_path)
+                conflict = self._check_expected_state(
+                    rel_path=rel_path,
+                    current_state=current_state,
+                    expected_state=expected_state,
                 )
+                if conflict:
+                    return conflict
 
-            entry_count = 0
-            total_file_bytes = current_size_bytes
-            is_dir = full_path.is_dir()
+                entry_count = 1
+                total_file_bytes = current_state.size_bytes
+                is_dir = full_path.is_dir()
 
-            if is_dir:
-                entry_count, total_file_bytes = self._scan_directory_stats(full_path)
-                if entry_count > 0 and not recursive:
-                    return ToolResponse.error(
-                        code=ToolErrorCode.INVALID_PARAM,
-                        message=(
-                            f"Directory '{path}' is not empty. Set recursive=true to delete it."
+                if is_dir:
+                    entry_count, total_file_bytes = self._scan_directory_stats(full_path)
+                    if entry_count > 0 and not recursive:
+                        return ToolResponse.error(
+                            code=ToolErrorCode.INVALID_PARAM,
+                            message=f"Directory '{path}' is not empty. Set recursive=true to delete it.",
+                        )
+                    if entry_count > self.MAX_DIR_ENTRIES_WITHOUT_FORCE and not force:
+                        return ToolResponse.error(
+                            code=ToolErrorCode.INVALID_PARAM,
+                            message=(
+                                f"Directory '{path}' contains {entry_count} entries. "
+                                "Set force=true to confirm large recursive deletion."
+                            ),
+                        )
+
+                if dry_run:
+                    return ToolResponse.partial(
+                        text=(
+                            f"Dry run: would delete {rel_path}\n"
+                            f"Type: {'directory' if is_dir else 'file'}\n"
+                            f"Recursive: {recursive}\n"
+                            f"Estimated entries: {entry_count}\n"
+                            f"Estimated bytes: {total_file_bytes}"
                         ),
-                    )
-                if entry_count > self.MAX_DIR_ENTRIES_WITHOUT_FORCE and not force:
-                    return ToolResponse.error(
-                        code=ToolErrorCode.INVALID_PARAM,
-                        message=(
-                            f"Directory '{path}' contains {entry_count} entries. "
-                            f"Set force=true to confirm large recursive deletion."
-                        ),
+                        data={
+                            "path": rel_path,
+                            "deleted": False,
+                            "dry_run": True,
+                            "is_directory": is_dir,
+                            "recursive": recursive,
+                            "entry_count": entry_count,
+                            "estimated_bytes": total_file_bytes,
+                            **_metadata_payload(current_state),
+                        },
                     )
 
-            if dry_run:
-                return ToolResponse.partial(
+                trash_path = self._make_trash_path(full_path)
+                self.trash_root.mkdir(parents=True, exist_ok=True)
+                os.replace(str(full_path), str(trash_path))
+
+                purged = False
+                if purge:
+                    if trash_path.is_dir():
+                        shutil.rmtree(trash_path)
+                    else:
+                        trash_path.unlink(missing_ok=True)
+                    purged = True
+
+                self._clear_cached_state(rel_path, recursive=is_dir)
+                return ToolResponse.success(
                     text=(
-                        f"Dry run: would delete {rel_path}\n"
+                        f"Deleted {rel_path} via atomic trash move\n"
                         f"Type: {'directory' if is_dir else 'file'}\n"
                         f"Recursive: {recursive}\n"
-                        f"Estimated entries: {entry_count if is_dir else 1}\n"
-                        f"Estimated bytes: {total_file_bytes}"
+                        f"Purged: {purged}\n"
+                        f"Trash path: {self._display_path(trash_path)}"
                     ),
                     data={
                         "path": rel_path,
-                        "deleted": False,
-                        "dry_run": True,
+                        "deleted": True,
                         "is_directory": is_dir,
                         "recursive": recursive,
-                        "entry_count": entry_count if is_dir else 1,
+                        "purged": purged,
+                        "entry_count": entry_count,
                         "estimated_bytes": total_file_bytes,
+                        "trash_path": self._display_path(trash_path),
                     },
                 )
 
-            trash_path = self._make_trash_path(full_path)
-            self.trash_root.mkdir(parents=True, exist_ok=True)
-
-            # Atomic move (same filesystem under project root)
-            os.replace(str(full_path), str(trash_path))
-
-            purged = False
-            if purge:
-                if trash_path.is_dir():
-                    shutil.rmtree(trash_path)
-                else:
-                    trash_path.unlink(missing_ok=True)
-                purged = True
-
-            return ToolResponse.success(
-                text=(
-                    f"Deleted {rel_path} via atomic trash move\n"
-                    f"Type: {'directory' if is_dir else 'file'}\n"
-                    f"Recursive: {recursive}\n"
-                    f"Purged: {purged}\n"
-                    f"Trash path: { _display_path(self.project_root, trash_path) }"
-                ),
-                data={
-                    "path": rel_path,
-                    "deleted": True,
-                    "is_directory": is_dir,
-                    "recursive": recursive,
-                    "purged": purged,
-                    "entry_count": entry_count if is_dir else 1,
-                    "estimated_bytes": total_file_bytes,
-                    "trash_path": _display_path(self.project_root, trash_path),
-                },
-            )
-
-        except ValueError:
-            return ToolResponse.error(
-                code=ToolErrorCode.ACCESS_DENIED,
-                message=f"Path '{path}' is outside the project root, access denied",
-            )
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
                 message=f"No permission to delete '{path}'",
             )
-        except Exception as e:
+        except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to delete path: {str(e)}",
+                message=f"Failed to delete path: {exc}",
             )
-
-    def _resolve_path(self, path: str) -> Path:
-        if os.path.isabs(path):
-            full_path = Path(path).resolve()
-        else:
-            full_path = (self.working_dir / path).resolve()
-        full_path.relative_to(self.project_root)
-        return full_path
 
     def _validate_protected_path(self, full_path: Path) -> Optional[str]:
         if full_path == self.project_root:
@@ -933,21 +1158,20 @@ class DeleteTool(Tool):
             return "Refusing to delete an ancestor of the current working directory."
         if self.trash_root == full_path or self.trash_root.is_relative_to(full_path):
             return "Refusing to delete the internal delete trash area."
-
         for part in full_path.parts:
             if part in self.PROTECTED_PARTS:
                 return f"Refusing to delete protected path segment '{part}'."
         return None
 
-    def _scan_directory_stats(self, directory: Path) -> tuple[int, int]:
+    @staticmethod
+    def _scan_directory_stats(directory: Path) -> tuple[int, int]:
         entry_count = 0
         total_file_bytes = 0
         for root, dirnames, filenames in os.walk(directory):
             entry_count += len(dirnames) + len(filenames)
             for filename in filenames:
-                file_path = Path(root) / filename
                 try:
-                    total_file_bytes += file_path.stat().st_size
+                    total_file_bytes += (Path(root) / filename).stat().st_size
                 except OSError:
                     continue
         return entry_count, total_file_bytes
@@ -961,39 +1185,26 @@ class DeleteTool(Tool):
         return candidate
 
 
-class EditTool(Tool):
-    """File Edit Tool
-
-    Features:
-    - Precise replacement of file content (single-match by default, optional replace-all mode)
-    - Optimistic locking conflict detection
-    - Automatically back up the original file
-
-    Parameters:
-    - path: File path
-    - old_string: Content to be replaced
-    - new_string: Replacement content
-    - replace_all: Whether to replace all matches (optional, defaults to False)
-    - file_mtime_ms: Cached mtime (optional)
-    """
+class EditTool(_WorkspaceFileTool):
+    """Apply precise text replacement inside an existing text file."""
 
     def __init__(
         self,
         project_root: str = ".",
         working_dir: Optional[str] = None,
-        registry: Optional['ToolRegistry'] = None
+        registry: Optional["ToolRegistry"] = None,
     ):
         super().__init__(
             name="Edit",
             description=(
-                "Apply precise text replacement(s) inside an existing text file. By default it performs "
-                "one unique match replacement; set `replace_all=true` to replace every occurrence."
+                "Apply precise text replacement(s) inside an existing text file. "
+                "By default it performs one unique match replacement; set replace_all=true "
+                "to replace every occurrence."
             ),
-            expandable=False
+            project_root=project_root,
+            working_dir=working_dir,
+            registry=registry,
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = Path(working_dir).expanduser().resolve() if working_dir else self.project_root
-        self.registry = registry
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -1001,256 +1212,266 @@ class EditTool(Tool):
                 name="path",
                 type="string",
                 description="Existing file path relative to the project root.",
-                required=True
+                required=True,
             ),
             ToolParameter(
                 name="old_string",
                 type="string",
                 description=(
-                    "Exact existing text to replace. It must match exactly one location in the file. "
-                    "Include enough surrounding context to make the match unique."
+                    "Exact existing text to replace. It must match exactly one location in the file "
+                    "unless replace_all=true."
                 ),
-                required=True
+                required=True,
             ),
             ToolParameter(
                 name="new_string",
                 type="string",
-                description="Replacement text for the matched `old_string`.",
-                required=True
+                description="Replacement text for the matched old_string.",
+                required=True,
             ),
             ToolParameter(
                 name="replace_all",
                 type="boolean",
-                description=(
-                    "If true, replace all occurrences of `old_string`. If false (default), "
-                    "`old_string` must match exactly one location."
-                ),
+                description="If true, replace all occurrences of old_string.",
                 required=False,
-                default=False
+                default=False,
             ),
             ToolParameter(
                 name="file_mtime_ms",
                 type="integer",
                 description="Legacy optimistic-lock mtime from a previous Read call.",
-                required=False
+                required=False,
+            ),
+            ToolParameter(
+                name="file_ctime_ms",
+                type="integer",
+                description="Legacy optimistic-lock ctime from a previous Read call.",
+                required=False,
+            ),
+            ToolParameter(
+                name="file_size_bytes",
+                type="integer",
+                description="Legacy optimistic-lock size from a previous Read call.",
+                required=False,
             ),
             ToolParameter(
                 name="expected_mtime_ms",
                 type="integer",
                 description="Preferred optimistic-lock mtime from Read.",
-                required=False
+                required=False,
+            ),
+            ToolParameter(
+                name="expected_ctime_ms",
+                type="integer",
+                description="Preferred optimistic-lock ctime from Read.",
+                required=False,
             ),
             ToolParameter(
                 name="expected_size_bytes",
                 type="integer",
                 description="Optional optimistic-lock file size from Read for stricter conflict detection.",
-                required=False
+                required=False,
             ),
             ToolParameter(
                 name="dry_run",
                 type="boolean",
                 description="If true, show the unified diff preview without writing anything to disk.",
                 required=False,
-                default=False
-            )
+                default=False,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """Execute file edit"""
         path = parameters.get("path")
         old_string = parameters.get("old_string")
         new_string = parameters.get("new_string")
         replace_all = bool(parameters.get("replace_all", False))
-        cached_mtime = parameters.get("expected_mtime_ms", parameters.get("file_mtime_ms"))
-        cached_size = parameters.get("expected_size_bytes", parameters.get("file_size_bytes"))
         dry_run = bool(parameters.get("dry_run", False))
 
-        if not path:
+        if not path or not isinstance(path, str):
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: path"
+                message="Missing required parameter: path",
             )
-
         if old_string is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: old_string"
+                message="Missing required parameter: old_string",
             )
-
         if new_string is None:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="Missing required parameter: new_string"
+                message="Missing required parameter: new_string",
+            )
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="old_string and new_string must both be strings",
             )
         if old_string == "":
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
-                message="old_string cannot be empty"
+                message="old_string cannot be empty",
             )
 
         try:
-            # Resolve path
             full_path = self._resolve_path(path)
+        except ValueError:
+            return ToolResponse.error(
+                code=ToolErrorCode.ACCESS_DENIED,
+                message=f"Path '{path}' is outside the project root, access denied",
+            )
 
+        try:
             if not full_path.exists():
                 return ToolResponse.error(
                     code=ToolErrorCode.NOT_FOUND,
-                    message=f"File '{path}' does not exist"
+                    message=f"File '{path}' does not exist",
                 )
             if full_path.is_dir():
                 return ToolResponse.error(
                     code=ToolErrorCode.IS_DIRECTORY,
-                    message=f"Path '{path}' is a directory, cannot edit as a file"
+                    message=f"Path '{path}' is a directory, cannot edit as a file",
                 )
             if is_binary_file(full_path):
                 return ToolResponse.error(
                     code=ToolErrorCode.BINARY_FILE,
-                    message=f"File '{path}' is a binary file, cannot edit as text"
+                    message=f"File '{path}' is a binary file, cannot edit as text",
                 )
 
-            # Enforce read-before-edit
-            rel_path = _display_path(self.project_root, full_path)
-            err = _require_prior_read(self.registry, rel_path)
-            if err:
-                return err
+            rel_path = self._display_path(full_path)
+            with _path_lock(full_path):
+                require_read_error = self._require_prior_read(rel_path)
+                if require_read_error:
+                    return require_read_error
 
-            # Get current file metadata
-            current_mtime = os.path.getmtime(full_path)
-            current_mtime_ms = int(current_mtime * 1000)
-            current_size = os.path.getsize(full_path)
-
-            # Check optimistic locking conflict
-            if cached_mtime is not None and current_mtime_ms != cached_mtime:
-                return ToolResponse.error(
-                    code=ToolErrorCode.CONFLICT,
-                    message=f"File modified since last read. Current mtime={current_mtime_ms}, cached mtime={cached_mtime}",
-                    context={
-                        "current_mtime_ms": current_mtime_ms,
-                        "cached_mtime_ms": cached_mtime
-                    }
+                content, encoding = read_text_file(full_path)
+                line_ending = detect_line_ending(content)
+                current_state = _snapshot_file(full_path, encoding=encoding)
+                expected_state = self._expected_state_from_parameters(parameters, rel_path)
+                conflict = self._check_expected_state(
+                    rel_path=rel_path,
+                    current_state=current_state,
+                    expected_state=expected_state,
                 )
-            if cached_size is not None and current_size != cached_size:
-                return ToolResponse.error(
-                    code=ToolErrorCode.CONFLICT,
-                    message=f"File size changed since last read. Current size={current_size}, cached size={cached_size}",
-                    context={
-                        "current_size_bytes": current_size,
-                        "cached_size_bytes": cached_size
-                    }
+                if conflict:
+                    return conflict
+
+                normalized_old = normalize_line_endings(old_string, line_ending)
+                normalized_new = normalize_line_endings(new_string, line_ending)
+                try:
+                    replace_result = replace_with_flexible_match(
+                        content,
+                        normalized_old,
+                        normalized_new,
+                        replace_all=replace_all,
+                    )
+                except EditNotFoundError as exc:
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=str(exc),
+                        context={"matches": 0},
+                    )
+                except EditAmbiguousError as exc:
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=str(exc),
+                    )
+                except EditMatchError as exc:
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=str(exc),
+                    )
+
+                replacements_applied = replace_result.replacements
+                new_content = replace_result.content
+
+                if new_content == content:
+                    self._cache_state(rel_path, current_state)
+                    return _no_change_response("Edit check complete", rel_path, current_state)
+
+                diff_preview, diff_truncated = make_diff_preview(content, new_content, rel_path)
+                backup_path = None
+                formatter_result = FormatterResult(
+                    attempted=False,
+                    available=False,
+                    success=False,
+                    skipped_reason="Formatter was not run.",
                 )
-
-            # Read file content
-            content, _ = read_text_file(full_path)
-            line_ending = detect_line_ending(content)
-
-            # Validate old_string match count
-            matches = content.count(old_string)
-            if matches == 0:
-                return ToolResponse.error(
-                    code=ToolErrorCode.INVALID_PARAM,
-                    message="old_string not found in file content.",
-                    context={"matches": matches}
+                diagnostics_result = DiagnosticsResult(
+                    attempted=False,
+                    available=False,
+                    success=False,
+                    skipped_reason="Diagnostics were not run.",
                 )
-            if not replace_all and matches != 1:
-                return ToolResponse.error(
-                    code=ToolErrorCode.INVALID_PARAM,
-                    message=f"old_string must match file content uniquely. Found {matches} matches.",
-                    context={"matches": matches}
-                )
+                if not dry_run:
+                    backup_path = self._backup_file(full_path)
+                    atomic_write(full_path, new_content, encoding=encoding)
+                    formatter_result = run_formatter(full_path, self.project_root)
+                    diagnostics_result = run_diagnostics(full_path, self.project_root)
+                    final_content, final_encoding = read_text_file(full_path)
+                    encoding = final_encoding
+                    new_content = final_content
+                    diff_preview, diff_truncated = make_diff_preview(content, new_content, rel_path)
+                    new_state = _snapshot_file(full_path, encoding=encoding)
+                    self._cache_state(rel_path, new_state)
+                else:
+                    new_state = current_state
 
-            # Execute replacement
-            replacements_applied = matches if replace_all else 1
-            if replace_all:
-                new_content = content.replace(old_string, new_string)
-            else:
-                new_content = content.replace(old_string, new_string, 1)
-            new_content = normalize_line_endings(new_content, line_ending)
+                changed_bytes = len(new_content.encode(encoding)) - len(content.encode(encoding))
+                text_lines = [
+                    (
+                        f"{'Dry run: would edit' if dry_run else 'Successfully edited'} {rel_path} "
+                        f"({replacements_applied} replacement{'s' if replacements_applied != 1 else ''}, "
+                        f"{changed_bytes:+d} bytes changed, strategy={replace_result.strategy})"
+                    ),
+                    _metadata_text(new_state),
+                ]
+                if backup_path is not None:
+                    text_lines.append(f"Backup: {self._display_path(backup_path)}")
+                formatter_summary = _formatter_summary(formatter_result)
+                if formatter_summary:
+                    text_lines.append(formatter_summary)
+                text_lines.extend(_diagnostics_summary(diagnostics_result))
+                text_lines.append(_format_diff_section(diff_preview, diff_truncated))
 
-            if new_content == content:
-                return _no_change_response(
-                    "Edit check complete",
-                    rel_path,
-                    current_mtime_ms,
-                    current_size,
-                )
-
-            diff_preview, diff_truncated = make_diff_preview(content, new_content, rel_path)
-
-            # Back up original file
-            backup_path = self._backup_file(full_path) if not dry_run else None
-
-            # Write new content
-            if not dry_run:
-                atomic_write(full_path, new_content)
-
-            changed_bytes = (
-                len(new_string.encode('utf-8')) - len(old_string.encode('utf-8'))
-            ) * replacements_applied
-            new_mtime_ms = cached_mtime if dry_run else int(os.path.getmtime(full_path) * 1000)
-            new_size = len(new_content.encode('utf-8')) if dry_run else os.path.getsize(full_path)
-
-            response_factory = ToolResponse.partial if dry_run else ToolResponse.success
-            return response_factory(
-                text=(
-                    f"{'Dry run: Will edit' if dry_run else 'Successfully edited'} {rel_path} "
-                    f"({replacements_applied} replacement{'s' if replacements_applied != 1 else ''}, "
-                    f"{changed_bytes:+d} bytes changed)\n"
-                    f"Metadata: file_mtime_ms={new_mtime_ms}, file_size_bytes={new_size}, "
-                    f"expected_mtime_ms={new_mtime_ms}, expected_size_bytes={new_size}"
-                    + _format_diff_section(diff_preview, diff_truncated)
-                ),
-                data={
+                data = {
                     "path": rel_path,
-                    "modified": True,
+                    "modified": not dry_run,
                     "dry_run": dry_run,
                     "replace_all": replace_all,
                     "num_replacements": replacements_applied,
                     "changed_bytes": changed_bytes,
-                    "file_mtime_ms": new_mtime_ms,
-                    "file_size_bytes": new_size,
-                    "expected_mtime_ms": new_mtime_ms,
-                    "expected_size_bytes": new_size,
+                    "match_strategy": replace_result.strategy,
                     "diff_preview": diff_preview,
                     "diff_truncated": diff_truncated,
-                    "backup_path": str(backup_path.relative_to(self.working_dir))
-                    if backup_path else None,
+                    "backup_path": self._display_path(backup_path) if backup_path else None,
+                    "encoding": encoding,
+                    "formatter": formatter_result.to_dict(),
+                    "diagnostics": diagnostics_result.to_dict(),
+                    **_metadata_payload(new_state),
                 }
-            )
-
-        except ValueError:
-            return ToolResponse.error(
-                code=ToolErrorCode.ACCESS_DENIED,
-                message=f"Path '{path}' is outside the project root, access denied"
-            )
+                response_factory = (
+                    ToolResponse.partial if dry_run or _post_process_failed(formatter_result, diagnostics_result) else ToolResponse.success
+                )
+                return response_factory(text="\n".join(text_lines), data=data)
 
         except PermissionError:
             return ToolResponse.error(
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=f"No permission to edit '{path}'"
+                message=f"No permission to edit '{path}'",
             )
-        except Exception as e:
+        except Exception as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed to edit file: {str(e)}"
+                message=f"Failed to edit file: {exc}",
             )
 
-    def _backup_file(self, full_path: Path) -> Path:
-        """Back up file"""
+    @staticmethod
+    def _backup_file(full_path: Path) -> Path:
         backup_dir = full_path.parent / ".backups"
         backup_dir.mkdir(exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{full_path.name}.{timestamp}.bak"
-        backup_path = backup_dir / backup_name
-
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = backup_dir / f"{full_path.name}.{timestamp}.bak"
         shutil.copy2(full_path, backup_path)
         return backup_path
-
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve relative path"""
-        if os.path.isabs(path):
-            full_path = Path(path).resolve()
-        else:
-            full_path = (self.working_dir / path).resolve()
-        full_path.relative_to(self.project_root)
-        return full_path

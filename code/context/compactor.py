@@ -1,36 +1,30 @@
-"""ContextCompactor - Three-layer context compression engine
+"""Conversation compaction helpers for long-running agents."""
 
-Three-layer compression strategy (adapts to OpenAI function-calling message format):
-- Layer 1 (micro_compact): Called every round, truncates old tool results.
-- Layer 2 (auto_compact): When the token threshold is exceeded, the LLM generates a summary to replace all history.
-- Layer 3 (manual_compact): Manually triggered, supports an optional focus parameter to guide the summary.
+from __future__ import annotations
 
-Message format (OpenAI function calling):
-- {"role": "system", "content": "..."}
-- {"role": "user", "content": "..."}
-- {"role": "assistant", "content": "...", "tool_calls": [...]}
-- {"role": "tool", "tool_call_id": "...", "content": "..."}
-"""
-
+import json
 import os
 import re
-import json
-from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..core.config import Config
 from .token_counter import TokenCounter
 
-# ---------------------------------------------------------------------------
-# Load summary prompts from the markdown file
-# ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SUMMARY_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "summary_prompt.md"
+COMPACTION_PREFIX = "[Context compacted at "
+COMPACTION_SUMMARY_HEADING = "## Conversation Summary"
+COMPACTION_ACKNOWLEDGEMENT = (
+    "Understood. I have the conversation summary and will continue from the current state."
+)
+_TOOL_RESULT_PLACEHOLDER = "[Previous tool result: {tool_name} - truncated to save context]"
 
 
 def _extract_section(text: str, name: str) -> str:
-    """Extract content between <!-- {name}_START --> and <!-- {name}_END --> markers."""
+    """Extract content between ``START`` and ``END`` HTML comment markers."""
     pattern = rf"<!--\s*{re.escape(name)}_START\s*-->\s*\n(.*?)\n\s*<!--\s*{re.escape(name)}_END\s*-->"
     match = re.search(pattern, text, re.DOTALL)
     if not match:
@@ -38,208 +32,134 @@ def _extract_section(text: str, name: str) -> str:
     return match.group(1).strip()
 
 
-_SUMMARY_MD = _SUMMARY_PROMPT_FILE.read_text(encoding="utf-8")
-SUMMARY_SYSTEM_PROMPT: str = _extract_section(_SUMMARY_MD, "SUMMARY_SYSTEM_PROMPT")
-SUMMARY_USER_TEMPLATE: str = _extract_section(_SUMMARY_MD, "SUMMARY_USER_TEMPLATE")
+@lru_cache(maxsize=1)
+def _load_summary_prompts() -> Tuple[str, str]:
+    prompt_markdown = _SUMMARY_PROMPT_FILE.read_text(encoding="utf-8")
+    return (
+        _extract_section(prompt_markdown, "SUMMARY_SYSTEM_PROMPT"),
+        _extract_section(prompt_markdown, "SUMMARY_USER_TEMPLATE"),
+    )
+
+
+SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE = _load_summary_prompts()
+
+
+def _stringify_content(content: Any) -> str:
+    """Normalize OpenAI-style message content into a plain text string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", ""))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
 
 
 class ContextCompactor:
-    """Three-layer context compression engine
-
-    Reuses existing components:
-    - TokenCounter: token estimation
-    - ObservationTruncator's truncation concept used for single result size limits
-
-    Usage example::
-
-        compactor = ContextCompactor(config=config, token_counter=counter)
-
-        # Automatically called every round
-        compactor.micro_compact(messages)
-
-        # Called when the threshold is exceeded
-        if compactor.estimate_tokens(messages) > config.compact_token_threshold:
-            messages[:] = compactor.auto_compact(messages, llm)
-
-        # Called manually
-        messages[:] = compactor.manual_compact(messages, llm, focus="authentication module")
-    """
+    """Compaction pipeline for OpenAI-style chat transcripts."""
 
     def __init__(self, config: Config, token_counter: Optional[TokenCounter] = None):
         self.config = config
         self.token_counter = token_counter or TokenCounter()
-        # Cached tool_call_id -> tool_name mapping (incrementally updated)
         self._tool_name_map: Dict[str, str] = {}
-        self._tool_name_map_msg_count: int = 0  # messages scanned so far
-
+        self._tool_name_map_msg_count = 0
 
     def estimate_tokens(self, messages: List[Dict]) -> int:
-        """Estimate the total number of tokens in the message list
-
-        Iterates over the content field of all messages, accumulating the token count.
-        Also estimates structures like tool_calls.
-        """
+        """Estimate total prompt tokens for a message list."""
         total = 0
         for msg in messages:
-            content = msg.get("content") or ""
-            if isinstance(content, str):
-                total += self.token_counter.count_text(content)
-            elif isinstance(content, list):
-                # Multimodal content list
-                for part in content:
-                    if isinstance(part, dict):
-                        total += self.token_counter.count_text(part.get("text", ""))
-                    elif isinstance(part, str):
-                        total += self.token_counter.count_text(part)
-
-            # tool_calls also consume tokens
+            total += self.token_counter.count_text(_stringify_content(msg.get("content")))
             tool_calls = msg.get("tool_calls")
             if tool_calls:
-                total += self.token_counter.count_text(json.dumps(tool_calls, ensure_ascii=False))
-
-            # Role marker overhead
+                total += self.token_counter.count_text(json.dumps(tool_calls, ensure_ascii=False, default=str))
             total += 4
         return total
 
-
     def micro_compact(self, messages: List[Dict]) -> List[Dict]:
-        """Micro-compression: Truncate old tool results (in-place modification)
+        """Replace older, verbose tool results with small placeholders in place."""
+        keep_recent = max(0, int(self.config.compact_keep_recent_tool_results))
+        tool_indices = [index for index, msg in enumerate(messages) if msg.get("role") == "tool"]
+        if len(tool_indices) <= keep_recent:
+            return messages
 
-        Scans tool role messages backward from the newest message,
-        retains the full content of the N most recent tool results,
-        and replaces older tool results with short placeholders.
-
-        Args:
-            messages: List of messages (modified in-place)
-
-        Returns:
-            The same list of messages (convenient for chaining)
-        """
-        keep_recent = self.config.compact_keep_recent_tool_results
-
-        # Collect indices of all tool messages (from newest to oldest)
-        tool_indices = [
-            i for i, msg in enumerate(messages) if msg.get("role") == "tool"
-        ]
-        tool_indices.reverse()  # Newest first
-
-        # Build tool_call_id -> tool_name mapping (incremental update)
         tool_name_map = self._update_tool_name_map(messages)
+        for reverse_index, message_index in enumerate(reversed(tool_indices)):
+            if reverse_index < keep_recent:
+                continue
 
-        # Skip the most recent keep_recent, truncate the rest
-        for idx_pos, msg_idx in enumerate(tool_indices):
-            if idx_pos < keep_recent:
-                continue  # Keep the recent ones
+            message = messages[message_index]
+            content = _stringify_content(message.get("content"))
+            if len(content) <= 200 or content.startswith("[Previous tool result:"):
+                continue
 
-            msg = messages[msg_idx]
-            content = msg.get("content", "")
-            if len(content) > 200:
-                tool_call_id = msg.get("tool_call_id", "")
-                tool_name = tool_name_map.get(tool_call_id, "unknown")
-                msg["content"] = (
-                    f"[Previous tool result: {tool_name} — truncated to save context]"
-                )
+            tool_call_id = message.get("tool_call_id", "")
+            tool_name = tool_name_map.get(tool_call_id, "unknown")
+            message["content"] = _TOOL_RESULT_PLACEHOLDER.format(tool_name=tool_name)
 
         return messages
 
-
     def auto_compact(self, messages: List[Dict], llm) -> List[Dict]:
-        """Automatic compression: Save transcript + LLM summary replaces history
-
-        Args:
-            messages: Current list of messages
-            llm: HelloAgentsLLM instance, used to generate the summary
-
-        Returns:
-            A new (compressed) list of messages
-        """
+        """Compact history using the default summary prompt."""
         return self._compact_with_llm(messages, llm, focus=None)
 
-
     def manual_compact(self, messages: List[Dict], llm, focus: Optional[str] = None) -> List[Dict]:
-        """Manual compression: Same as auto_compact, but allows specifying a focus
-
-        Args:
-            messages: Current list of messages
-            llm: HelloAgentsLLM instance
-            focus: Optional focus description to guide the summary's emphasis
-
-        Returns:
-            A new (compressed) list of messages
-        """
+        """Compact history with an optional summary focus."""
         return self._compact_with_llm(messages, llm, focus=focus)
 
-
     def _compact_with_llm(self, messages: List[Dict], llm, focus: Optional[str]) -> List[Dict]:
-        """Core compression logic: Save transcript, generate summary, rebuild message list"""
-
-        # 1. Save full transcript
+        """Persist transcript, summarize non-system history, and rebuild messages."""
         self._save_transcript(messages)
 
-        # 2. Separate system messages (merge into at most one)
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        non_system_msgs = [m for m in messages if m.get("role") != "system"]
+        system_messages = [msg for msg in messages if msg.get("role") == "system"]
+        non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+        conversation_text = self._serialize_messages(non_system_messages, max_chars=80000)
+        summary = self._summarize_messages(non_system_messages, conversation_text, llm, focus)
 
-        # 3. Serialize conversation text (limit length to avoid overly large prompts)
-        conversation_text = self._serialize_messages(non_system_msgs, max_chars=80000)
+        compacted: List[Dict] = []
+        if system_messages:
+            merged_system = "\n\n".join(_stringify_content(msg.get("content")) for msg in system_messages)
+            compacted.append({"role": "system", "content": merged_system})
+        compacted.append({"role": "user", "content": self._build_summary_message(summary)})
+        compacted.append({"role": "assistant", "content": COMPACTION_ACKNOWLEDGEMENT})
+        return compacted
 
-        # 4. Build summary prompt
-        focus_instruction = ""
-        if focus:
-            focus_instruction = f"Pay special attention to: {focus}"
-
-        summary_prompt = SUMMARY_USER_TEMPLATE.format(
+    def _summarize_messages(
+        self,
+        messages: List[Dict],
+        conversation_text: str,
+        llm,
+        focus: Optional[str],
+    ) -> str:
+        summary_system_prompt, summary_user_template = _load_summary_prompts()
+        focus_instruction = f"Pay special attention to: {focus}" if focus else ""
+        summary_prompt = summary_user_template.format(
             conversation=conversation_text,
             focus_instruction=focus_instruction,
             max_tokens=self.config.summary_max_tokens,
         )
 
-        # 5. Call LLM to generate summary
         try:
-            summary_response = llm.invoke(
+            response = llm.invoke(
                 messages=[
-                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {"role": "system", "content": summary_system_prompt},
                     {"role": "user", "content": summary_prompt},
                 ],
                 temperature=self.config.summary_temperature,
                 max_tokens=self.config.summary_max_tokens,
             )
-            # LLMResponse object - get the content attribute
-            summary = getattr(summary_response, "content", str(summary_response))
-        except Exception as e:
-            # Fallback to a simple statistical summary
-            summary = self._generate_fallback_summary(non_system_msgs)
-            print(f"[compact] LLM summary failed ({e}), using fallback")
-
-        # 6. Rebuild message list (ensure only one system message is at the front)
-        compacted: List[Dict] = []
-        if system_msgs:
-            merged_system = "\n\n".join(m.get("content", "") for m in system_msgs)
-            compacted.append({"role": "system", "content": merged_system})
-        compacted.append({
-            "role": "user",
-            "content": (
-                f"[Context compacted at {datetime.now().strftime('%H:%M:%S')}]\n\n"
-                f"## Conversation Summary\n{summary}"
-            ),
-        })
-        compacted.append({
-            "role": "assistant",
-            "content": (
-                "Understood. I have the conversation summary and will continue from the current state."
-            ),
-        })
-
-        return compacted
+            summary = getattr(response, "content", str(response)).strip()
+            return summary or self._generate_fallback_summary(messages)
+        except Exception as exc:
+            print(f"[compact] LLM summary failed ({exc}), using fallback")
+            return self._generate_fallback_summary(messages)
 
     def _update_tool_name_map(self, messages: List[Dict]) -> Dict[str, str]:
-        """Incrementally update the tool_call_id -> tool_name mapping.
-
-        Only scans messages added since the last call, avoiding O(n) full scan
-        on every micro_compact invocation.
-        """
+        """Incrementally update the ``tool_call_id -> tool_name`` mapping."""
         start = self._tool_name_map_msg_count
-        # Handle list shrinking after compaction
         if start > len(messages):
             self._tool_name_map.clear()
             start = 0
@@ -247,88 +167,106 @@ class ContextCompactor:
         for msg in messages[start:]:
             if msg.get("role") != "assistant":
                 continue
-            tool_calls = msg.get("tool_calls")
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                tc_id = tc.get("id", "")
-                func = tc.get("function", {})
-                name = func.get("name", "unknown")
-                if tc_id:
-                    self._tool_name_map[tc_id] = name
+            for tool_call in msg.get("tool_calls") or []:
+                tool_call_id = tool_call.get("id", "")
+                function = tool_call.get("function", {}) or {}
+                tool_name = function.get("name", "unknown")
+                if tool_call_id:
+                    self._tool_name_map[tool_call_id] = tool_name
 
         self._tool_name_map_msg_count = len(messages)
         return self._tool_name_map
 
-    def _build_tool_name_map(self, messages: List[Dict]) -> Dict[str, str]:
-        """Build tool_call_id -> tool_name mapping from assistant message's tool_calls"""
-        mapping: Dict[str, str] = {}
-        for msg in messages:
-            if msg.get("role") != "assistant":
-                continue
-            tool_calls = msg.get("tool_calls")
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                tc_id = tc.get("id", "")
-                func = tc.get("function", {})
-                name = func.get("name", "unknown")
-                if tc_id:
-                    mapping[tc_id] = name
-        return mapping
+    def _serialize_messages(
+        self,
+        messages: List[Dict],
+        max_chars: int = 80000,
+        max_message_chars: int = 2000,
+    ) -> str:
+        """Serialize the newest relevant messages first within a fixed character budget."""
+        serialized = [
+            self._serialize_single_message(message, max_message_chars=max_message_chars)
+            for message in messages
+        ]
+        if not serialized:
+            return ""
 
-    def _serialize_messages(self, messages: List[Dict], max_chars: int = 80000) -> str:
-        """Serialize the message list to text (for the summary prompt)"""
-        lines = []
+        selected: List[str] = []
         total_chars = 0
-        for msg in messages:
-            role = msg.get("role", "?")
-            content = msg.get("content", "")
-
-            # Truncate a single excessively long content
-            if len(content) > 2000:
-                content = content[:2000] + "... [truncated]"
-
-            line = f"[{role}] {content}"
-            if total_chars + len(line) > max_chars:
-                lines.append("... [earlier messages truncated]")
+        for line in reversed(serialized):
+            line_chars = len(line) + (2 if selected else 0)
+            if total_chars + line_chars > max_chars:
                 break
-            lines.append(line)
-            total_chars += len(line)
+            selected.append(line)
+            total_chars += line_chars
 
-        return "\n\n".join(lines)
+        selected.reverse()
+        if len(selected) < len(serialized):
+            selected.insert(0, "... [earlier messages truncated]")
+        return "\n\n".join(selected)
 
-    def _generate_fallback_summary(self, messages: List[Dict]) -> str:
-        """Fallback summary: Pure statistical info (no LLM call)"""
+    def _serialize_single_message(self, message: Dict, max_message_chars: int) -> str:
+        """Serialize one message, preserving tool-call metadata when present."""
+        role = message.get("role", "?")
+        content = _stringify_content(message.get("content"))
+        if len(content) > max_message_chars:
+            content = content[:max_message_chars].rstrip() + "... [truncated]"
+
+        suffix_parts: List[str] = []
+        if role == "assistant" and message.get("tool_calls"):
+            tool_names = [
+                tool_call.get("function", {}).get("name", "unknown")
+                for tool_call in message.get("tool_calls", [])
+            ]
+            suffix_parts.append("tool_calls=" + ", ".join(tool_names))
+        if role == "tool" and message.get("tool_call_id"):
+            suffix_parts.append(f"tool_call_id={message['tool_call_id']}")
+
+        suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+        return f"[{role}{suffix}] {content}"
+
+    def _generate_fallback_summary(self, messages: Iterable[Dict]) -> str:
+        """Generate a deterministic summary when the LLM summary step fails."""
         role_counts: Dict[str, int] = {}
         for msg in messages:
             role = msg.get("role", "unknown")
             role_counts[role] = role_counts.get(role, 0) + 1
 
-        parts = [f"Conversation contained {len(messages)} messages:"]
+        parts = [f"Conversation contained {sum(role_counts.values())} messages:"]
         for role, count in sorted(role_counts.items()):
             parts.append(f"- {role}: {count}")
-
         return "\n".join(parts)
 
+    def _build_summary_message(self, summary: str) -> str:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        return f"{COMPACTION_PREFIX}{timestamp}]\n\n{COMPACTION_SUMMARY_HEADING}\n{summary}"
+
     def _save_transcript(self, messages: List[Dict]) -> Optional[str]:
-        """Save full transcript to a JSONL file"""
-        transcript_dir = self.config.compact_transcript_dir
+        """Persist the full transcript as JSONL using an atomic write."""
+        transcript_dir = Path(self.config.compact_transcript_dir)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filepath = transcript_dir / f"transcript_{timestamp}.jsonl"
+
+        lines = []
+        for message in messages:
+            serializable = {
+                key: value
+                for key, value in message.items()
+                if isinstance(value, (str, int, float, bool, list, dict, type(None)))
+            }
+            lines.append(json.dumps(serializable, ensure_ascii=False, default=str))
+
         try:
-            os.makedirs(transcript_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = os.path.join(transcript_dir, f"transcript_{timestamp}.jsonl")
-
-            with open(filepath, "w", encoding="utf-8") as f:
-                for msg in messages:
-                    # Filter out non-serializable fields
-                    serializable = {
-                        k: v for k, v in msg.items()
-                        if isinstance(v, (str, int, float, bool, list, dict, type(None)))
-                    }
-                    f.write(json.dumps(serializable, ensure_ascii=False) + "\n")
-
-            return filepath
-        except Exception as e:
-            print(f"[compact] Failed to save transcript: {e}")
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            self._atomic_write(filepath, "\n".join(lines) + "\n")
+            return str(filepath.resolve())
+        except Exception as exc:
+            print(f"[compact] Failed to save transcript: {exc}")
             return None
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
+        """Write a file atomically to avoid partially-written transcripts."""
+        temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        temp_path.write_text(content, encoding=encoding)
+        os.replace(temp_path, path)

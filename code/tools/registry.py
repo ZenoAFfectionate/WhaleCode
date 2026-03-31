@@ -1,9 +1,11 @@
 """Tool Registry - HelloAgents Native Tool System"""
 
-from typing import Optional, Any, Callable, Dict
+import asyncio
+import json
 import time
+from typing import Optional, Any, Callable, Dict
 from .base import Tool
-from .response import ToolResponse, ToolStatus
+from .response import ToolResponse
 from .errors import ToolErrorCode
 from .circuit_breaker import CircuitBreaker
 
@@ -135,6 +137,78 @@ class ToolRegistry:
         func_info = self._functions.get(name)
         return func_info["func"] if func_info else None
 
+    def _circuit_open_response(self, name: str) -> ToolResponse:
+        status = self.circuit_breaker.get_status(name)
+        return ToolResponse.error(
+            code=ToolErrorCode.CIRCUIT_OPEN,
+            message=(
+                f"Tool '{name}' is currently disabled due to consecutive failures. "
+                f"Available in {status['recover_in_seconds']} seconds."
+            ),
+            context={"tool_name": name, "circuit_status": status},
+        )
+
+    @staticmethod
+    def _normalize_tool_parameters(input_payload: Any) -> Dict[str, Any]:
+        if isinstance(input_payload, dict):
+            return input_payload
+        if isinstance(input_payload, str):
+            try:
+                parsed = json.loads(input_payload)
+            except json.JSONDecodeError:
+                return {"input": input_payload}
+            return parsed if isinstance(parsed, dict) else {"input": parsed}
+        return {"input": str(input_payload)}
+
+    @staticmethod
+    def _tool_exception_response(name: str, input_payload: Any, exc: Exception) -> ToolResponse:
+        return ToolResponse.error(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            message=f"Exception occurred while executing tool '{name}': {str(exc)}",
+            context={"tool_name": name, "input": input_payload},
+        )
+
+    @staticmethod
+    def _function_success_response(name: str, input_payload: Any, result: Any, elapsed_ms: int) -> ToolResponse:
+        return ToolResponse.success(
+            text=str(result),
+            data={"output": result},
+            stats={"time_ms": elapsed_ms},
+            context={"tool_name": name, "input": input_payload},
+        )
+
+    @staticmethod
+    def _function_error_response(name: str, input_payload: Any, exc: Exception, elapsed_ms: int) -> ToolResponse:
+        return ToolResponse.error(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            message=f"Function execution failed: {str(exc)}",
+            stats={"time_ms": elapsed_ms},
+            context={"tool_name": name, "input": input_payload},
+        )
+
+    def _execute_function_sync(self, name: str, input_payload: Any) -> ToolResponse:
+        func = self._functions[name]["func"]
+        start_time = time.time()
+        try:
+            result = func(input_payload)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return self._function_success_response(name, input_payload, result, elapsed_ms)
+        except Exception as exc:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return self._function_error_response(name, input_payload, exc, elapsed_ms)
+
+    async def _execute_function_async(self, name: str, input_payload: Any) -> ToolResponse:
+        func = self._functions[name]["func"]
+        start_time = time.time()
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, lambda: func(input_payload))
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return self._function_success_response(name, input_payload, result, elapsed_ms)
+        except Exception as exc:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return self._function_error_response(name, input_payload, exc, elapsed_ms)
+
     def execute_tool(self, name: str, input_text: str) -> ToolResponse:
         """
         Execute tool, returning a ToolResponse object (with circuit breaker protection)
@@ -148,81 +222,57 @@ class ToolRegistry:
         """
         # Check circuit breaker
         if self.circuit_breaker.is_open(name):
-            status = self.circuit_breaker.get_status(name)
-            return ToolResponse.error(
-                code=ToolErrorCode.CIRCUIT_OPEN,
-                message=f"Tool '{name}' is currently disabled due to consecutive failures. Available in {status['recover_in_seconds']} seconds.",
-                context={
-                    "tool_name": name,
-                    "circuit_status": status
-                }
-            )
+            return self._circuit_open_response(name)
 
         # Execute tool
-        response = None
-
         # Prioritize finding Tool object (new protocol)
         if name in self._tools:
             tool = self._tools[name]
             try:
-                # Parse parameters (supports JSON string or dictionary)
-                import json
-                if isinstance(input_text, str):
-                    try:
-                        parameters = json.loads(input_text)
-                    except json.JSONDecodeError:
-                        # If not JSON, treat as a normal string
-                        parameters = {"input": input_text}
-                elif isinstance(input_text, dict):
-                    parameters = input_text
-                else:
-                    parameters = {"input": str(input_text)}
-
-                # Use run_with_timing to automatically add time statistics
+                parameters = self._normalize_tool_parameters(input_text)
                 response = tool.run_with_timing(parameters)
-            except Exception as e:
-                response = ToolResponse.error(
-                    code=ToolErrorCode.EXECUTION_ERROR,
-                    message=f"Exception occurred while executing tool '{name}': {str(e)}",
-                    context={"tool_name": name, "input": input_text}
-                )
+            except Exception as exc:
+                response = self._tool_exception_response(name, input_text, exc)
 
         # Find function tool (automatically wrap to new protocol)
         elif name in self._functions:
-            func = self._functions[name]["func"]
-            start_time = time.time()
-
-            try:
-                result = func(input_text)
-                elapsed_ms = int((time.time() - start_time) * 1000)
-
-                # Wrap as ToolResponse
-                response = ToolResponse.success(
-                    text=str(result),
-                    data={"output": result},
-                    stats={"time_ms": elapsed_ms},
-                    context={"tool_name": name, "input": input_text}
-                )
-            except Exception as e:
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                response = ToolResponse.error(
-                    code=ToolErrorCode.EXECUTION_ERROR,
-                    message=f"Function execution failed: {str(e)}",
-                    stats={"time_ms": elapsed_ms},
-                    context={"tool_name": name, "input": input_text}
-                )
+            response = self._execute_function_sync(name, input_text)
 
         # Tool does not exist
         else:
             response = ToolResponse.error(
                 code=ToolErrorCode.NOT_FOUND,
                 message=f"Tool named '{name}' not found",
-                context={"tool_name": name}
+                context={"tool_name": name},
             )
 
         # Record circuit breaker result
         self.circuit_breaker.record_result(name, response)
 
+        return response
+
+    async def aexecute_tool(self, name: str, input_text: Any) -> ToolResponse:
+        """Async version of execute_tool with the same dispatch and breaker behavior."""
+        if self.circuit_breaker.is_open(name):
+            return self._circuit_open_response(name)
+
+        if name in self._tools:
+            tool = self._tools[name]
+            try:
+                parameters = self._normalize_tool_parameters(input_text)
+                response = await tool.arun_with_timing(parameters)
+            except Exception as exc:
+                response = self._tool_exception_response(name, input_text, exc)
+        elif name in self._functions:
+            response = await self._execute_function_async(name, input_text)
+        else:
+            response = ToolResponse.error(
+                code=ToolErrorCode.NOT_FOUND,
+                message=f"Tool named '{name}' not found",
+                context={"tool_name": name},
+            )
+
+        self.circuit_breaker.record_result(name, response)
         return response
 
     def get_tools_description(self) -> str:

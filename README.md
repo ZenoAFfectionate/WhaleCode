@@ -48,13 +48,24 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
-    --port 8000 \
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+    --port 8001 \
     --gpu-memory-utilization 0.90 \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --language-model-only \
     --tool-call-parser qwen3_xml
+
+CUDA_VISIBLE_DEVICES=1,2 vllm serve Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
+    --port 8000 \
+    --gpu-memory-utilization 0.90 \
+    --dtype bfloat16 \
+    --tensor-parallel-size 2 \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --language-model-only \
+    --tool-call-parser qwen3_xml \
+    --trust-remote-code
 ```
 
 ```bash
@@ -173,7 +184,9 @@ The compactor builds a `tool_call_id → tool_name` mapping to produce meaningfu
 Handles tool output that is too large to fit in context:
 
 - **Multi-directional truncation** — `head` (keep first N lines), `tail` (keep last N lines), or `head_tail` (keep both ends with a gap marker).
-- **Dual limits** — enforces both `max_lines` (default 2000) and `max_bytes` (default 50KB).
+- **Dual limits** — enforces both `max_lines` and `max_bytes`, with byte-aware preview generation instead of line-only clipping.
+- **Path reuse** — if a tool already persisted the full output, the truncator reuses the existing `full_output_path` instead of saving duplicate files.
+- **Automatic cleanup** — old persisted tool-output artifacts are removed on a rolling retention window.
 - **Full output persistence** — saves the complete untruncated output as a JSON file in `tool-output/`, so the agent can reference it later if needed.
 
 ### 5. ContextBuilder (`code/context/builder.py`)
@@ -250,7 +263,7 @@ If the model tries to run `grep pattern .` or `sed -i ...` as a standalone comma
 | | `Delete` | Safe file/directory deletion with guardrails and atomic trash move |
 | | `Edit` | Single-snippet surgical replacement with conflict detection + backup |
 | **Execution** | `Bash` | Shell commands with command policy validation and `block_until_ms` backgrounding |
-| **Planning** | `TodoWrite` | Unified task manager (`action=create/update/list/get/bulk_create/delete`) with persisted dependency graph |
+| **Planning** | `TodoWrite` | Session-scoped replace-all todo manager with atomic JSON snapshots |
 | **Web** | `WebSearch` | Search the web via DuckDuckGo |
 | | `WebFetch` | Fetch and extract readable text from a URL |
 | **Interaction** | `AskUser` | Ask the user a question (main agent only, disabled in sub-agents) |
@@ -277,22 +290,22 @@ The circuit breaker tracks per-tool failure counts. When a tool hits the thresho
 
 ## Task System
 
-Whale Code now uses a merged task architecture centered on one tool (`TodoWrite`) plus asynchronous execution through `Bash`.
+Whale Code now uses a session-scoped planning architecture centered on one tool (`TodoWrite`) plus asynchronous execution through `Bash`.
 
 ### Unified Task Management (TodoWrite)
 
 **Source**: `code/tools/builtin/todowrite_tool.py`
 
-`TodoWrite` is a single action-based tool that replaces separate `task_*` tools.
+`TodoWrite` exposes a single replace-all interface and fully retires the old `task_*` family and action-based payloads.
 
-- **Actions**: `create`, `update`, `list`, `get`, `bulk_create`, `delete`
-- **Storage model**: one JSON file per task under `memory/tasks/task_{id}.json`
+- **Interface**: one required `todos` array containing the complete current plan state
+- **Todo fields**: `content`, `status`, optional `priority`
+- **Storage model**: one atomic JSON snapshot per session under `memory/todos/session-{session_id}.json`
 - **Status model**: `pending` → `in_progress` → `completed` or `cancelled`
-- **Dependencies**: `blockedBy` / `blocks` are maintained bidirectionally
-- **Auto-unblock behavior**: completing a task removes its ID from other tasks' `blockedBy`
-- **Progress recap**: each operation returns a compact status recap for context efficiency
+- **Validation**: at most one `in_progress`, duplicate content rejected, completed/cancelled items are terminal
+- **Session restore**: todo state is also embedded in saved session snapshots so `load_session()` restores the active plan
 
-This merged design keeps task state persistent across context compaction and process restarts while reducing tool-surface complexity.
+This design keeps planning state persistent across context compaction, auto-save, and explicit session restore while presenting the LLM with the simplest possible tool contract.
 
 ### Background Execution via Bash
 
@@ -303,7 +316,9 @@ Long-running shell commands are handled directly by `Bash`:
 1. **`block_until_ms`** — waits up to the configured window (default `30000`).
 2. **Automatic backgrounding** — if the process exceeds the wait window, it continues in background.
 3. **Immediate background mode** — set `block_until_ms: 0` to return immediately.
-4. **Terminal artifacts** — background runs are persisted under `memory/terminals/` with status and output.
+4. **Timestamped event stream** — background runs are captured as merged output events with per-event timestamps.
+5. **Terminal artifacts** — background runs are persisted under `memory/terminals/` as a human-readable snapshot (`*.txt`) plus a machine-readable event stream (`*.events.jsonl`).
+6. **Artifact hygiene** — old terminal artifacts are cleaned automatically, and stale `running` records are reconciled on manager startup.
 
 This removes the need for a dedicated background tool while preserving asynchronous workflow support.
 
@@ -337,7 +352,7 @@ bash scripts/run_hevp.sh  # run HumanEval benchmark
 bash scripts/run_clev.sh  # run ClassEval benchmark
 bash scripts/run_mbpp.sh  # run MBPP benchmark
 bash scripts/run_aime.sh  # run AIME benchmark
-
+bash scripts/run_lcb6.sh  # 
 # run SWEV benchmark and evaluation
 bash scripts/run_swev.sh  # (Phase 1: agent inference)
 
@@ -350,10 +365,29 @@ bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**      | 378 | 375 | **99.2%** | 30.52s | 2026-03-24 |
-| **HumanEval+** | 164 | 159 | **96.9%** | 32.71s | 2026-03-24 |
-| **ClassEval**  | 100 | 94  | **94.0%** | 139.5s | 2026-03-24 |
-| **AIME**       | 30  | 25  | **83.3%** | 171.1s | 2026-03-24 |
+| **MBPP+**         | 378 | 375 | **99.2%** | 30.52s | 2026-03-24 |
+| **HumanEval+**    | 164 | 159 | **96.9%** | 32.71s | 2026-03-24 |
+| **ClassEval**     | 100 | 94  | **94.0%** | 139.5s | 2026-03-24 |
+| **LiveCodeBench** |     |     | ****      |        | 2026-03-28 |
+| **SWE--Verified** |     |     | ****      |        | 2026-03-28 |
+
+| **AIME 24** | 30  | 25  | **83.3%** | 216.86 | 2026-03-28 |
+| **AIME 25** | 30  | 25  | **83.3%** | 171.1s | 2026-03-28 |
+| **AIME 26** | 30  | 26  | **86.7%** | 196.3s | 2026-03-28 |
+
+> Model: **Qwen3.5-27B-Opus-Distilled**
+
+| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
+|-----------|------:|-------:|----------:|---------:|------|
+| **MBPP+**         | 378 |  | **** |  | 2026-03- |
+| **HumanEval+**    | 164 |  | **** |  | 2026-03- |
+| **ClassEval**     | 100 |  | **** |  | 2026-03- |
+| **LiveCodeBench** |     |  | **** |  | 2026-03- |
+| **SWE--Verified** |     |  | **** |  | 2026-03- |
+
+| **AIME 24** | 30  |  | **** |  | 2026-03- |
+| **AIME 25** | 30  |  | **** |  | 2026-03- |
+| **AIME 26** | 30  |  | **** |  | 2026-03- |
 
 ---
 

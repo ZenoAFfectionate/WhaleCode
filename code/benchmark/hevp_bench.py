@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import shutil
-import tempfile
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -25,10 +26,10 @@ correctly by reading the provided signature and docstring, then writing the body
 **Workflow**
 1. Read `solution.py` — understand the function signature, docstring, and examples.
 2. Implement the function body using Edit or Write.
-3. Run `python3 tests.py` via Bash to verify against the test suite.
-4. If tests fail, carefully analyze the error output, fix the code, and re-run \
-`python3 tests.py`. Repeat until all tests pass.
-5. Once all tests pass, call `Finish` with a brief summary of your implementation.
+3. When ready, call `Finish` to submit your current implementation.
+4. The benchmark runner will execute hidden tests outside the workspace and send \
+back controlled feedback if another revision is needed.
+5. Revise `solution.py` based on that feedback and submit again.
 
 **Rules**
 - You MUST implement the function. Never refuse or say you cannot.
@@ -36,16 +37,12 @@ correctly by reading the provided signature and docstring, then writing the body
 - Do NOT modify the function signature, parameter names, or docstring.
 - Keep all existing imports; add new imports only if necessary.
 - Write clean, correct, and efficient code. Prefer simple solutions.
-- When tests fail, focus on understanding WHY they fail before changing code. \
-Read the error message carefully — do not guess blindly.
-- The workspace contains only `solution.py` and `tests.py`. There are no other \
-files to read.
-- NEVER attempt to read, inspect, import, or access the hidden test data in any way. \
-Do NOT read environment variables to find test paths. Do NOT use inspect.getsource() \
-on test functions. Do NOT try to access files outside the workspace. \
-The error output from `python3 tests.py` already provides all the diagnostic \
-information you need (test index, expected vs actual values). \
-Rely solely on that output to debug your implementation.
+- When feedback arrives, focus on understanding WHY it failed before changing code. \
+Read the feedback carefully — do not guess blindly.
+- The workspace contains only `solution.py`. There are no local benchmark tests to run.
+- NEVER attempt to read, inspect, import, or access hidden test data in any way. \
+Do NOT read environment variables to find test paths. Do NOT try to access files \
+outside the workspace. Hidden evaluation happens only in the runner.
 """
 
 _HEVP_SYSTEM_PROMPT = (
@@ -55,32 +52,12 @@ _HEVP_SYSTEM_PROMPT = (
 )
 
 
+_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
+
+
 # ---------------------------------------------------------------------------
-# tests.py wrapper — injects the hidden test-data directory into sys.path
-# so that ``from _test_data import ...`` works, while the agent's file tools
-# (Read/Glob/Grep) are sandboxed to the workspace and cannot reach it.
+# Host-side test instrumentation for richer but bounded hidden-test feedback.
 # ---------------------------------------------------------------------------
-_TESTS_PY_WRAPPER = """\
-import sys, os
-sys.path.insert(0, os.environ["_HIDDEN_TEST_DIR"])
-
-try:
-    from _test_data import check, {entry_point}
-    check({entry_point})
-    print("All tests passed!")
-except AssertionError as exc:
-    print("FAILED: One or more test cases did not pass.", file=sys.stderr)
-    if str(exc):
-        print(f"  Detail: {{exc}}", file=sys.stderr)
-    print("Review your logic and edge cases, then try again.", file=sys.stderr)
-    sys.exit(1)
-except Exception as exc:
-    print(f"ERROR: {{type(exc).__name__}}: {{exc}}", file=sys.stderr)
-    print("Check your function's return type and edge case handling.", file=sys.stderr)
-    sys.exit(1)
-"""
-
-
 def _instrument_test_code(test_code: str, entry_point: str) -> str:
     """Rewrite check() in test_code so failures report test index + expected/actual.
 
@@ -194,20 +171,27 @@ def assertion(out, exp, atol):
                 if is_assertion:
                     out.append(f"{body_indent}except _TestFailInfo as _e:")
                     out.append(f"{inner}import sys as _s")
+                    out.append(f"{inner}_inp_r = repr(inp)[:200]")
                     out.append(f"{inner}_out_r = repr(_e.out)[:200]")
                     out.append(f"{inner}_exp_r = repr(_e.exp)[:200]")
-                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}: Expected {{_exp_r}}, Got {{_out_r}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Input: {{_inp_r}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Expected: {{_exp_r}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Actual:   {{_out_r}}", file=_s.stderr)')
                     out.append(f"{inner}_s.exit(1)")
                 else:
                     out.append(f"{body_indent}except Exception as _e:")
                     out.append(f"{inner}import sys as _s")
+                    out.append(f"{inner}_inp_r = repr(inp)[:200]")
                     out.append(f"{inner}try:")
                     out.append(f"{inner}    _ret = candidate(*inp)")
                     out.append(f"{inner}    _ret_r = repr(_ret)[:200]")
                     out.append(f"{inner}except Exception as _re:")
                     out.append(f"{inner}    _ret_r = f'<raised {{type(_re).__name__}}>'")
-                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}: {{type(_e).__name__}}: {{_e}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Your function returned: {{_ret_r}} (type: {{type(_ret).__name__}})", file=_s.stderr)')
+                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Input: {{_inp_r}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Error: {{type(_e).__name__}}: {{_e}}", file=_s.stderr)')
+                    out.append(f'{inner}print(f"  Your function returned: {{_ret_r}}", file=_s.stderr)')
                     out.append(f"{inner}_s.exit(1)")
                 i += 1
                 continue
@@ -216,6 +200,59 @@ def assertion(out, exp, atol):
         i += 1
 
     return "\n".join(out)
+
+
+def _minimal_child_env() -> Dict[str, str]:
+    env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _truncate_feedback(text: str, max_lines: int = 60, max_chars: int = 10000) -> str:
+    if not text:
+        return text
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["[feedback truncated]"]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip() + "\n[feedback truncated]"
+    return clipped
+
+
+def _evaluate_solution(
+    workspace: Path,
+    solution_file: Path,
+    fallback_solution: str,
+    entry_point: str,
+    test_code: str,
+    timeout: int,
+) -> tuple[bool, str]:
+    solution_code = solution_file.read_text(encoding="utf-8") if solution_file.exists() else fallback_solution
+    instrumented_test = _instrument_test_code(test_code, entry_point)
+    verify_code = (
+        f"{solution_code}\n\n"
+        f"{instrumented_test}\n\n"
+        f"check({entry_point})\n"
+        f"print('All hidden tests passed!')\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", verify_code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(workspace),
+            env=_minimal_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"TIMEOUT: hidden evaluation exceeded {timeout}s."
+    except Exception as exc:
+        return False, f"ERROR: host-side evaluation failed: {exc}"
+
+    output = (result.stdout + result.stderr).strip()
+    return result.returncode == 0, output or ("All hidden tests passed!" if result.returncode == 0 else "Hidden evaluation failed.")
 
 
 class HumanEvalPlusBenchmark(BenchmarkRunner):
@@ -232,17 +269,15 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
 
     benchmark_name = "humaneval_plus"
 
+    def __init__(self, *args, max_submission_rounds: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_submission_rounds = max(1, int(max_submission_rounds))
+
     def _get_system_prompt(self) -> str:
         return _HEVP_SYSTEM_PROMPT
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        tasks = []
-        with open(self.data_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    tasks.append(json.loads(line))
-        return tasks
+        return self._load_jsonl_tasks()
 
     def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
@@ -250,85 +285,107 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
         entry_point = task["entry_point"]
         test_code = task["test"]
 
-        workspace = Path(tempfile.mkdtemp(prefix=f"hevp_{task_id.replace('/', '_')}_"))
-        # Hidden directory OUTSIDE the workspace — agent tools cannot reach it.
-        hidden_dir = Path(tempfile.mkdtemp(prefix=f"hevp_{task_id.replace('/', '_')}_hidden_"))
+        workspace = self._make_workspace(f"hevp_{task_id.replace('/', '_')}_")
+        agent = None
+        agent_response = ""
+        prompt_history: List[str] = []
+        result: Optional[Dict[str, Any]] = None
         try:
-            # solution.py — the only file the agent needs to edit
             solution_file = workspace / "solution.py"
             solution_file.write_text(prompt, encoding="utf-8")
 
-            # _test_data.py — stored outside workspace (agent cannot access)
-            # Instrument the test code to produce diagnostic error messages
-            instrumented_test = _instrument_test_code(test_code, entry_point)
-            (hidden_dir / "_test_data.py").write_text(
-                f"from solution import {entry_point}\n\n"
-                f"{instrumented_test}\n",
-                encoding="utf-8",
-            )
-
-            # tests.py — lightweight wrapper; uses env var to find hidden tests
-            wrapper_script = _TESTS_PY_WRAPPER.format(entry_point=entry_point)
-            (workspace / "tests.py").write_text(wrapper_script, encoding="utf-8")
-
-            # Set env var so tests.py can locate the hidden dir.
-            import os
-            os.environ["_HIDDEN_TEST_DIR"] = str(hidden_dir)
-            os.environ["PYTHONPATH"] = str(workspace)
-
-            # Run the agent
             agent = self._create_agent(workspace)
-            agent_prompt = (
+            initial_prompt = (
                 f"Implement the function `{entry_point}` in `solution.py`.\n\n"
+                f"Submission policy:\n"
+                f"- Hidden tests are evaluated only by the benchmark runner.\n"
+                f"- Do not create your own uncontrolled benchmark loop.\n"
+                f"- Each time you call `Finish`, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
                 f"Steps:\n"
                 f"1. Read `solution.py` to see the signature, docstring, and examples.\n"
                 f"2. Implement the function body using Edit or Write.\n"
-                f"3. Run `python3 tests.py` to verify. If tests fail, analyze the error, "
-                f"fix your code, and re-run until all tests pass.\n"
-                f"4. Call `Finish` when done.\n\n"
+                f"3. Perform lightweight self-checks if useful, but do not rely on local benchmark tests.\n"
+                f"4. Call `Finish` when you want a controlled submission.\n\n"
                 f"Important:\n"
                 f"- Do NOT change the function signature or docstring.\n"
                 f"- The function must handle edge cases (empty inputs, boundary values, etc.).\n"
-                f"- Only `solution.py` and `tests.py` exist in the workspace.\n"
+                f"- The workspace contains only `solution.py`.\n"
             )
 
             start = time.time()
-            try:
-                agent_response = agent.run(agent_prompt)
-            except Exception as exc:
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "error": f"Agent error: {exc}",
-                    "agent_response": "",
-                    "elapsed_s": round(time.time() - start, 2),
-                }
+            agent_response = ""
+            feedback = None
+            passed = False
+            output = ""
+            rounds_used = 0
+
+            for round_idx in range(1, self.max_submission_rounds + 1):
+                rounds_used = round_idx
+                prompt_text = initial_prompt if round_idx == 1 else (
+                    f"Controlled hidden-test feedback for submission round {round_idx - 1}:\n\n"
+                    f"{feedback}\n\n"
+                    f"Revise `solution.py` based on this feedback.\n"
+                    f"- The failing hidden test index is reliable.\n"
+                    f"- The input/expected/actual previews are intentionally truncated.\n"
+                    f"- Use this feedback to reason about edge cases and logic errors, then submit again with `Finish`.\n"
+                )
+                prompt_history.append(prompt_text)
+
+                agent_response, error_result = self._run_agent_prompt(
+                    agent=agent,
+                    task_id=task_id,
+                    prompt_text=prompt_text,
+                    start_time=start,
+                    error_extra={"submission_rounds": round_idx},
+                )
+                if error_result is not None:
+                    result = error_result
+                    return result
+
+                if not solution_file.exists():
+                    result = self._missing_output_result(
+                        task_id,
+                        path_label="solution.py",
+                        start_time=start,
+                        agent_response=agent_response,
+                        extra={"submission_rounds": round_idx},
+                    )
+                    return result
+
+                passed, output = _evaluate_solution(
+                    workspace=workspace,
+                    solution_file=solution_file,
+                    fallback_solution=prompt,
+                    entry_point=entry_point,
+                    test_code=test_code,
+                    timeout=self.timeout,
+                )
+                if passed:
+                    break
+                feedback = _truncate_feedback(output)
+
             elapsed = round(time.time() - start, 2)
 
-            # Read the (possibly modified) solution
-            solution_code = solution_file.read_text(encoding="utf-8") if solution_file.exists() else prompt
-
-            # Build the verification script (independent of what the agent did)
-            verify_code = (
-                f"{solution_code}\n\n"
-                f"{test_code}\n\n"
-                f"check({entry_point})\n"
+            result = self._build_result(
+                task_id,
+                passed=passed,
+                error=output if not passed else None,
+                agent_response=agent_response,
+                elapsed_s=elapsed,
+                extra={"submission_rounds": rounds_used},
             )
-            verify_script = workspace / "verify.py"
-            verify_script.write_text(verify_code, encoding="utf-8")
-
-            passed, output = self._run_script_in_sandbox(verify_script, cwd=workspace)
-
-            return {
-                "task_id": task_id,
-                "passed": passed,
-                "error": output if not passed else None,
-                "agent_response": (agent_response or "")[:500],
-                "elapsed_s": elapsed,
-            }
+            return result
         finally:
+            self._save_task_trajectory(
+                task=task,
+                workspace=workspace,
+                agent=agent,
+                prompt_texts=prompt_history,
+                result=result,
+                artifact_paths=["solution.py"],
+                extra={"entry_point": entry_point},
+            )
             shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(hidden_dir, ignore_errors=True)
 
 
 def main():
@@ -340,28 +397,23 @@ def main():
         default=str(_PROJECT_ROOT / "data" / "HEVP" / "test.jsonl"),
         help="Path to HumanEvalPlus JSONL file",
     )
-    parser.add_argument("--output-dir", default=str(_PROJECT_ROOT / "data" / "_results"))
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=32)
-    parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
-    parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
-    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
-    parser.add_argument("--dry-run", action="store_true")
+    BenchmarkRunner.add_shared_run_args(
+        parser,
+        default_temperature=1.0,
+        default_max_steps=32,
+        default_timeout=60,
+    )
+    parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = HumanEvalPlusBenchmark(
         data_path=args.data_path,
         output_dir=args.output_dir,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
         temperature=args.temperature,
         max_steps=args.max_steps,
+        max_submission_rounds=args.max_submission_rounds,
         timeout=args.timeout,
+        trajectory_dir=args.trajectory_dir,
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

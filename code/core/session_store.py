@@ -35,7 +35,9 @@ class SessionStore:
         history=[...],
         tool_schema_hash="abc123",
         read_cache={},
-        metadata={"total_tokens": 1000}
+        metadata={"total_tokens": 1000},
+        session_id="s-20260331-abcdef12",
+        todo_state={"todos": [...]},
     )
     
     # 加载会话
@@ -55,7 +57,8 @@ class SessionStore:
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
     
-    def _generate_session_id(self) -> str:
+    @staticmethod
+    def generate_session_id() -> str:
         """生成唯一的会话 ID
         
         格式：s-{timestamp}-{uuid}
@@ -66,6 +69,10 @@ class SessionStore:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         unique_suffix = uuid.uuid4().hex[:8]
         return f"s-{timestamp}-{unique_suffix}"
+
+    def _generate_session_id(self) -> str:
+        """向后兼容的实例方法封装。"""
+        return self.generate_session_id()
     
     def save(
         self,
@@ -74,7 +81,9 @@ class SessionStore:
         tool_schema_hash: str,
         read_cache: Dict[str, Dict],
         metadata: Dict[str, Any],
-        session_name: Optional[str] = None
+        session_name: Optional[str] = None,
+        session_id: Optional[str] = None,
+        todo_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """保存会话
         
@@ -85,12 +94,14 @@ class SessionStore:
             read_cache: Read 工具的元数据缓存
             metadata: 会话元数据（tokens、steps、duration 等）
             session_name: 自定义会话名称（可选）
+            session_id: 稳定会话 ID（可选，未提供则自动生成）
+            todo_state: TodoWrite 会话计划快照（可选）
         
         Returns:
             保存的文件路径
         """
-        # 生成会话 ID（只生成一次）
-        session_id = self._generate_session_id()
+        # 生成或复用稳定的会话 ID
+        session_id = session_id or self._generate_session_id()
 
         # 生成文件名
         if session_name:
@@ -112,8 +123,10 @@ class SessionStore:
             ],
             "tool_schema_hash": tool_schema_hash,
             "read_cache": read_cache,
-            "metadata": metadata
+            "metadata": metadata,
         }
+        if todo_state is not None:
+            session_data["todo_state"] = todo_state
         
         # 原子写入（临时文件 + 重命名）
         temp_path = str(filepath) + ".tmp"
@@ -248,4 +261,3 @@ class SessionStore:
             "current_hash": current_hash,
             "recommendation": "建议重新读取文件" if changed else "可以安全恢复"
         }
-

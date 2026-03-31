@@ -1,20 +1,12 @@
-"""Context Engineering Module
+"""Context engineering primitives exposed by the package.
 
-Provides context engineering capabilities for the HelloAgents framework:
-- ContextBuilder: GSSC pipeline (Gather-Select-Structure-Compress)
-- HistoryManager: History management and compression
-- ObservationTruncator: Tool output truncation
-- TokenCounter: Token counter (caching + incremental calculation)
-- Compactor: Conversation compression and integration
-- NotesManager: Structured notes management
-- ContextObserver: Observability and metrics tracking
+This module intentionally avoids eager imports so lightweight consumers such as
+``HistoryManager`` do not also trigger tokenizer initialization or prompt file
+loading performed by heavier context components.
 """
 
-from .builder import ContextBuilder, ContextConfig, ContextPacket
-from .compactor import ContextCompactor
-from .history import HistoryManager
-from .truncator import ObservationTruncator
-from .token_counter import TokenCounter
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "ContextBuilder",
@@ -25,3 +17,24 @@ __all__ = [
     "ObservationTruncator",
     "TokenCounter",
 ]
+
+_EXPORTS = {
+    "ContextBuilder": (".builder", "ContextBuilder"),
+    "ContextCompactor": (".compactor", "ContextCompactor"),
+    "ContextConfig": (".builder", "ContextConfig"),
+    "ContextPacket": (".builder", "ContextPacket"),
+    "HistoryManager": (".history", "HistoryManager"),
+    "ObservationTruncator": (".truncator", "ObservationTruncator"),
+    "TokenCounter": (".token_counter", "TokenCounter"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr_name = _EXPORTS[name]
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

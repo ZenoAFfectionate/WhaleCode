@@ -2,32 +2,46 @@
 
 from __future__ import annotations
 
-import fnmatch
-import os
+import json
 import re
-import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..base import Tool, ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
-from ._code_utils import (
-    DEFAULT_IGNORES,
-    ensure_working_dir,
-    is_binary_file,
-    normalize_ignore_patterns,
-    prune_walk_dirs,
-    relative_display,
-    resolve_path,
-)
+from ._code_utils import ensure_working_dir, relative_display, resolve_path
+
+
+@dataclass
+class GrepMatch:
+    """Structured single-line search match."""
+
+    path: str
+    line: int
+    text: str
+    mtime_ms: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"path": self.path, "line": self.line, "text": self.text}
 
 
 class GrepTool(Tool):
-    """Search code using ripgrep when available, with Python fallback."""
+    """Search code with ripgrep."""
 
     MAX_RESULTS = 100
+    MAX_LINE_LENGTH = 2000
+    DEFAULT_EXCLUDE_GLOBS = (
+        "!.git/**",
+        "!**/.git/**",
+        "!.backups/**",
+        "!**/.backups/**",
+        "!.delete_trash/**",
+        "!**/.delete_trash/**",
+    )
+    INTERNAL_ARTIFACT_DIRS = {".backups", ".delete_trash"}
 
     def __init__(
         self,
@@ -38,8 +52,8 @@ class GrepTool(Tool):
         super().__init__(
             name=name,
             description=(
-                "Search code with a regex pattern. Prefer this when you need to find symbols, APIs, "
-                "config keys, error messages, or code patterns across the repository. Use `include` to narrow the search to the most relevant file types."
+                "Search code with a regex pattern using ripgrep. Results are limited to 100 matches. "
+                "Use `include` to narrow the search when you already know the relevant file types."
             ),
         )
         self.project_root = Path(project_root).expanduser().resolve()
@@ -50,17 +64,15 @@ class GrepTool(Tool):
             ToolParameter(
                 name="pattern",
                 type="string",
-                description=(
-                    "Regex pattern to search for, such as `class\\s+User`, `def run`, or `TODO`. "
-                    "Use a precise pattern when possible to reduce noise."
-                ),
+                description="The regex pattern to search for in file contents.",
                 required=True,
             ),
             ToolParameter(
                 name="path",
                 type="string",
                 description=(
-                    "Directory or file to search under, relative to the project root. Narrow this when you already know the likely subsystem."
+                    "The directory to search in, relative to the project root. "
+                    "If omitted, the project root is used."
                 ),
                 required=False,
                 default=".",
@@ -68,17 +80,8 @@ class GrepTool(Tool):
             ToolParameter(
                 name="include",
                 type="string",
-                description=(
-                    "Optional file glob filter such as `*.py`, `*.ts`, or `src/**/*.tsx`. Strongly recommended for large repositories."
-                ),
+                description='Optional file pattern to include in the search, such as "*.py" or "*.{ts,tsx}".',
                 required=False,
-            ),
-            ToolParameter(
-                name="case_sensitive",
-                type="boolean",
-                description="Set to true only when letter case matters for the search.",
-                required=False,
-                default=False,
             ),
         ]
 
@@ -86,12 +89,17 @@ class GrepTool(Tool):
         pattern = parameters.get("pattern")
         raw_path = parameters.get("path", ".")
         include = parameters.get("include")
-        case_sensitive = bool(parameters.get("case_sensitive", False))
 
         if not pattern or not isinstance(pattern, str):
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
                 message="pattern must be a non-empty regex string.",
+            )
+
+        if include is not None and not isinstance(include, str):
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message="include must be a string when provided.",
             )
 
         try:
@@ -108,161 +116,178 @@ class GrepTool(Tool):
                 message=f"Search root not found: {raw_path}",
             )
 
-        include_patterns = normalize_ignore_patterns(include)
+        if not root.is_dir():
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=f"Search root is not a directory: {raw_path}",
+            )
 
         try:
-            results, engine = self._run_search(root, pattern, include_patterns, case_sensitive)
+            matches, had_inaccessible_paths = self._run_rg(root, pattern, include)
+        except FileNotFoundError:
+            return ToolResponse.error(
+                code=ToolErrorCode.INTERNAL_ERROR,
+                message="ripgrep is required for GrepTool but was not found.",
+            )
         except re.error as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
                 message=f"Invalid regex pattern: {exc}",
             )
-        except Exception as exc:
+        except subprocess.SubprocessError as exc:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
                 message=f"Search failed: {exc}",
             )
 
-        truncated = len(results) > self.MAX_RESULTS
-        results = results[: self.MAX_RESULTS]
+        matches.sort(key=lambda match: match.mtime_ms, reverse=True)
+        total_matches = len(matches)
+        truncated = total_matches > self.MAX_RESULTS
+        final_matches = matches[: self.MAX_RESULTS]
 
         rel_root = relative_display(self.project_root, root)
+        data = {
+            "pattern": pattern,
+            "path": rel_root,
+            "matches": [match.to_dict() for match in final_matches],
+            "total_matches": total_matches,
+            "truncated": truncated,
+        }
+        if include:
+            data["include"] = include
+
+        if not final_matches:
+            return ToolResponse.success(text="No files found", data=data)
+
         lines = [
-            f"Pattern: {pattern}",
-            f"Search root: {rel_root}",
-            f"Engine: {engine}",
+            f"Found {total_matches} matches{f' (showing first {self.MAX_RESULTS})' if truncated else ''}"
         ]
-        if include_patterns:
-            lines.append(f"Include globs: {', '.join(include_patterns)}")
-        lines.append("")
+        current_file: Optional[str] = None
 
-        if results:
-            lines.extend(results)
-        else:
-            lines.append("[no matches]")
+        for match in final_matches:
+            if match.path != current_file:
+                if current_file is not None:
+                    lines.append("")
+                current_file = match.path
+                lines.append(f"{match.path}:")
+
+            display_text = match.text
+            if len(display_text) > self.MAX_LINE_LENGTH:
+                display_text = display_text[: self.MAX_LINE_LENGTH] + "..."
+            lines.append(f"  Line {match.line}: {display_text}")
+
         if truncated:
-            lines.extend(["", f"[showing first {self.MAX_RESULTS} matches only]"])
+            lines.extend(
+                [
+                    "",
+                    f"(Results truncated: showing {self.MAX_RESULTS} of {total_matches} matches ({total_matches - self.MAX_RESULTS} hidden). Consider using a more specific path or pattern.)",
+                ]
+            )
 
-        response_factory = ToolResponse.partial if truncated else ToolResponse.success
-        return response_factory(
-            text="\n".join(lines),
-            data={
-                "pattern": pattern,
-                "path": rel_root,
-                "matches": results,
-                "engine": engine,
-                "truncated": truncated,
-            },
-        )
+        if had_inaccessible_paths:
+            lines.extend(["", "(Some paths were inaccessible and skipped)"])
 
-    def _run_search(
-        self,
-        root: Path,
-        pattern: str,
-        include_patterns: List[str],
-        case_sensitive: bool,
-    ) -> tuple[List[str], str]:
-        if shutil.which("rg"):
-            try:
-                return self._run_rg(root, pattern, include_patterns, case_sensitive), "ripgrep"
-            except subprocess.SubprocessError:
-                pass
-        return self._run_python(root, pattern, include_patterns, case_sensitive), "python"
+        factory = ToolResponse.partial if truncated or had_inaccessible_paths else ToolResponse.success
+        return factory(text="\n".join(lines), data=data)
 
-    def _run_rg(
-        self,
-        root: Path,
-        pattern: str,
-        include_patterns: List[str],
-        case_sensitive: bool,
-    ) -> List[str]:
+    def _run_rg(self, root: Path, pattern: str, include: Optional[str]) -> tuple[List[GrepMatch], bool]:
         command = [
             "rg",
-            "--line-number",
-            "--no-heading",
-            "--color",
-            "never",
-            "--max-count",
-            str(self.MAX_RESULTS),
+            "--json",
+            "--hidden",
+            "--no-messages",
+            "--regexp",
+            pattern,
+            str(root),
         ]
-        if not case_sensitive:
-            command.append("-i")
-        for include_pattern in include_patterns:
-            command.extend(["--glob", include_pattern])
-        command.extend([pattern, str(root)])
+        for glob in reversed(self.DEFAULT_EXCLUDE_GLOBS):
+            command[4:4] = ["--glob", glob]
+        if include:
+            command[4:4] = ["--glob", include]
 
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
+            bufsize=1,
         )
 
-        if completed.returncode not in (0, 1):
-            raise subprocess.SubprocessError(completed.stderr.strip() or "ripgrep failed")
+        matches: List[GrepMatch] = []
+        mtime_cache: Dict[str, int] = {}
 
-        output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
-        results = []
-        for line in output_lines:
-            if len(results) >= self.MAX_RESULTS:
-                break
-            results.append(self._normalize_rg_line(line))
-        return results
-
-    def _run_python(
-        self,
-        root: Path,
-        pattern: str,
-        include_patterns: List[str],
-        case_sensitive: bool,
-    ) -> List[str]:
-        flags = 0 if case_sensitive else re.IGNORECASE
-        compiled = re.compile(pattern, flags)
-        matches: List[str] = []
-
-        if root.is_file():
-            files = [root]
-        else:
-            files = []
-            for current_root, dirnames, filenames in os.walk(root):
-                prune_walk_dirs(dirnames, include_hidden=False)
-                for filename in filenames:
-                    if filename in DEFAULT_IGNORES or filename.startswith("."):
-                        continue
-                    file_path = Path(current_root) / filename
-                    rel_path = relative_display(self.project_root, file_path)
-                    if include_patterns and not any(
-                        fnmatch.fnmatch(rel_path, pattern_item)
-                        or fnmatch.fnmatch(filename, pattern_item)
-                        for pattern_item in include_patterns
-                    ):
-                        continue
-                    files.append(file_path)
-
-        for file_path in files:
-            if len(matches) >= self.MAX_RESULTS:
-                break
-            if file_path.is_dir() or is_binary_file(file_path):
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            stripped = raw_line.strip()
+            if not stripped:
                 continue
+
             try:
-                content = file_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise subprocess.SubprocessError(f"Invalid ripgrep JSON output: {exc}") from exc
+
+            if payload.get("type") != "match":
                 continue
 
-            rel_path = relative_display(self.project_root, file_path)
-            for line_number, line in enumerate(content.splitlines(), start=1):
-                if compiled.search(line):
-                    matches.append(f"{rel_path}:{line_number}: {line}")
-                    if len(matches) >= self.MAX_RESULTS:
-                        break
+            match = self._parse_match_event(payload.get("data", {}), mtime_cache)
+            if match is not None:
+                matches.append(match)
 
-        return matches
+        _, stderr_text = process.communicate()
+        return_code = process.returncode
+        stderr_text = stderr_text.strip()
 
-    def _normalize_rg_line(self, line: str) -> str:
-        path_part, line_number, rest = line.split(":", 2)
-        path_obj = Path(path_part)
+        if return_code not in (0, 1, 2):
+            raise subprocess.SubprocessError(stderr_text or "ripgrep failed")
+
+        if return_code == 2 and not matches:
+            return [], False
+
+        if return_code == 2 and self._looks_like_regex_error(stderr_text):
+            raise re.error(stderr_text or "ripgrep regex parse error")
+
+        had_inaccessible_paths = return_code == 2
+        return matches, had_inaccessible_paths
+
+    def _parse_match_event(
+        self,
+        data: Dict[str, Any],
+        mtime_cache: Dict[str, int],
+    ) -> Optional[GrepMatch]:
+        path_text = data.get("path", {}).get("text")
+        if not path_text:
+            return None
+
+        normalized_path = self._normalize_rg_path(path_text)
+        if any(part in self.INTERNAL_ARTIFACT_DIRS for part in Path(normalized_path).parts):
+            return None
+        if normalized_path not in mtime_cache:
+            try:
+                mtime_cache[normalized_path] = int(
+                    (self.project_root / normalized_path).resolve().stat().st_mtime * 1000
+                )
+            except OSError:
+                mtime_cache[normalized_path] = 0
+
+        line_number = int(data.get("line_number") or 1)
+        line_text = (data.get("lines", {}).get("text") or "").rstrip("\r\n")
+        return GrepMatch(
+            path=normalized_path,
+            line=line_number,
+            text=line_text,
+            mtime_ms=mtime_cache[normalized_path],
+        )
+
+    def _normalize_rg_path(self, path_text: str) -> str:
+        path_obj = Path(path_text)
         if not path_obj.is_absolute():
-            path_obj = (Path.cwd() / path_obj).resolve()
-        return f"{relative_display(self.project_root, path_obj)}:{line_number}: {rest}"
+            path_obj = path_obj.resolve()
+        return relative_display(self.project_root, path_obj)
+
+    @staticmethod
+    def _looks_like_regex_error(stderr_text: str) -> bool:
+        lowered = stderr_text.lower()
+        return "regex parse error" in lowered or "error parsing regex" in lowered

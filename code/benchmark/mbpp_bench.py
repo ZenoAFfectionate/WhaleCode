@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shutil
-import tempfile
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -105,13 +102,7 @@ class MBPPPlusBenchmark(BenchmarkRunner):
     benchmark_name = "mbpp_plus"
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        tasks = []
-        with open(self.data_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    tasks.append(json.loads(line))
-        return tasks
+        return self._load_jsonl_tasks()
 
     def _build_test_code(self, task: Dict[str, Any], solution_code: str) -> str:
         """Build a verification script from solution + assertions.
@@ -129,7 +120,11 @@ class MBPPPlusBenchmark(BenchmarkRunner):
         entry_point = task["entry_point"]
         assertion_code = task.get("assertion", "")
 
-        workspace = Path(tempfile.mkdtemp(prefix=f"mbpp_{task_id.replace('/', '_')}_"))
+        workspace = self._make_workspace(f"mbpp_{task_id.replace('/', '_')}_")
+        agent = None
+        agent_response = ""
+        agent_prompt = ""
+        result: Optional[Dict[str, Any]] = None
         try:
             # Write an empty solution file with a hint comment
             solution_file = workspace / "solution.py"
@@ -164,29 +159,28 @@ class MBPPPlusBenchmark(BenchmarkRunner):
             )
 
             start = time.time()
-            try:
-                agent_response = agent.run(agent_prompt)
-            except Exception as exc:
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "error": f"Agent error: {exc}",
-                    "agent_response": "",
-                    "elapsed_s": round(time.time() - start, 2),
-                }
+            agent_response, error_result = self._run_agent_prompt(
+                agent=agent,
+                task_id=task_id,
+                prompt_text=agent_prompt,
+                start_time=start,
+            )
+            if error_result is not None:
+                result = error_result
+                return result
             elapsed = round(time.time() - start, 2)
 
             # Read the solution
             if solution_file.exists():
                 solution_code = solution_file.read_text(encoding="utf-8")
             else:
-                return {
-                    "task_id": task_id,
-                    "passed": False,
-                    "error": "solution.py not found after agent run",
-                    "agent_response": (agent_response or "")[:500],
-                    "elapsed_s": elapsed,
-                }
+                result = self._missing_output_result(
+                    task_id,
+                    path_label="solution.py",
+                    elapsed_s=elapsed,
+                    agent_response=agent_response,
+                )
+                return result
 
             # Build and run the test
             test_code = self._build_test_code(task, solution_code)
@@ -195,14 +189,24 @@ class MBPPPlusBenchmark(BenchmarkRunner):
 
             passed, output = self._run_script_in_sandbox(verify_script, cwd=workspace)
 
-            return {
-                "task_id": task_id,
-                "passed": passed,
-                "error": output if not passed else None,
-                "agent_response": (agent_response or "")[:500],
-                "elapsed_s": elapsed,
-            }
+            result = self._build_result(
+                task_id,
+                passed=passed,
+                error=output if not passed else None,
+                agent_response=agent_response,
+                elapsed_s=elapsed,
+            )
+            return result
         finally:
+            self._save_task_trajectory(
+                task=task,
+                workspace=workspace,
+                agent=agent,
+                prompt_texts=[agent_prompt] if agent_prompt else [],
+                result=result,
+                artifact_paths=["solution.py", "tests.py", "verify.py"],
+                extra={"entry_point": entry_point},
+            )
             shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -215,28 +219,21 @@ def main():
         default=str(_PROJECT_ROOT / "data" / "MBPP" / "test.jsonl"),
         help="Path to MbppPlus JSONL file",
     )
-    parser.add_argument("--output-dir", default=str(_PROJECT_ROOT / "data" / "_results"))
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=64)
-    parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--task-ids", nargs="*", default=None)
-    parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
-    parser.add_argument("--dry-run", action="store_true")
+    BenchmarkRunner.add_shared_run_args(
+        parser,
+        default_temperature=1.0,
+        default_max_steps=64,
+        default_timeout=60,
+    )
     args = parser.parse_args()
 
     bench = MBPPPlusBenchmark(
         data_path=args.data_path,
         output_dir=args.output_dir,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
         temperature=args.temperature,
         max_steps=args.max_steps,
         timeout=args.timeout,
+        trajectory_dir=args.trajectory_dir,
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

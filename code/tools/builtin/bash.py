@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -13,21 +14,116 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from ...context.truncator import ObservationTruncator
 from ..base import Tool, ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
 from ._code_utils import (
-    apply_line_limit,
     atomic_write,
     ensure_working_dir,
     relative_display,
     resolve_path,
-    safe_decode_output,
 )
+
+
+class _CommandEventStream:
+    """Capture merged command output as a timestamped event stream."""
+
+    READ_CHUNK_SIZE = 4096
+
+    def __init__(self, output_prefix: bytes = b""):
+        self._lock = threading.RLock()
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._events: List[Dict[str, Any]] = []
+        self._reader: Optional[threading.Thread] = None
+        self._closed = threading.Event()
+        self._sequence = 0
+
+        if output_prefix:
+            self._append_bytes(output_prefix, source="buffered")
+
+    def start(self, stream) -> None:
+        if stream is None:
+            self._closed.set()
+            return
+        self._reader = threading.Thread(
+            target=self._drain,
+            args=(stream,),
+            daemon=True,
+            name="bash-output-reader",
+        )
+        self._reader.start()
+
+    def _drain(self, stream) -> None:
+        try:
+            while True:
+                reader = getattr(stream, "read1", None)
+                chunk = reader(self.READ_CHUNK_SIZE) if reader else stream.read(self.READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+                self._append_bytes(chunk)
+        finally:
+            self._append_bytes(b"", final=True)
+            try:
+                stream.close()
+            except Exception:
+                pass
+            self._closed.set()
+
+    def _append_bytes(self, payload: bytes, *, source: str = "live", final: bool = False) -> None:
+        text = self._decoder.decode(payload, final=final)
+        if not text:
+            return
+        with self._lock:
+            self._sequence += 1
+            self._events.append(
+                {
+                    "seq": self._sequence,
+                    "ts": datetime.now().isoformat(),
+                    "stream": "output",
+                    "source": source,
+                    "text": text,
+                }
+            )
+
+    def add_system_event(self, text: str, *, source: str = "system") -> None:
+        if not text:
+            return
+        with self._lock:
+            self._sequence += 1
+            self._events.append(
+                {
+                    "seq": self._sequence,
+                    "ts": datetime.now().isoformat(),
+                    "stream": "system",
+                    "source": source,
+                    "text": text,
+                }
+            )
+
+    def wait_closed(self, timeout: Optional[float] = None) -> bool:
+        if self._reader:
+            self._reader.join(timeout)
+        return self._closed.is_set()
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(event["text"] for event in self._events if event.get("stream") == "output")
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(event) for event in self._events]
+
+    def event_count(self) -> int:
+        with self._lock:
+            return len(self._events)
 
 
 class _TerminalBackgroundManager:
     """Persist background command execution into terminal files."""
+
+    SNAPSHOT_INTERVAL_SECONDS = 0.25
+    RETENTION_DAYS = 7
 
     def __init__(self, project_root: Path):
         self.project_root = project_root
@@ -38,6 +134,9 @@ class _TerminalBackgroundManager:
         self._next_id = self._discover_next_id()
         self._records: Dict[int, Dict[str, Any]] = {}
         self._load_index()
+        self._reconcile_records()
+        self._cleanup_records()
+        self._save_index()
 
     def track_process(
         self,
@@ -47,8 +146,7 @@ class _TerminalBackgroundManager:
         working_directory: str,
         description: str,
         block_until_ms: int,
-        stdout_prefix: bytes = b"",
-        stderr_prefix: bytes = b"",
+        event_stream: _CommandEventStream,
     ) -> Dict[str, Any]:
         started_at = datetime.now().isoformat()
         started_ts = time.time()
@@ -56,9 +154,11 @@ class _TerminalBackgroundManager:
             terminal_id = self._next_id
             self._next_id += 1
             terminal_file = self.terminals_dir / f"{terminal_id}.txt"
+            event_file = self.terminals_dir / f"{terminal_id}.events.jsonl"
             record = {
                 "id": terminal_id,
                 "terminal_file": str(terminal_file),
+                "event_file": str(event_file),
                 "status": "running",
                 "pid": process.pid,
                 "command": command,
@@ -70,9 +170,10 @@ class _TerminalBackgroundManager:
                 "finished_at": "",
                 "exit_code": None,
                 "elapsed_ms": None,
+                "status_reason": "",
             }
             self._records[terminal_id] = record
-            atomic_write(terminal_file, self._render_running(record))
+            self._write_snapshot(record, event_stream.snapshot(), running=True)
             self._save_index()
 
             waiter = threading.Thread(
@@ -80,8 +181,7 @@ class _TerminalBackgroundManager:
                 args=(
                     terminal_id,
                     process,
-                    stdout_prefix,
-                    stderr_prefix,
+                    event_stream,
                 ),
                 daemon=True,
                 name=f"bash-terminal-{terminal_id}",
@@ -91,6 +191,7 @@ class _TerminalBackgroundManager:
             return {
                 "terminal_id": terminal_id,
                 "terminal_file": str(terminal_file),
+                "event_file": str(event_file),
                 "pid": process.pid,
                 "status": "running",
             }
@@ -99,45 +200,44 @@ class _TerminalBackgroundManager:
         self,
         terminal_id: int,
         process: subprocess.Popen,
-        stdout_prefix: bytes,
-        stderr_prefix: bytes,
+        event_stream: _CommandEventStream,
     ) -> None:
-        try:
-            stdout, stderr = process.communicate()
-        except Exception as exc:
-            stdout = b""
-            stderr = str(exc).encode("utf-8", errors="replace")
+        last_event_count = -1
+        last_snapshot_ts = 0.0
+        while True:
+            exit_code = process.poll()
+            snapshot = event_stream.snapshot()
+            if exit_code is None:
+                now = time.time()
+                if len(snapshot) != last_event_count or now - last_snapshot_ts >= self.SNAPSHOT_INTERVAL_SECONDS:
+                    with self._lock:
+                        record = self._records.get(terminal_id)
+                        if record:
+                            self._write_snapshot(record, snapshot, running=True)
+                    last_event_count = len(snapshot)
+                    last_snapshot_ts = now
+                time.sleep(self.SNAPSHOT_INTERVAL_SECONDS)
+                continue
 
-        stdout = stdout or b""
-        stderr = stderr or b""
+            event_stream.wait_closed(timeout=2.0)
+            snapshot = event_stream.snapshot()
+            with self._lock:
+                record = self._records.get(terminal_id)
+                if not record:
+                    return
 
-        if stdout_prefix and not stdout.startswith(stdout_prefix):
-            stdout = stdout_prefix + stdout
-        if stderr_prefix and not stderr.startswith(stderr_prefix):
-            stderr = stderr_prefix + stderr
+                finished_at = datetime.now().isoformat()
+                elapsed_ms = int((time.time() - record["started_ts"]) * 1000)
+                record["finished_at"] = finished_at
+                record["exit_code"] = exit_code
+                record["elapsed_ms"] = elapsed_ms
+                record["status"] = "completed" if exit_code == 0 else "failed"
+                record["status_reason"] = ""
+                self._write_snapshot(record, snapshot, running=False)
+                self._save_index()
+            return
 
-        stdout_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
-        exit_code = process.returncode
-
-        with self._lock:
-            record = self._records.get(terminal_id)
-            if not record:
-                return
-
-            finished_at = datetime.now().isoformat()
-            elapsed_ms = int((time.time() - record["started_ts"]) * 1000)
-
-            record["finished_at"] = finished_at
-            record["exit_code"] = exit_code
-            record["elapsed_ms"] = elapsed_ms
-            record["status"] = "completed" if exit_code == 0 else "failed"
-
-            terminal_file = Path(record["terminal_file"])
-            atomic_write(terminal_file, self._render_finished(record, stdout_text, stderr_text))
-            self._save_index()
-
-    def _render_running(self, record: Dict[str, Any]) -> str:
+    def _render_running(self, record: Dict[str, Any], events: List[Dict[str, Any]]) -> str:
         running_for_seconds = max(int(time.time() - record["started_ts"]), 0)
         lines = [
             f"[terminal:{record['id']}]",
@@ -149,13 +249,20 @@ class _TerminalBackgroundManager:
             f"command: {record['command']}",
             f"description: {record['description'] or '[none]'}",
             f"block_until_ms: {record['block_until_ms']}",
+            f"event_file: {record['event_file']}",
+            f"event_count: {len(events)}",
+            "",
+            "--- event_stream ---",
+            self._render_event_stream(events) or "[no output yet]",
             "",
             "--- output ---",
+            (self._events_to_output_text(events) or "[empty]").rstrip(),
+            "",
             "[running]",
         ]
         return "\n".join(lines) + "\n"
 
-    def _render_finished(self, record: Dict[str, Any], stdout_text: str, stderr_text: str) -> str:
+    def _render_finished(self, record: Dict[str, Any], events: List[Dict[str, Any]]) -> str:
         running_for_seconds = max(int((record.get("elapsed_ms") or 0) / 1000), 0)
         lines = [
             f"[terminal:{record['id']}]",
@@ -167,12 +274,15 @@ class _TerminalBackgroundManager:
             f"working_directory: {record['working_directory']}",
             f"command: {record['command']}",
             f"description: {record['description'] or '[none]'}",
+            f"event_file: {record['event_file']}",
+            f"event_count: {len(events)}",
+            *( [f"status_reason: {record['status_reason']}"] if record.get("status_reason") else [] ),
             "",
-            "--- stdout ---",
-            stdout_text.strip() or "[empty]",
+            "--- event_stream ---",
+            self._render_event_stream(events) or "[no output]",
             "",
-            "--- stderr ---",
-            stderr_text.strip() or "[empty]",
+            "--- output ---",
+            (self._events_to_output_text(events) or "[empty]").rstrip(),
             "",
             f"exit_code: {record['exit_code']}",
             f"elapsed_ms: {record['elapsed_ms']}",
@@ -202,6 +312,8 @@ class _TerminalBackgroundManager:
             if not isinstance(item, dict) or "id" not in item:
                 continue
             record = dict(item)
+            record.setdefault("event_file", str(self.terminals_dir / f"{record['id']}.events.jsonl"))
+            record.setdefault("status_reason", "")
             started_at = record.get("started_at")
             if started_at:
                 try:
@@ -227,6 +339,163 @@ class _TerminalBackgroundManager:
             json.dumps({"records": records}, ensure_ascii=False, indent=2) + "\n",
         )
 
+    def _reconcile_records(self) -> None:
+        now_ts = time.time()
+        for record in self._records.values():
+            status = record.get("status")
+            pid = record.get("pid")
+            if status in {"running", "detached"}:
+                if self._pid_alive(pid):
+                    if status == "detached":
+                        continue
+                    record["status"] = "detached"
+                    record["status_reason"] = "manager_restarted"
+                    record["finished_at"] = ""
+                    self._append_system_note(
+                        record,
+                        "Background process is still alive, but the previous manager restarted. Live capture is detached.",
+                    )
+                else:
+                    record["status"] = "terminated"
+                    record["status_reason"] = "stale_running_record"
+                    record["finished_at"] = datetime.now().isoformat()
+                    record["exit_code"] = None
+                    record["elapsed_ms"] = max(int((now_ts - record.get("started_ts", now_ts)) * 1000), 0)
+                    self._append_system_note(
+                        record,
+                        "Recovered stale running record: process is no longer alive.",
+                    )
+
+    def _cleanup_records(self) -> None:
+        cutoff = time.time() - self.RETENTION_DAYS * 24 * 60 * 60
+        active_files: Set[str] = set()
+        expired_ids: List[int] = []
+
+        for record_id, record in self._records.items():
+            active_files.add(record["terminal_file"])
+            active_files.add(record["event_file"])
+
+            finished_at = record.get("finished_at")
+            if record.get("status") in {"running", "detached"} and self._pid_alive(record.get("pid")):
+                continue
+            record_ts = self._record_timestamp(record, finished_at)
+            if record_ts >= cutoff:
+                continue
+            expired_ids.append(record_id)
+
+        for record_id in expired_ids:
+            record = self._records.pop(record_id, None)
+            if not record:
+                continue
+            for key in ("terminal_file", "event_file"):
+                path = Path(record[key])
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+
+        for pattern in ("*.txt", "*.events.jsonl"):
+            for item in self.terminals_dir.glob(pattern):
+                if str(item) in active_files:
+                    continue
+                try:
+                    item.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+
+    def _append_system_note(self, record: Dict[str, Any], note: str) -> None:
+        events = self._load_events(record)
+        events.append(
+            {
+                "seq": len(events) + 1,
+                "ts": datetime.now().isoformat(),
+                "stream": "system",
+                "source": "reconcile",
+                "text": note,
+            }
+        )
+        self._write_snapshot(record, events, running=False)
+
+    def _load_events(self, record: Dict[str, Any]) -> List[Dict[str, Any]]:
+        path = Path(record["event_file"])
+        if not path.exists():
+            return []
+        events: List[Dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    events.append(payload)
+        except Exception:
+            return []
+        return events
+
+    def _write_snapshot(self, record: Dict[str, Any], events: List[Dict[str, Any]], *, running: bool) -> None:
+        terminal_path = Path(record["terminal_file"])
+        event_path = Path(record["event_file"])
+        rendered = self._render_running(record, events) if running else self._render_finished(record, events)
+        atomic_write(terminal_path, rendered)
+        atomic_write(event_path, self._render_event_jsonl(events))
+
+    @staticmethod
+    def _render_event_jsonl(events: List[Dict[str, Any]]) -> str:
+        if not events:
+            return ""
+        return "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in events)
+
+    @staticmethod
+    def _events_to_output_text(events: List[Dict[str, Any]]) -> str:
+        return "".join(event.get("text", "") for event in events if event.get("stream") == "output")
+
+    @staticmethod
+    def _render_event_stream(events: List[Dict[str, Any]]) -> str:
+        rendered: List[str] = []
+        for event in events:
+            ts = event.get("ts", "")
+            stream = event.get("stream", "output")
+            source = event.get("source")
+            prefix = f"{ts} [{stream}"
+            if source and source not in {"live", "system"}:
+                prefix += f"/{source}"
+            prefix += "] "
+            text = event.get("text", "")
+            lines = text.splitlines() or [text]
+            if not lines:
+                rendered.append(prefix.rstrip())
+                continue
+            for line in lines:
+                rendered.append(prefix + line)
+        return "\n".join(line.rstrip() for line in rendered if line is not None).strip()
+
+    @staticmethod
+    def _record_timestamp(record: Dict[str, Any], timestamp: Optional[str]) -> float:
+        if timestamp:
+            try:
+                return datetime.fromisoformat(timestamp).timestamp()
+            except ValueError:
+                pass
+        return float(record.get("started_ts") or time.time())
+
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
 
 _TERMINAL_MANAGERS: Dict[str, _TerminalBackgroundManager] = {}
 _TERMINAL_MANAGERS_LOCK = threading.Lock()
@@ -247,6 +516,9 @@ class BashTool(Tool):
 
     DEFAULT_BLOCK_UNTIL_MS = 30000
     MAX_BLOCK_UNTIL_MS = 600000
+    OUTPUT_PREVIEW_MAX_LINES = 900
+    OUTPUT_PREVIEW_MAX_BYTES = 24_000
+    MAX_POLICY_PARSE_DEPTH = 3
 
     INTERACTIVE_COMMANDS: Set[str] = {
         "vim",
@@ -285,6 +557,7 @@ class BashTool(Tool):
     PREFER_SPECIALIZED_TOOLS: Set[str] = {
         "ls", "find",
         "grep", "rg",
+        "cat", "head", "tail",
         "sed", "awk",
     }
     NETWORK_COMMANDS: Set[str] = {
@@ -292,6 +565,21 @@ class BashTool(Tool):
         "pip", "pip3",
         "apt", "apt-get", "brew",
         "curl", "wget",
+    }
+    COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "|&", "&", "(", ")"}
+    SHELL_WRAPPERS: Set[str] = {"bash", "sh", "zsh", "dash", "ksh"}
+    SHELL_COMMAND_FLAGS: Set[str] = {"-c", "-lc", "-ic", "-ec", "-exc", "-lec"}
+    ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+    PREFERRED_TOOL_MESSAGES: Dict[str, str] = {
+        "ls": "Use the LS tool instead of `ls` in Bash for directory listing.",
+        "find": "Use the Glob tool instead of `find` in Bash for file discovery.",
+        "grep": "Use the Grep tool instead of `grep` in Bash for code and text search.",
+        "rg": "Use the Grep tool instead of `rg` in Bash for code and text search.",
+        "cat": "Use the Read tool instead of `cat` in Bash for file reading.",
+        "head": "Use the Read tool instead of `head` in Bash for file reading.",
+        "tail": "Use the Read tool instead of `tail` in Bash for file reading.",
+        "sed": "Use the Edit tool instead of `sed` in Bash for file editing.",
+        "awk": "Use the Edit or Grep tools instead of `awk` in Bash for repository inspection.",
     }
 
     def __init__(
@@ -304,13 +592,21 @@ class BashTool(Tool):
             name=name,
             description=(
                 "Run a non-interactive shell command inside the workspace. "
-                "Use this for builds, tests, formatters, linters, package scripts, developer commands, "
-                "and quick file inspection (cat, head, tail). "
+                "Use this for builds, tests, formatters, linters, package scripts, git, and other "
+                "developer commands. Prefer dedicated tools instead of Bash for directory listing "
+                "(LS), file discovery (Glob), code search (Grep), file reading (Read), and file "
+                "editing (Edit/Write/Delete). "
                 "Commands that exceed block_until_ms are moved to background and tracked by terminal files."
             ),
         )
         self.project_root = Path(project_root).expanduser().resolve()
         self.working_dir = ensure_working_dir(self.project_root, working_dir)
+        self.output_truncator = ObservationTruncator(
+            max_lines=self.OUTPUT_PREVIEW_MAX_LINES,
+            max_bytes=self.OUTPUT_PREVIEW_MAX_BYTES,
+            truncate_direction="head",
+            output_dir=str(self.project_root / "memory" / "tool-output"),
+        )
         self.allow_network = os.getenv("BASH_ALLOW_NETWORK", "false").lower() in {
             "1",
             "true",
@@ -323,13 +619,17 @@ class BashTool(Tool):
             ToolParameter(
                 name="command",
                 type="string",
-                description="Shell command to execute.",
+                description=(
+                    "Shell command to execute. Use Bash for terminal workflows like builds, tests, "
+                    "git, and package scripts. Do not use it for `ls`, `find`, `grep`, `cat`, "
+                    "`head`, `tail`, `sed`, or `awk` when the dedicated tools fit the task."
+                ),
                 required=True,
             ),
             ToolParameter(
                 name="working_directory",
                 type="string",
-                description="Working directory relative to the workspace root.",
+                description="Working directory relative to the workspace root. Use this instead of `cd`.",
                 required=False,
                 default=".",
             ),
@@ -346,7 +646,7 @@ class BashTool(Tool):
             ToolParameter(
                 name="description",
                 type="string",
-                description="Optional summary of this command.",
+                description="Optional short summary of what this command does.",
                 required=False,
                 default="",
             ),
@@ -430,7 +730,7 @@ class BashTool(Tool):
                 ["bash", "-lc", command],
                 cwd=target_dir,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 env={**os.environ, "PROJECT_ROOT": str(self.project_root)},
             )
         except Exception as exc:
@@ -443,9 +743,13 @@ class BashTool(Tool):
                 ),
             )
 
+        event_stream = self._create_event_stream()
+        event_stream.start(process.stdout)
+
         if block_until_ms == 0:
             return self._background_response(
                 process=process,
+                event_stream=event_stream,
                 command=command,
                 description=description,
                 directory=target_dir,
@@ -454,23 +758,24 @@ class BashTool(Tool):
             )
 
         try:
-            stdout, stderr = process.communicate(timeout=block_until_ms / 1000)
-        except subprocess.TimeoutExpired as exc:
+            process.wait(timeout=block_until_ms / 1000)
+            event_stream.wait_closed(timeout=2.0)
+        except subprocess.TimeoutExpired:
             return self._background_response(
                 process=process,
+                event_stream=event_stream,
                 command=command,
                 description=description,
                 directory=target_dir,
                 block_until_ms=block_until_ms,
                 reason="exceeded_block_until",
-                stdout_prefix=exc.stdout or b"",
-                stderr_prefix=exc.stderr or b"",
             )
         except Exception as exc:
             try:
                 process.kill()
             except Exception:
                 pass
+            event_stream.wait_closed(timeout=1.0)
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
                 message=f"Failed while waiting for command: {exc}",
@@ -481,21 +786,19 @@ class BashTool(Tool):
             description=description,
             directory=target_dir,
             exit_code=process.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            event_stream=event_stream,
         )
 
     def _background_response(
         self,
         *,
         process: subprocess.Popen,
+        event_stream: _CommandEventStream,
         command: str,
         description: str,
         directory: Path,
         block_until_ms: int,
         reason: str,
-        stdout_prefix: bytes = b"",
-        stderr_prefix: bytes = b"",
     ) -> ToolResponse:
         rel_dir = relative_display(self.project_root, directory)
         manager = _get_terminal_manager(self.project_root)
@@ -505,8 +808,7 @@ class BashTool(Tool):
             working_directory=rel_dir,
             description=description,
             block_until_ms=block_until_ms,
-            stdout_prefix=stdout_prefix,
-            stderr_prefix=stderr_prefix,
+            event_stream=event_stream,
         )
 
         parts: List[str] = []
@@ -518,6 +820,7 @@ class BashTool(Tool):
                 f"Directory: {rel_dir}",
                 f"Status: running in background (pid={task['pid']})",
                 f"Terminal file: {task['terminal_file']}",
+                f"Event file: {task['event_file']}",
             ]
         )
         if reason == "exceeded_block_until":
@@ -535,69 +838,238 @@ class BashTool(Tool):
                 "block_until_ms": block_until_ms,
                 "terminal_id": task["terminal_id"],
                 "terminal_file": task["terminal_file"],
+                "event_file": task["event_file"],
                 "pid": task["pid"],
             },
         )
 
     def _validate_command(self, command: str) -> Optional[str]:
         lowered = command.lower()
+        invocations = self._extract_command_invocations(command)
 
         if re.search(r"(^|[;&|]\s*)rm\s+-rf\s+/", lowered):
             return "Refusing to run a destructive command."
 
-        categories: List[tuple[str, Set[str]]] = [
-            ("Privileged commands are not allowed", self.PRIVILEGED_COMMANDS),
-            ("Interactive terminal commands are not allowed", self.INTERACTIVE_COMMANDS),
-            ("Destructive system commands are not allowed", self.DESTRUCTIVE_COMMANDS),
-            (
-                "Delete-related shell commands are blocked in Bash; use the Delete tool instead",
-                self.DELETE_COMMANDS,
-            ),
-        ]
-        if not self.allow_network:
-            categories.append(
-                ("Network-related commands are disabled for Bash by default", self.NETWORK_COMMANDS),
-            )
-        for message, blocklist in categories:
-            for blocked in blocklist:
-                if re.search(rf"\b{re.escape(blocked)}\b", lowered):
-                    return f"{message} (detected '{blocked}')."
+        for tokens in invocations:
+            if not tokens:
+                continue
+            leader = tokens[0]
+            if self._is_rm_root(tokens):
+                return "Refusing to run a destructive command."
+            if leader in self.PRIVILEGED_COMMANDS:
+                return f"Privileged commands are not allowed (detected '{leader}')."
+            if leader in self.INTERACTIVE_COMMANDS:
+                return f"Interactive terminal commands are not allowed (detected '{leader}')."
+            if leader in self.DESTRUCTIVE_COMMANDS:
+                return f"Destructive system commands are not allowed (detected '{leader}')."
+            if leader in self.DELETE_COMMANDS or self._is_delete_pattern(tokens):
+                return "Delete-related shell commands are blocked in Bash; use the Delete tool instead."
+            if not self.allow_network and leader in self.NETWORK_COMMANDS:
+                return f"Network-related commands are disabled for Bash by default (detected '{leader}')."
+            if leader in self.PREFER_SPECIALIZED_TOOLS:
+                return self.PREFERRED_TOOL_MESSAGES.get(
+                    leader,
+                    (
+                        f"Use the dedicated tool instead of `{leader}` in Bash. "
+                        "LS → directory listing, Glob → file discovery, Grep → code search, "
+                        "Read → file reading, Edit → file editing, Delete → file removal."
+                    ),
+                )
 
         for pattern in self.DELETE_PATTERNS:
             if re.search(pattern, lowered):
                 return "Delete-related shell commands are blocked in Bash; use the Delete tool instead."
 
-        for leader in self._extract_segment_leaders(command):
-            if leader in self.PREFER_SPECIALIZED_TOOLS:
-                return (
-                    f"Use the dedicated tool instead of `{leader}` in Bash. "
-                    "Read → file reading, Grep → code search, Glob → file finding, "
-                    "LS → directory listing, Edit → file editing, Delete → file removal."
-                )
-
         return None
 
     @staticmethod
     def _extract_segment_leaders(command: str) -> List[str]:
-        chain_segments = re.split(r"\|\||&&|;", command)
-        leaders: List[str] = []
-        for segment in chain_segments:
-            segment = segment.strip()
-            if not segment:
-                continue
-            first_pipe = segment.split("|")[0].strip()
-            if not first_pipe:
-                continue
-            try:
-                seg_tokens = shlex.split(first_pipe, posix=True)
-            except ValueError:
-                seg_tokens = re.findall(r"[a-zA-Z0-9_./+-]+", first_pipe)
-            if seg_tokens:
-                leaders.append(Path(seg_tokens[0]).name)
-        return leaders
+        return [tokens[0] for tokens in BashTool._extract_command_invocations(command)]
 
     def validate_command_policy(self, command: str) -> Optional[str]:
         return self._validate_command(command)
+
+    @classmethod
+    def _extract_command_invocations(cls, command: str, depth: int = 0) -> List[List[str]]:
+        if depth >= cls.MAX_POLICY_PARSE_DEPTH:
+            return []
+
+        try:
+            tokens = cls._tokenize_command(command)
+        except ValueError:
+            return cls._fallback_extract_invocations(command)
+
+        invocations: List[List[str]] = []
+        current: List[str] = []
+
+        for token in tokens:
+            if token in cls.COMMAND_SEPARATORS:
+                invocation = cls._normalize_invocation_tokens(current)
+                if invocation:
+                    nested = cls._extract_nested_shell_invocations(invocation, depth)
+                    invocations.extend(nested or [invocation])
+                current = []
+                continue
+            current.append(token)
+
+        invocation = cls._normalize_invocation_tokens(current)
+        if invocation:
+            nested = cls._extract_nested_shell_invocations(invocation, depth)
+            invocations.extend(nested or [invocation])
+
+        return invocations
+
+    @classmethod
+    def _tokenize_command(cls, command: str) -> List[str]:
+        lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars="|&;()<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+
+    @classmethod
+    def _fallback_extract_invocations(cls, command: str) -> List[List[str]]:
+        invocations: List[List[str]] = []
+        for segment in re.split(r"\|\||\|&|&&|;|\|", command):
+            segment = segment.strip()
+            if not segment:
+                continue
+            try:
+                tokens = shlex.split(segment, posix=True)
+            except ValueError:
+                tokens = re.findall(r"[A-Za-z0-9_./:+-]+", segment)
+            invocation = cls._normalize_invocation_tokens(tokens)
+            if invocation:
+                invocations.append(invocation)
+        return invocations
+
+    @classmethod
+    def _normalize_invocation_tokens(cls, tokens: List[str]) -> Optional[List[str]]:
+        if not tokens:
+            return None
+
+        idx = 0
+        while idx < len(tokens) and cls.ASSIGNMENT_PATTERN.fullmatch(tokens[idx]):
+            idx += 1
+        tokens = tokens[idx:]
+        if not tokens:
+            return None
+
+        tokens = cls._strip_command_wrappers(tokens)
+        if not tokens:
+            return None
+
+        leader = Path(tokens[0]).name.lower()
+        return [leader, *tokens[1:]]
+
+    @classmethod
+    def _strip_command_wrappers(cls, tokens: List[str]) -> List[str]:
+        current = list(tokens)
+
+        while current:
+            leader = Path(current[0]).name.lower()
+
+            if leader == "env":
+                idx = 1
+                while idx < len(current):
+                    token = current[idx]
+                    if token == "--":
+                        idx += 1
+                        break
+                    if token.startswith("-") or cls.ASSIGNMENT_PATTERN.fullmatch(token):
+                        idx += 1
+                        continue
+                    break
+                current = current[idx:]
+                continue
+
+            if leader in {"command", "builtin", "nohup", "stdbuf"}:
+                idx = 1
+                while idx < len(current) and current[idx].startswith("-"):
+                    idx += 1
+                current = current[idx:]
+                continue
+
+            if leader == "time":
+                idx = 1
+                while idx < len(current) and current[idx].startswith("-"):
+                    idx += 1
+                current = current[idx:]
+                continue
+
+            if leader == "timeout":
+                idx = 1
+                while idx < len(current):
+                    token = current[idx]
+                    if token.startswith("-") or cls._looks_like_duration(token):
+                        idx += 1
+                        continue
+                    break
+                current = current[idx:]
+                continue
+
+            if leader == "nice":
+                idx = 1
+                while idx < len(current):
+                    token = current[idx]
+                    if token.startswith("-") or re.fullmatch(r"[+-]?\d+", token):
+                        idx += 1
+                        continue
+                    break
+                current = current[idx:]
+                continue
+
+            break
+
+        return current
+
+    @classmethod
+    def _extract_nested_shell_invocations(
+        cls,
+        invocation: List[str],
+        depth: int,
+    ) -> List[List[str]]:
+        if not invocation:
+            return []
+
+        leader = invocation[0]
+        if leader not in cls.SHELL_WRAPPERS:
+            return []
+
+        for index, token in enumerate(invocation[1:], start=1):
+            if token not in cls.SHELL_COMMAND_FLAGS:
+                continue
+            if index + 1 >= len(invocation):
+                return []
+            nested_command = invocation[index + 1]
+            return cls._extract_command_invocations(nested_command, depth + 1)
+
+        return []
+
+    @staticmethod
+    def _looks_like_duration(token: str) -> bool:
+        return bool(re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", token))
+
+    @staticmethod
+    def _is_rm_root(tokens: List[str]) -> bool:
+        if not tokens or tokens[0] != "rm":
+            return False
+        has_recursive_force = any(
+            token.startswith("-") and "r" in token and "f" in token
+            for token in tokens[1:]
+        )
+        touches_root = any(token == "/" for token in tokens[1:] if token != "--")
+        return has_recursive_force and touches_root
+
+    @staticmethod
+    def _is_delete_pattern(tokens: List[str]) -> bool:
+        if not tokens:
+            return False
+        leader = tokens[0]
+        if leader == "find" and any(token == "-delete" for token in tokens[1:]):
+            return True
+        if leader == "git" and len(tokens) > 1 and tokens[1].lower() == "clean":
+            return True
+        return False
 
     def _format_response(
         self,
@@ -605,15 +1077,24 @@ class BashTool(Tool):
         description: str,
         directory: Path,
         exit_code: Optional[int],
-        stdout: bytes,
-        stderr: bytes,
+        event_stream: _CommandEventStream,
     ) -> ToolResponse:
-        stdout_text, stdout_bytes_truncated = safe_decode_output(stdout)
-        stderr_text, stderr_bytes_truncated = safe_decode_output(stderr)
-        stdout_text, stdout_lines_truncated = apply_line_limit(stdout_text)
-        stderr_text, stderr_lines_truncated = apply_line_limit(stderr_text)
-
         rel_dir = relative_display(self.project_root, directory)
+        output_text = event_stream.text()
+        truncation = self.output_truncator.truncate(
+            tool_name="bash",
+            output=output_text,
+            metadata={
+                "command": command,
+                "description": description,
+                "working_directory": rel_dir,
+                "exit_code": exit_code,
+                "event_count": event_stream.event_count(),
+            },
+        )
+        preview_text = truncation.get("display_preview", truncation.get("preview", output_text))
+        truncated = truncation.get("truncated", False)
+        full_output_path = truncation.get("full_output_path")
 
         parts: List[str] = []
         if description:
@@ -625,17 +1106,9 @@ class BashTool(Tool):
         else:
             parts.append(f"Exit code: {exit_code} (failure)")
 
-        if stdout_text:
-            parts.extend(["", "--- stdout ---", stdout_text])
-            if stdout_bytes_truncated or stdout_lines_truncated:
-                parts.append("[stdout truncated]")
-
-        if stderr_text:
-            parts.extend(["", "--- stderr ---", stderr_text])
-            if stderr_bytes_truncated or stderr_lines_truncated:
-                parts.append("[stderr truncated]")
-
-        if not stdout_text and not stderr_text:
+        if preview_text:
+            parts.extend(["", "--- output ---", preview_text])
+        else:
             parts.extend(["", "[no output]"])
 
         text = "\n".join(parts)
@@ -645,15 +1118,19 @@ class BashTool(Tool):
             "description": description,
             "working_directory": rel_dir,
             "exit_code": exit_code,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
+            "output": preview_text,
+            "stdout": preview_text,
+            "stderr": "",
+            "event_count": event_stream.event_count(),
+            "truncated": truncated,
+            "full_output_path": full_output_path,
         }
 
-        if exit_code != 0:
-            return ToolResponse.error(
-                code=ToolErrorCode.EXECUTION_ERROR,
-                message=text,
-                context={"command": command, "working_directory": rel_dir, "exit_code": exit_code},
-            )
+        if truncated:
+            return ToolResponse.partial(text=text, data=data)
 
         return ToolResponse.success(text=text, data=data)
+
+    @staticmethod
+    def _create_event_stream(output_prefix: bytes = b"") -> _CommandEventStream:
+        return _CommandEventStream(output_prefix=output_prefix)

@@ -2,17 +2,18 @@
 
 import json
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from ..core.agent import Agent
 from ..core.llm import HelloAgentsLLM
 from ..core.config import Config
 from ..core.message import Message
-from ..core.lifecycle import AgentEvent, EventType, LifecycleHook
+from ..core.lifecycle import EventType, LifecycleHook
 from ..core.streaming import StreamEvent, StreamEventType
 from ..tools.registry import ToolRegistry
 from ..tools.response import ToolStatus
-from ..tools.errors import ToolErrorCode
 from ..context.compactor import ContextCompactor
 
 
@@ -38,6 +39,21 @@ You complete tasks by calling tools:
 - You may call tools multiple times to gather information
 - Only call Finish when you are confident you have enough information
 """
+
+
+@dataclass
+class _ExecutionState:
+    current_step: int
+    total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    no_tool_call_retries: int = 0
+    max_no_tool_call_retries: int = 2
+    is_retry: bool = False
+    consecutive_no_diff_edits: int = 0
+    last_test_output_hash: Optional[int] = None
+    consecutive_same_tests: int = 0
+    stagnation_detected: bool = False
 
 
 class ReActAgent(Agent):
@@ -240,6 +256,447 @@ class ReActAgent(Agent):
     def add_tool(self, tool):
         """添加工具到工具注册表"""
         self.tool_registry.register_tool(tool)
+
+    def _parallel_user_tool_execution_enabled(self) -> bool:
+        """Whether sync run() should execute user tools concurrently."""
+        return False
+
+    @staticmethod
+    def _invalid_tool_arguments_content(exc: json.JSONDecodeError) -> str:
+        return f"Error: Invalid argument format - {exc}"
+
+    def _split_tool_calls(self, tool_calls: List[Any]) -> tuple[List[Any], List[Any]]:
+        """Split tool calls into builtin and user-defined groups."""
+        builtin_calls: List[Any] = []
+        user_calls: List[Any] = []
+
+        for tool_call in tool_calls:
+            target = builtin_calls if tool_call.function.name in self._builtin_tools else user_calls
+            target.append(tool_call)
+
+        return builtin_calls, user_calls
+
+    def _decode_tool_call(self, tool_call: Any) -> tuple[str, str, Optional[Dict[str, Any]], Optional[str]]:
+        """Decode a single tool call payload into structured arguments."""
+        tool_name = tool_call.function.name
+        tool_call_id = tool_call.id
+
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError as exc:
+            return tool_name, tool_call_id, None, self._invalid_tool_arguments_content(exc)
+
+        return tool_name, tool_call_id, arguments, None
+
+    async def _emit_tool_call_event(
+        self,
+        on_tool_call: LifecycleHook,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Dict[str, Any],
+        current_step: int,
+    ) -> None:
+        await self._emit_event(
+            EventType.TOOL_CALL,
+            on_tool_call,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args=arguments,
+            step=current_step,
+        )
+
+    def _trace_tool_call(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Dict[str, Any],
+        *,
+        step: int,
+    ) -> None:
+        if not self.trace_logger:
+            return
+
+        self.trace_logger.log_event(
+            "tool_call",
+            {
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "args": arguments,
+            },
+            step=step,
+        )
+
+    def _trace_tool_result(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        result_content: str,
+        *,
+        step: int,
+        status: Optional[str] = None,
+    ) -> None:
+        if not self.trace_logger:
+            return
+
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "result": result_content,
+        }
+        if status is not None:
+            payload["status"] = status
+
+        self.trace_logger.log_event("tool_result", payload, step=step)
+
+    def _tool_error_result(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        error_content: str,
+        *,
+        step: int,
+    ) -> tuple[str, str, Dict[str, str]]:
+        self._render_agent_error(error_content)
+        self._trace_tool_result(
+            tool_name,
+            tool_call_id,
+            error_content,
+            step=step,
+            status="error",
+        )
+        return (tool_name, tool_call_id, {"content": error_content})
+
+    def _create_execution_state(self, start_step: int) -> _ExecutionState:
+        return _ExecutionState(current_step=start_step)
+
+    def _trace_user_message(self, input_text: str) -> None:
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                "message_written",
+                {"role": "user", "content": input_text},
+            )
+
+    def _prepare_execution(self, input_text: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        messages = self._build_messages(input_text)
+        tool_schemas = self._build_tool_schemas()
+        self._trace_user_message(input_text)
+        self._render_agent_start(input_text)
+        return messages, tool_schemas
+
+    def _maybe_compact_messages(self, messages: List[Dict[str, Any]]) -> None:
+        if self._compactor and self.config.compact_enabled:
+            self._compactor.micro_compact(messages)
+            if self._compactor.estimate_tokens(messages) > self.config.compact_token_threshold:
+                self._render_compaction_notice()
+                messages[:] = self._compactor.auto_compact(messages, self.llm)
+
+    def _record_model_response(self, response: Any, current_step: int, state: _ExecutionState) -> Any:
+        response_message = response.choices[0].message
+
+        if response.usage:
+            state.total_tokens += response.usage.total_tokens
+            state.total_prompt_tokens += getattr(response.usage, "prompt_tokens", 0)
+            state.total_completion_tokens += getattr(response.usage, "completion_tokens", 0)
+            self._total_tokens = state.total_tokens
+            self._turn_prompt_tokens = state.total_prompt_tokens
+            self._turn_completion_tokens = state.total_completion_tokens
+            self._last_prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                "model_output",
+                {
+                    "content": response_message.content or "",
+                    "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
+                    "usage": {
+                        "total_tokens": response.usage.total_tokens if response.usage else 0,
+                        "cost": 0.0,
+                    },
+                },
+                step=current_step,
+            )
+
+        return response_message
+
+    def _append_assistant_tool_call_message(self, messages: List[Dict[str, Any]], response_message: Any) -> None:
+        tool_calls = response_message.tool_calls or []
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+
+    @staticmethod
+    def _append_tool_message(messages: List[Dict[str, Any]], tool_call_id: str, result_content: str) -> None:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result_content,
+            }
+        )
+
+    def _append_final_history(self, input_text: str, final_answer: str) -> None:
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(final_answer, "assistant"))
+
+    def _finalize_trace_session(
+        self,
+        session_start_time: datetime,
+        current_step: int,
+        final_answer: str,
+        *,
+        status: str,
+    ) -> None:
+        if not self.trace_logger:
+            return
+
+        duration = (datetime.now() - session_start_time).total_seconds()
+        self.trace_logger.log_event(
+            "session_end",
+            {
+                "duration": duration,
+                "total_steps": current_step,
+                "final_answer": final_answer,
+                "status": status,
+            },
+        )
+        self.trace_logger.finalize()
+
+    def _should_retry_without_tool_call(
+        self,
+        messages: List[Dict[str, Any]],
+        text_content: str,
+        state: _ExecutionState,
+    ) -> bool:
+        if text_content or state.no_tool_call_retries >= state.max_no_tool_call_retries:
+            return False
+
+        state.no_tool_call_retries += 1
+        state.is_retry = True
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "You have access to tools — please use them to complete the task. "
+                    "Do not respond with text only. Call a tool now."
+                ),
+            }
+        )
+        return True
+
+    @staticmethod
+    def _extract_tool_command(tool_calls: List[Any], tool_call_id: str) -> str:
+        for tool_call in tool_calls:
+            if tool_call.id != tool_call_id:
+                continue
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except Exception:
+                return ""
+            return arguments.get("command", "")
+        return ""
+
+    def _update_stagnation_state(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        result_content: str,
+        tool_calls: List[Any],
+        current_step: int,
+        state: _ExecutionState,
+    ) -> None:
+        if tool_name == "Edit":
+            if "[no textual diff]" in result_content:
+                state.consecutive_no_diff_edits += 1
+            else:
+                state.consecutive_no_diff_edits = 0
+        else:
+            state.consecutive_no_diff_edits = 0
+
+        if tool_name == "Bash":
+            cmd = self._extract_tool_command(tool_calls, tool_call_id)
+            if "tests.py" in cmd or "pytest" in cmd or "unittest" in cmd:
+                test_hash = hash(result_content)
+                if test_hash == state.last_test_output_hash:
+                    state.consecutive_same_tests += 1
+                else:
+                    state.consecutive_same_tests = 0
+                    state.last_test_output_hash = test_hash
+
+        if state.consecutive_no_diff_edits >= 3 or state.consecutive_same_tests >= 3:
+            reason = (
+                "3 consecutive Edit calls with no textual diff"
+                if state.consecutive_no_diff_edits >= 3
+                else "3 consecutive identical test results"
+            )
+            self._render_event("stagnation_detected", {"reason": reason, "step": current_step})
+            state.stagnation_detected = True
+
+    def _process_tool_results(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_calls: List[Any],
+        tool_results: List[tuple],
+        current_step: int,
+        state: _ExecutionState,
+    ) -> Optional[str]:
+        for tool_name, tool_call_id, result in tool_results:
+            if tool_name == "Finish" and result.get("finished"):
+                final_answer = result["final_answer"]
+                self._render_final_answer(final_answer, step=current_step)
+                return final_answer
+
+            result_content = result.get("content", str(result))
+            self._append_tool_message(messages, tool_call_id, result_content)
+            self._update_stagnation_state(
+                tool_name,
+                tool_call_id,
+                result_content,
+                tool_calls,
+                current_step,
+                state,
+            )
+            if state.stagnation_detected:
+                break
+
+        return None
+
+    def _execute_tools(
+        self,
+        tool_calls: List[Any],
+        current_step: int,
+    ) -> List[tuple]:
+        """Execute builtin tools serially and user tools with an optional shared executor."""
+        results = []
+        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
+
+        for tc in builtin_calls:
+            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+            if error_content is not None:
+                results.append(
+                    self._tool_error_result(
+                        tool_name,
+                        tool_call_id,
+                        error_content,
+                        step=current_step,
+                    )
+                )
+                continue
+
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+
+            result = self._handle_builtin_tool(tool_name, arguments)
+            self._render_builtin_tool(
+                tool_name,
+                result["content"],
+                tool_call_id=tool_call_id,
+                step=current_step,
+            )
+
+            self._trace_tool_result(
+                tool_name,
+                tool_call_id,
+                result["content"],
+                step=current_step,
+                status="success",
+            )
+
+            results.append((tool_name, tool_call_id, result))
+
+        prepared_user_calls = []
+        for tc in user_calls:
+            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+            if error_content is not None:
+                results.append(
+                    self._tool_error_result(
+                        tool_name,
+                        tool_call_id,
+                        error_content,
+                        step=current_step,
+                    )
+                )
+                continue
+
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+
+            self._render_tool_call(
+                tool_name,
+                arguments,
+                tool_call_id=tool_call_id,
+                step=current_step,
+            )
+            prepared_user_calls.append((tool_name, tool_call_id, arguments))
+
+        if not prepared_user_calls:
+            return results
+
+        max_concurrent = getattr(self.config, "max_concurrent_tools", 3)
+        run_in_parallel = self._parallel_user_tool_execution_enabled() and len(prepared_user_calls) > 1
+
+        if run_in_parallel:
+            with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+                future_items = [
+                    (
+                        tool_name,
+                        tool_call_id,
+                        executor.submit(self._execute_tool_call, tool_name, arguments),
+                    )
+                    for tool_name, tool_call_id, arguments in prepared_user_calls
+                ]
+
+                for tool_name, tool_call_id, future in future_items:
+                    try:
+                        result_content = future.result()
+                    except Exception as exc:
+                        result_content = f"❌ Tool execution failed: {exc}"
+
+                    self._trace_tool_result(
+                        tool_name,
+                        tool_call_id,
+                        result_content,
+                        step=current_step,
+                    )
+
+                    self._render_tool_result(
+                        result_content,
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        step=current_step,
+                    )
+                    results.append((tool_name, tool_call_id, {"content": result_content}))
+        else:
+            for tool_name, tool_call_id, arguments in prepared_user_calls:
+                result_content = self._execute_tool_call(tool_name, arguments)
+
+                self._trace_tool_result(
+                    tool_name,
+                    tool_call_id,
+                    result_content,
+                    step=current_step,
+                )
+
+                self._render_tool_result(
+                    result_content,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    step=current_step,
+                )
+                results.append((tool_name, tool_call_id, {"content": result_content}))
+
+        return results
     
     def run(self, input_text: str, **kwargs) -> str:
         """
@@ -298,54 +755,24 @@ class ReActAgent(Agent):
         Returns:
             最终答案
         """
-        # 构建消息列表
-        messages = self._build_messages(input_text)
+        start_step = int(kwargs.pop("start_step", 0) or 0)
+        if start_step < 0:
+            start_step = 0
 
-        # 构建工具 schemas（包含内置工具和用户工具）
-        tool_schemas = self._build_tool_schemas()
+        messages, tool_schemas = self._prepare_execution(input_text)
+        state = self._create_execution_state(start_step)
 
-        current_step = 0
-        total_tokens = 0
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        no_tool_call_retries = 0
-        max_no_tool_call_retries = 2
-        _is_retry = False  # 标记当前是否为重试（重试时不渲染 step header）
+        while self.max_steps <= 0 or state.current_step < self.max_steps:
+            if not state.is_retry:
+                state.current_step += 1
+                self._render_step_start(state.current_step)
+            state.is_retry = False
 
-        # --- Stagnation detection ---
-        _consecutive_no_diff_edits = 0   # adjacent Edit calls with no textual diff
-        _last_test_output_hash = None    # hash of last test run output
-        _consecutive_same_tests = 0      # consecutive identical test results
-        _stagnation_detected = False
+            self._current_step = state.current_step
+            self._maybe_compact_messages(messages)
 
-        # 记录用户消息
-        if self.trace_logger:
-            self.trace_logger.log_event(
-                "message_written",
-                {"role": "user", "content": input_text}
-            )
+            self._before_model_call(messages, state.current_step)
 
-        self._render_agent_start(input_text)
-
-        while self.max_steps <= 0 or current_step < self.max_steps:
-            if not _is_retry:
-                current_step += 1
-                self._render_step_start(current_step)
-            _is_retry = False  # 重置标记
-
-            # 保存当前步数（用于异常时保存）
-            self._current_step = current_step
-
-            # 上下文压缩（内部机制，对 LLM 透明）
-            if self._compactor and self.config.compact_enabled:
-                self._compactor.micro_compact(messages)
-                if self._compactor.estimate_tokens(messages) > self.config.compact_token_threshold:
-                    self._render_compaction_notice()
-                    messages[:] = self._compactor.auto_compact(messages, self.llm)
-
-            self._before_model_call(messages, current_step)
-
-            # 调用 LLM（Function Calling）
             try:
                 response = self.llm.invoke_with_tools(
                     messages=messages,
@@ -354,285 +781,68 @@ class ReActAgent(Agent):
                     **kwargs
                 )
             except Exception as e:
-                self._render_llm_error(e, step=current_step)
+                self._render_llm_error(e, step=state.current_step)
                 if self.trace_logger:
                     self.trace_logger.log_event(
                         "error",
                         {"error_type": "LLM_ERROR", "message": str(e)},
-                        step=current_step
+                        step=state.current_step
                     )
                 break
 
-            # 获取响应消息
-            response_message = response.choices[0].message
-
-            # 累计 tokens
-            if response.usage:
-                total_tokens += response.usage.total_tokens
-                total_prompt_tokens += getattr(response.usage, 'prompt_tokens', 0)
-                total_completion_tokens += getattr(response.usage, 'completion_tokens', 0)
-                self._total_tokens = total_tokens
-                self._turn_prompt_tokens = total_prompt_tokens
-                self._turn_completion_tokens = total_completion_tokens
-                # Track the most recent call's prompt_tokens as current context usage
-                self._last_prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
-
-            # 记录模型输出
-            if self.trace_logger:
-                self.trace_logger.log_event(
-                    "model_output",
-                    {
-                        "content": response_message.content or "",
-                        "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
-                        "usage": {
-                            "total_tokens": response.usage.total_tokens if response.usage else 0,
-                            "cost": 0.0
-                        }
-                    },
-                    step=current_step
-                )
-
-            # 处理工具调用
+            response_message = self._record_model_response(response, state.current_step, state)
             tool_calls = response_message.tool_calls
             if not tool_calls:
                 text_content = (response_message.content or "").strip()
 
-                # 如果模型返回了有意义的文本，说明它判断无需工具即可回答，
-                # 直接接受为最终答案（例如问候、闲聊、知识问答等场景）。
-                # 只有当模型返回空内容时，才认为是 tool-calling 不稳定并重试。
-                if not text_content and no_tool_call_retries < max_no_tool_call_retries:
-                    no_tool_call_retries += 1
-                    _is_retry = True  # 标记下次循环为重试，不渲染 step header
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "You have access to tools — please use them to complete the task. "
-                            "Do not respond with text only. Call a tool now."
-                        ),
-                    })
+                if self._should_retry_without_tool_call(messages, text_content, state):
                     continue
 
-                # 直接返回文本响应
                 final_answer = text_content or "Sorry, I cannot answer this question."
                 self._render_direct_response(final_answer)
-
-                # 保存到历史记录
-                self.add_message(Message(input_text, "user"))
-                self.add_message(Message(final_answer, "assistant"))
-
-                if self.trace_logger:
-                    duration = (datetime.now() - session_start_time).total_seconds()
-                    self.trace_logger.log_event(
-                        "session_end",
-                        {
-                            "duration": duration,
-                            "total_steps": current_step,
-                            "final_answer": final_answer,
-                            "status": "success"
-                        }
-                    )
-                    self.trace_logger.finalize()
-
+                self._append_final_history(input_text, final_answer)
+                self._finalize_trace_session(
+                    session_start_time,
+                    state.current_step,
+                    final_answer,
+                    status="success",
+                )
                 return final_answer
 
-            # 将助手消息添加到历史（模型成功发起了工具调用，重置重试计数器）
-            no_tool_call_retries = 0
-            messages.append({
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in tool_calls
-                ]
-            })
+            state.no_tool_call_retries = 0
+            self._append_assistant_tool_call_message(messages, response_message)
 
-            # 执行所有工具调用
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                tool_call_id = tool_call.id
+            tool_results = self._execute_tools(tool_calls, state.current_step)
+            final_answer = self._process_tool_results(
+                messages,
+                tool_calls,
+                tool_results,
+                state.current_step,
+                state,
+            )
+            if final_answer is not None:
+                self._append_final_history(input_text, final_answer)
+                self._finalize_trace_session(
+                    session_start_time,
+                    state.current_step,
+                    final_answer,
+                    status="success",
+                )
+                return final_answer
 
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    self._render_agent_error(f"Tool argument parsing failed: {e}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": f"Error: Invalid argument format - {str(e)}"
-                    })
-                    continue
-
-                # 记录工具调用
-                if self.trace_logger:
-                    self.trace_logger.log_event(
-                        "tool_call",
-                        {
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "args": arguments
-                        },
-                        step=current_step
-                    )
-
-                # 检查是否是内置工具
-                if tool_name in self._builtin_tools:
-                    result = self._handle_builtin_tool(tool_name, arguments)
-                    self._render_builtin_tool(
-                        tool_name,
-                        result['content'],
-                        tool_call_id=tool_call_id,
-                        step=current_step,
-                    )
-
-                    # 记录工具结果
-                    if self.trace_logger:
-                        self.trace_logger.log_event(
-                            "tool_result",
-                            {
-                                "tool_name": tool_name,
-                                "tool_call_id": tool_call_id,
-                                "status": "success",
-                                "result": result['content']
-                            },
-                            step=current_step
-                        )
-
-                    # 检查是否是 Finish
-                    if tool_name == "Finish" and result.get("finished"):
-                        final_answer = result["final_answer"]
-                        self._render_final_answer(final_answer, step=current_step)
-
-                        # 保存到历史记录
-                        self.add_message(Message(input_text, "user"))
-                        self.add_message(Message(final_answer, "assistant"))
-
-                        if self.trace_logger:
-                            duration = (datetime.now() - session_start_time).total_seconds()
-                            self.trace_logger.log_event(
-                                "session_end",
-                                {
-                                    "duration": duration,
-                                    "total_steps": current_step,
-                                    "final_answer": final_answer,
-                                    "status": "success"
-                                }
-                            )
-                            self.trace_logger.finalize()
-
-                        return final_answer
-
-                    # 添加工具结果到消息
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": result['content']
-                    })
-                else:
-                    # 用户工具
-                    self._render_tool_call(
-                        tool_name,
-                        arguments,
-                        tool_call_id=tool_call_id,
-                        step=current_step,
-                    )
-
-                    # 执行工具（使用基类方法，支持字典参数）
-                    result = self._execute_tool_call(tool_name, arguments)
-
-                    # 记录工具结果
-                    if self.trace_logger:
-                        self.trace_logger.log_event(
-                            "tool_result",
-                            {
-                                "tool_name": tool_name,
-                                "tool_call_id": tool_call_id,
-                                "result": result
-                            },
-                            step=current_step
-                        )
-
-                    # 检查是否是错误
-                    self._render_tool_result(
-                        result,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        step=current_step,
-                    )
-
-                    # 添加工具结果到消息
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": result
-                    })
-
-                    # --- Stagnation detection ---
-                    if tool_name == "Edit":
-                        if "[no textual diff]" in result:
-                            _consecutive_no_diff_edits += 1
-                        else:
-                            _consecutive_no_diff_edits = 0
-                    else:
-                        # Non-Edit tool resets the counter (user requires adjacent Edit calls)
-                        _consecutive_no_diff_edits = 0
-
-                    if tool_name == "Bash":
-                        cmd = arguments.get("command", "")
-                        if "tests.py" in cmd or "pytest" in cmd or "unittest" in cmd:
-                            test_hash = hash(result)
-                            if test_hash == _last_test_output_hash:
-                                _consecutive_same_tests += 1
-                            else:
-                                _consecutive_same_tests = 0
-                                _last_test_output_hash = test_hash
-
-                    if _consecutive_no_diff_edits >= 3 or _consecutive_same_tests >= 3:
-                        reason = (
-                            "3 consecutive Edit calls with no textual diff"
-                            if _consecutive_no_diff_edits >= 3
-                            else "3 consecutive identical test results"
-                        )
-                        self._render_event("stagnation_detected", {
-                            "reason": reason,
-                            "step": current_step,
-                        })
-                        _stagnation_detected = True
-                        break  # break inner for-loop
-
-            # Check if stagnation was detected to break the outer while-loop
-            if _stagnation_detected:
+            if state.stagnation_detected:
                 break
 
-        # 达到最大步数或停滞检测触发
-        if not _stagnation_detected:
+        if not state.stagnation_detected:
             self._render_timeout()
         final_answer = "Sorry, I could not complete this task within the step limit."
-
-        # 保存到历史记录
-        self.add_message(Message(input_text, "user"))
-        self.add_message(Message(final_answer, "assistant"))
-
-        # 记录会话结束（超时）
-        if self.trace_logger:
-            duration = (datetime.now() - session_start_time).total_seconds()
-            self.trace_logger.log_event(
-                "session_end",
-                {
-                    "duration": duration,
-                    "total_steps": current_step,
-                    "final_answer": final_answer,
-                    "status": "timeout"
-                }
-            )
-            self.trace_logger.finalize()
-
+        self._append_final_history(input_text, final_answer)
+        self._finalize_trace_session(
+            session_start_time,
+            state.current_step,
+            final_answer,
+            status="timeout",
+        )
         return final_answer
 
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
@@ -767,6 +977,9 @@ class ReActAgent(Agent):
             最终答案
         """
         session_start_time = datetime.now()
+        start_step = int(kwargs.pop("start_step", 0) or 0)
+        if start_step < 0:
+            start_step = 0
 
         # 触发开始事件
         await self._emit_event(
@@ -776,59 +989,26 @@ class ReActAgent(Agent):
         )
 
         try:
-            # 构建消息列表
-            messages = self._build_messages(input_text)
-            tool_schemas = self._build_tool_schemas()
+            messages, tool_schemas = self._prepare_execution(input_text)
+            state = self._create_execution_state(start_step)
 
-            current_step = 0
-            total_tokens = 0
-            total_prompt_tokens = 0
-            total_completion_tokens = 0
-            no_tool_call_retries = 0
-            max_no_tool_call_retries = 2
-            _is_retry = False
+            while self.max_steps <= 0 or state.current_step < self.max_steps:
+                if not state.is_retry:
+                    state.current_step += 1
+                    self._render_step_start(state.current_step)
+                state.is_retry = False
 
-            # --- Stagnation detection ---
-            _consecutive_no_diff_edits = 0
-            _last_test_output_hash = None
-            _consecutive_same_tests = 0
-            _stagnation_detected = False
+                self._current_step = state.current_step
+                self._maybe_compact_messages(messages)
 
-            # 记录用户消息
-            if self.trace_logger:
-                self.trace_logger.log_event(
-                    "message_written",
-                    {"role": "user", "content": input_text}
-                )
-
-            self._render_agent_start(input_text)
-
-            while self.max_steps <= 0 or current_step < self.max_steps:
-                if not _is_retry:
-                    current_step += 1
-                    self._render_step_start(current_step)
-                _is_retry = False
-
-                # 保存当前步数
-                self._current_step = current_step
-
-                # 上下文压缩
-                if self._compactor and self.config.compact_enabled:
-                    self._compactor.micro_compact(messages)
-                    if self._compactor.estimate_tokens(messages) > self.config.compact_token_threshold:
-                        self._render_compaction_notice()
-                        messages[:] = self._compactor.auto_compact(messages, self.llm)
-
-                # 触发步骤开始事件
                 await self._emit_event(
                     EventType.STEP_START,
                     on_step,
-                    step=current_step
+                    step=state.current_step
                 )
 
-                await self._abefore_model_call(messages, current_step)
+                await self._abefore_model_call(messages, state.current_step)
 
-                # 异步调用 LLM
                 try:
                     response = await self.llm.ainvoke_with_tools(
                         messages=messages,
@@ -837,242 +1017,106 @@ class ReActAgent(Agent):
                         **kwargs
                     )
                 except Exception as e:
-                    self._render_llm_error(e, step=current_step)
+                    self._render_llm_error(e, step=state.current_step)
                     await self._emit_event(
                         EventType.AGENT_ERROR,
                         on_error,
                         error=str(e),
-                        step=current_step
+                        step=state.current_step
                     )
                     break
 
-                # 获取响应消息
-                response_message = response.choices[0].message
-
-                # 累计 tokens
-                if response.usage:
-                    total_tokens += response.usage.total_tokens
-                    total_prompt_tokens += getattr(response.usage, 'prompt_tokens', 0)
-                    total_completion_tokens += getattr(response.usage, 'completion_tokens', 0)
-                    self._total_tokens = total_tokens
-                    self._turn_prompt_tokens = total_prompt_tokens
-                    self._turn_completion_tokens = total_completion_tokens
-                    # Track the most recent call's prompt_tokens as current context usage
-                    self._last_prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
-
-                # 记录模型输出
-                if self.trace_logger:
-                    self.trace_logger.log_event(
-                        "model_output",
-                        {
-                            "content": response_message.content or "",
-                            "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
-                            "usage": {
-                                "total_tokens": response.usage.total_tokens if response.usage else 0,
-                                "cost": 0.0
-                            }
-                        },
-                        step=current_step
-                    )
-
-                # 处理工具调用
+                response_message = self._record_model_response(response, state.current_step, state)
                 tool_calls = response_message.tool_calls
                 if not tool_calls:
                     text_content = (response_message.content or "").strip()
 
-                    # Only retry when model returns empty content (tool-calling instability).
-                    # If it returned meaningful text, accept it as the final answer.
-                    if not text_content and no_tool_call_retries < max_no_tool_call_retries:
-                        no_tool_call_retries += 1
-                        _is_retry = True
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You have access to tools — please use them to complete the task. "
-                                "Do not respond with text only. Call a tool now."
-                            ),
-                        })
+                    if self._should_retry_without_tool_call(messages, text_content, state):
                         continue
 
-                    # 没有工具调用，直接返回
                     final_answer = text_content or "Sorry, I cannot answer this question."
                     self._render_direct_response(final_answer)
-
-                    self.add_message(Message(input_text, "user"))
-                    self.add_message(Message(final_answer, "assistant"))
+                    self._append_final_history(input_text, final_answer)
 
                     await self._emit_event(
                         EventType.AGENT_FINISH,
                         on_finish,
                         result=final_answer,
-                        total_steps=current_step,
-                        total_tokens=total_tokens
+                        total_steps=state.current_step,
+                        total_tokens=state.total_tokens
                     )
 
-                    if self.trace_logger:
-                        duration = (datetime.now() - session_start_time).total_seconds()
-                        self.trace_logger.log_event(
-                            "session_end",
-                            {
-                                "duration": duration,
-                                "total_steps": current_step,
-                                "final_answer": final_answer,
-                                "status": "success"
-                            }
-                        )
-                        self.trace_logger.finalize()
-
+                    self._finalize_trace_session(
+                        session_start_time,
+                        state.current_step,
+                        final_answer,
+                        status="success",
+                    )
                     return final_answer
 
-                # 将助手消息添加到历史（模型成功发起了工具调用，重置重试计数器）
-                no_tool_call_retries = 0
-                messages.append({
-                    "role": "assistant",
-                    "content": response_message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        }
-                        for tc in tool_calls
-                    ]
-                })
+                state.no_tool_call_retries = 0
+                self._append_assistant_tool_call_message(messages, response_message)
 
-                # 异步并行执行工具
                 tool_results = await self._execute_tools_async(
                     tool_calls,
-                    current_step,
+                    state.current_step,
                     on_tool_call
                 )
 
-                # 检查是否有 Finish 工具
-                for tool_name, tool_call_id, result in tool_results:
-                    if tool_name == "Finish" and result.get("finished"):
-                        final_answer = result["final_answer"]
-                        self._render_final_answer(final_answer, step=current_step)
+                final_answer = self._process_tool_results(
+                    messages,
+                    tool_calls,
+                    tool_results,
+                    state.current_step,
+                    state,
+                )
+                if final_answer is not None:
+                    self._append_final_history(input_text, final_answer)
+                    await self._emit_event(
+                        EventType.AGENT_FINISH,
+                        on_finish,
+                        result=final_answer,
+                        total_steps=state.current_step,
+                        total_tokens=state.total_tokens
+                    )
+                    self._finalize_trace_session(
+                        session_start_time,
+                        state.current_step,
+                        final_answer,
+                        status="success",
+                    )
+                    return final_answer
 
-                        self.add_message(Message(input_text, "user"))
-                        self.add_message(Message(final_answer, "assistant"))
-
-                        await self._emit_event(
-                            EventType.AGENT_FINISH,
-                            on_finish,
-                            result=final_answer,
-                            total_steps=current_step,
-                            total_tokens=total_tokens
-                        )
-
-                        if self.trace_logger:
-                            duration = (datetime.now() - session_start_time).total_seconds()
-                            self.trace_logger.log_event(
-                                "session_end",
-                                {
-                                    "duration": duration,
-                                    "total_steps": current_step,
-                                    "final_answer": final_answer,
-                                    "status": "success"
-                                }
-                            )
-                            self.trace_logger.finalize()
-
-                        return final_answer
-
-                    # 添加工具结果到消息
-                    result_content = result.get('content', str(result))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": result_content
-                    })
-
-                    # --- Stagnation detection ---
-                    if tool_name == "Edit":
-                        if "[no textual diff]" in result_content:
-                            _consecutive_no_diff_edits += 1
-                        else:
-                            _consecutive_no_diff_edits = 0
-                    else:
-                        _consecutive_no_diff_edits = 0
-
-                    if tool_name == "Bash":
-                        # Check tool_calls for matching arguments
-                        for tc in tool_calls:
-                            if tc.id == tool_call_id:
-                                try:
-                                    tc_args = json.loads(tc.function.arguments)
-                                    cmd = tc_args.get("command", "")
-                                except Exception:
-                                    cmd = ""
-                                break
-                        else:
-                            cmd = ""
-                        if "tests.py" in cmd or "pytest" in cmd or "unittest" in cmd:
-                            test_hash = hash(result_content)
-                            if test_hash == _last_test_output_hash:
-                                _consecutive_same_tests += 1
-                            else:
-                                _consecutive_same_tests = 0
-                                _last_test_output_hash = test_hash
-
-                    if _consecutive_no_diff_edits >= 3 or _consecutive_same_tests >= 3:
-                        reason = (
-                            "3 consecutive Edit calls with no textual diff"
-                            if _consecutive_no_diff_edits >= 3
-                            else "3 consecutive identical test results"
-                        )
-                        self._render_event("stagnation_detected", {
-                            "reason": reason,
-                            "step": current_step,
-                        })
-                        _stagnation_detected = True
-                        break
-
-                # Check stagnation to break outer loop
-                if _stagnation_detected:
+                if state.stagnation_detected:
                     break
 
-                # 触发步骤完成事件
                 await self._emit_event(
                     EventType.STEP_FINISH,
                     on_step,
-                    step=current_step,
+                    step=state.current_step,
                     tool_calls=len(tool_calls)
                 )
 
-            # 达到最大步数或停滞检测触发
-            if not _stagnation_detected:
+            if not state.stagnation_detected:
                 self._render_timeout()
             final_answer = "Sorry, I could not complete this task within the step limit."
-
-            self.add_message(Message(input_text, "user"))
-            self.add_message(Message(final_answer, "assistant"))
+            self._append_final_history(input_text, final_answer)
 
             await self._emit_event(
                 EventType.AGENT_FINISH,
                 on_finish,
                 result=final_answer,
-                total_steps=current_step,
-                total_tokens=total_tokens,
+                total_steps=state.current_step,
+                total_tokens=state.total_tokens,
                 status="timeout"
             )
 
-            if self.trace_logger:
-                duration = (datetime.now() - session_start_time).total_seconds()
-                self.trace_logger.log_event(
-                    "session_end",
-                    {
-                        "duration": duration,
-                        "total_steps": current_step,
-                        "final_answer": final_answer,
-                        "status": "timeout"
-                    }
-                )
-                self.trace_logger.finalize()
-
+            self._finalize_trace_session(
+                session_start_time,
+                state.current_step,
+                final_answer,
+                status="timeout",
+            )
             return final_answer
 
         except Exception as e:
@@ -1106,36 +1150,30 @@ class ReActAgent(Agent):
             [(tool_name, tool_call_id, result), ...]
         """
         results = []
-
-        # 分组：内置工具 vs 用户工具
-        builtin_calls = []
-        user_calls = []
-
-        for tc in tool_calls:
-            if tc.function.name in self._builtin_tools:
-                builtin_calls.append(tc)
-            else:
-                user_calls.append(tc)
+        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
 
         # 1. 串行执行内置工具
         for tc in builtin_calls:
-            tool_name = tc.function.name
-            tool_call_id = tc.id
-
-            try:
-                arguments = json.loads(tc.function.arguments)
-            except json.JSONDecodeError as e:
-                results.append((tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}"}))
+            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+            if error_content is not None:
+                results.append(
+                    self._tool_error_result(
+                        tool_name,
+                        tool_call_id,
+                        error_content,
+                        step=current_step,
+                    )
+                )
                 continue
 
-            # 触发工具调用事件
-            await self._emit_event(
-                EventType.TOOL_CALL,
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+
+            await self._emit_tool_call_event(
                 on_tool_call,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                args=arguments,
-                step=current_step
+                tool_name,
+                tool_call_id,
+                arguments,
+                current_step,
             )
 
             result = self._handle_builtin_tool(tool_name, arguments)
@@ -1146,18 +1184,13 @@ class ReActAgent(Agent):
                 step=current_step,
             )
 
-            # 记录工具结果
-            if self.trace_logger:
-                self.trace_logger.log_event(
-                    "tool_result",
-                    {
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "status": "success",
-                        "result": result['content']
-                    },
-                    step=current_step
-                )
+            self._trace_tool_result(
+                tool_name,
+                tool_call_id,
+                result["content"],
+                step=current_step,
+                status="success",
+            )
 
             results.append((tool_name, tool_call_id, result))
 
@@ -1170,22 +1203,23 @@ class ReActAgent(Agent):
 
             async def execute_one(tc):
                 async with semaphore:
-                    tool_name = tc.function.name
-                    tool_call_id = tc.id
+                    tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+                    if error_content is not None:
+                        return self._tool_error_result(
+                            tool_name,
+                            tool_call_id,
+                            error_content,
+                            step=current_step,
+                        )
 
-                    try:
-                        arguments = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError as e:
-                        return (tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}"})
+                    self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
 
-                    # 触发工具调用事件
-                    await self._emit_event(
-                        EventType.TOOL_CALL,
+                    await self._emit_tool_call_event(
                         on_tool_call,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        args=arguments,
-                        step=current_step
+                        tool_name,
+                        tool_call_id,
+                        arguments,
+                        current_step,
                     )
 
                     self._render_tool_call(
@@ -1195,51 +1229,17 @@ class ReActAgent(Agent):
                         step=current_step,
                     )
 
-                    # 异步执行工具
-                    tool = self.tool_registry.get_tool(tool_name)
-                    if not tool:
-                        result_content = f"❌ 工具 {tool_name} 不存在"
-                        result_status = "error"
-                    else:
-                        try:
-                            tool_response = await tool.arun_with_timing(arguments)
-                            if tool_response.status == ToolStatus.ERROR:
-                                error_code = (
-                                    tool_response.error_info.get("code", "UNKNOWN")
-                                    if tool_response.error_info
-                                    else "UNKNOWN"
-                                )
-                                result_content = f"❌ 错误 [{error_code}]: {tool_response.text}"
-                                result_status = "error"
-                            elif tool_response.status == ToolStatus.PARTIAL:
-                                result_content = f"⚠️ 部分成功: {tool_response.text}"
-                                result_status = "success"
-                            else:
-                                result_content = tool_response.text
-                                result_status = "success"
+                    tool_response = await self._aexecute_tool_response(tool_name, arguments)
+                    result_content = self._format_tool_response_text(tool_name, tool_response)
+                    result_status = "error" if tool_response.status == ToolStatus.ERROR else "success"
 
-                            # 应用截断
-                            truncate_result = self.truncator.truncate(
-                                tool_name=tool_name,
-                                output=result_content
-                            )
-                            result_content = truncate_result.get('preview', result_content)
-                        except Exception as e:
-                            result_content = f"❌ 工具执行失败: {str(e)}"
-                            result_status = "error"
-
-                    # 记录工具结果
-                    if self.trace_logger:
-                        self.trace_logger.log_event(
-                            "tool_result",
-                            {
-                                "tool_name": tool_name,
-                                "tool_call_id": tool_call_id,
-                                "status": result_status,
-                                "result": result_content
-                            },
-                            step=current_step
-                        )
+                    self._trace_tool_result(
+                        tool_name,
+                        tool_call_id,
+                        result_content,
+                        step=current_step,
+                        status=result_status,
+                    )
 
                     self._render_tool_result(
                         result_content,
@@ -1288,6 +1288,9 @@ class ReActAgent(Agent):
             StreamEvent: 流式事件
         """
         session_start_time = datetime.now()
+        start_step = int(kwargs.pop("start_step", 0) or 0)
+        if start_step < 0:
+            start_step = 0
 
         # 发送开始事件
         yield StreamEvent.create(
@@ -1299,35 +1302,31 @@ class ReActAgent(Agent):
         await self._emit_event(EventType.AGENT_START, on_start, input_text=input_text)
 
         try:
-            # 构建消息列表
-            messages = self._build_messages(input_text)
-            tool_schemas = self._build_tool_schemas()
-
-            current_step = 0
+            messages, tool_schemas = self._prepare_execution(input_text)
+            state = self._create_execution_state(start_step)
             final_answer = None
 
-            self._render_agent_start(input_text)
-
-            while self.max_steps <= 0 or current_step < self.max_steps:
-                current_step += 1
+            while self.max_steps <= 0 or state.current_step < self.max_steps:
+                state.current_step += 1
+                self._current_step = state.current_step
+                self._maybe_compact_messages(messages)
 
                 # 发送步骤开始事件
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
                     self.name,
-                    step=current_step,
+                    step=state.current_step,
                     max_steps=self.max_steps
                 )
 
-                await self._emit_event(EventType.STEP_START, on_step, step=current_step)
+                await self._emit_event(EventType.STEP_START, on_step, step=state.current_step)
 
-                self._render_step_start(current_step)
+                self._render_step_start(state.current_step)
 
-                await self._abefore_model_call(messages, current_step)
+                await self._abefore_model_call(messages, state.current_step)
 
                 # LLM 流式调用
                 full_response = ""
-                tool_calls_data = []
 
                 try:
                     # 使用 LLM 的异步流式方法
@@ -1339,7 +1338,7 @@ class ReActAgent(Agent):
                             StreamEventType.LLM_CHUNK,
                             self.name,
                             chunk=chunk,
-                            step=current_step
+                            step=state.current_step
                         )
 
                         self._render_stream_chunk(chunk)
@@ -1347,14 +1346,14 @@ class ReActAgent(Agent):
                     self._render_stream_newline()
 
                 except Exception as e:
-                    error_msg = f"LLM 调用失败: {str(e)}"
+                    error_msg = f"LLM call failed: {str(e)}"
                     self._render_agent_error(error_msg)
 
                     yield StreamEvent.create(
                         StreamEventType.ERROR,
                         self.name,
                         error=error_msg,
-                        step=current_step
+                        step=state.current_step
                     )
 
                     await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
@@ -1371,7 +1370,11 @@ class ReActAgent(Agent):
                         **kwargs
                     )
 
-                    response_message = response.choices[0].message
+                    response_message = self._record_model_response(
+                        response,
+                        state.current_step,
+                        state,
+                    )
                     tool_calls = response_message.tool_calls
 
                     if not tool_calls:
@@ -1382,38 +1385,34 @@ class ReActAgent(Agent):
                             StreamEventType.AGENT_FINISH,
                             self.name,
                             result=final_answer,
-                            total_steps=current_step
+                            total_steps=state.current_step,
+                            total_tokens=state.total_tokens,
                         )
 
-                        await self._emit_event(EventType.AGENT_FINISH, on_finish, result=final_answer)
+                        await self._emit_event(
+                            EventType.AGENT_FINISH,
+                            on_finish,
+                            result=final_answer,
+                            total_steps=state.current_step,
+                            total_tokens=state.total_tokens,
+                        )
 
-                        # 保存到历史
-                        self.add_message(Message(input_text, "user"))
-                        self.add_message(Message(final_answer, "assistant"))
+                        self._append_final_history(input_text, final_answer)
+                        self._finalize_trace_session(
+                            session_start_time,
+                            state.current_step,
+                            final_answer,
+                            status="success",
+                        )
 
                         return
 
-                    # 添加助手消息到历史
-                    messages.append({
-                        "role": "assistant",
-                        "content": response_message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments
-                                }
-                            }
-                            for tc in tool_calls
-                        ]
-                    })
+                    self._append_assistant_tool_call_message(messages, response_message)
 
                     # 执行工具调用
                     tool_results = await self._execute_tools_async_stream(
                         tool_calls,
-                        current_step,
+                        state.current_step,
                         on_tool_call
                     )
 
@@ -1425,54 +1424,78 @@ class ReActAgent(Agent):
                             tool_name=tool_name,
                             tool_call_id=tool_call_id,
                             result=result_dict["content"],
-                            step=current_step
+                            step=state.current_step
                         )
 
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": result_dict["content"]
-                        })
+                        self._append_tool_message(messages, tool_call_id, result_dict["content"])
+
+                        self._update_stagnation_state(
+                            tool_name,
+                            tool_call_id,
+                            result_dict["content"],
+                            tool_calls,
+                            state.current_step,
+                            state,
+                        )
 
                         # 检查是否是 Finish 工具
-                        if tool_name == "Finish":
-                            try:
-                                args = json.loads(tool_calls[0].function.arguments)
-                                final_answer = args.get("answer", result_dict["content"])
-                            except:
-                                final_answer = result_dict["content"]
+                        if tool_name == "Finish" and result_dict.get("finished"):
+                            final_answer = result_dict.get("final_answer", result_dict["content"])
 
                             yield StreamEvent.create(
                                 StreamEventType.AGENT_FINISH,
                                 self.name,
                                 result=final_answer,
-                                total_steps=current_step
+                                total_steps=state.current_step,
+                                total_tokens=state.total_tokens,
                             )
 
-                            await self._emit_event(EventType.AGENT_FINISH, on_finish, result=final_answer)
+                            await self._emit_event(
+                                EventType.AGENT_FINISH,
+                                on_finish,
+                                result=final_answer,
+                                total_steps=state.current_step,
+                                total_tokens=state.total_tokens,
+                            )
 
-                            # 保存到历史
-                            self.add_message(Message(input_text, "user"))
-                            self.add_message(Message(final_answer, "assistant"))
+                            self._append_final_history(input_text, final_answer)
+                            self._finalize_trace_session(
+                                session_start_time,
+                                state.current_step,
+                                final_answer,
+                                status="success",
+                            )
 
                             return
+                        if state.stagnation_detected:
+                            break
+
+                    if state.stagnation_detected:
+                        break
 
                     # 发送步骤完成事件
                     yield StreamEvent.create(
                         StreamEventType.STEP_FINISH,
                         self.name,
-                        step=current_step
+                        step=state.current_step
+                    )
+
+                    await self._emit_event(
+                        EventType.STEP_FINISH,
+                        on_step,
+                        step=state.current_step,
+                        tool_calls=len(tool_calls),
                     )
 
                 except Exception as e:
-                    error_msg = f"工具执行失败: {str(e)}"
+                    error_msg = f"Tool execution failed: {str(e)}"
                     self._render_agent_error(error_msg)
 
                     yield StreamEvent.create(
                         StreamEventType.ERROR,
                         self.name,
                         error=error_msg,
-                        step=current_step
+                        step=state.current_step
                     )
 
                     await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
@@ -1480,24 +1503,38 @@ class ReActAgent(Agent):
 
             # 达到最大步数
             if not final_answer:
-                final_answer = "Sorry, maximum steps reached. Unable to complete the task."
+                if not state.stagnation_detected:
+                    self._render_timeout()
+                final_answer = "Sorry, I could not complete this task within the step limit."
 
                 yield StreamEvent.create(
                     StreamEventType.AGENT_FINISH,
                     self.name,
                     result=final_answer,
-                    total_steps=current_step,
-                    max_steps_reached=True
+                    total_steps=state.current_step,
+                    total_tokens=state.total_tokens,
+                    max_steps_reached=not state.stagnation_detected,
                 )
 
-                await self._emit_event(EventType.AGENT_FINISH, on_finish, result=final_answer)
+                await self._emit_event(
+                    EventType.AGENT_FINISH,
+                    on_finish,
+                    result=final_answer,
+                    total_steps=state.current_step,
+                    total_tokens=state.total_tokens,
+                    status="timeout",
+                )
 
-                # 保存到历史
-                self.add_message(Message(input_text, "user"))
-                self.add_message(Message(final_answer, "assistant"))
+                self._append_final_history(input_text, final_answer)
+                self._finalize_trace_session(
+                    session_start_time,
+                    state.current_step,
+                    final_answer,
+                    status="timeout",
+                )
 
         except Exception as e:
-            error_msg = f"Agent 执行失败: {str(e)}"
+            error_msg = f"Agent execution failed: {str(e)}"
 
             yield StreamEvent.create(
                 StreamEventType.ERROR,
@@ -1527,45 +1564,47 @@ class ReActAgent(Agent):
             List[tuple]: (tool_name, tool_call_id, result_dict) 列表
         """
         results = []
-
-        # 分组：内置工具 vs 用户工具
-        builtin_calls = [tc for tc in tool_calls if tc.function.name in self._builtin_tools]
-        user_calls = [tc for tc in tool_calls if tc.function.name not in self._builtin_tools]
+        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
 
         # 1. 串行执行内置工具
         for tc in builtin_calls:
-            tool_name = tc.function.name
-            tool_call_id = tc.id
-
-            try:
-                arguments = json.loads(tc.function.arguments)
-            except json.JSONDecodeError as e:
-                results.append((tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}"}))
+            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+            if error_content is not None:
+                results.append(
+                    self._tool_error_result(
+                        tool_name,
+                        tool_call_id,
+                        error_content,
+                        step=current_step,
+                    )
+                )
                 continue
 
-            # 触发工具调用事件
-            await self._emit_event(
-                EventType.TOOL_CALL,
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+
+            await self._emit_tool_call_event(
                 on_tool_call,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                args=arguments,
-                step=current_step
+                tool_name,
+                tool_call_id,
+                arguments,
+                current_step,
             )
 
-            # 执行内置工具
-            if tool_name == "Thought":
-                reasoning = arguments.get("reasoning", "")
-                self._console(f"💭 思考: {reasoning}")
-                result_content = f"已记录推理过程: {reasoning}"
-            elif tool_name == "Finish":
-                answer = arguments.get("answer", "")
-                self._console(f"✅ 最终答案: {answer}")
-                result_content = answer
-            else:
-                result_content = f"未知的内置工具: {tool_name}"
-
-            results.append((tool_name, tool_call_id, {"content": result_content}))
+            result = self._handle_builtin_tool(tool_name, arguments)
+            self._render_builtin_tool(
+                tool_name,
+                result["content"],
+                tool_call_id=tool_call_id,
+                step=current_step,
+            )
+            self._trace_tool_result(
+                tool_name,
+                tool_call_id,
+                result["content"],
+                step=current_step,
+                status="success",
+            )
+            results.append((tool_name, tool_call_id, result))
 
         # 2. 并行执行用户工具
         if user_calls:
@@ -1574,22 +1613,23 @@ class ReActAgent(Agent):
 
             async def execute_one(tc):
                 async with semaphore:
-                    tool_name = tc.function.name
-                    tool_call_id = tc.id
+                    tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+                    if error_content is not None:
+                        return self._tool_error_result(
+                            tool_name,
+                            tool_call_id,
+                            error_content,
+                            step=current_step,
+                        )
 
-                    try:
-                        arguments = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError as e:
-                        return (tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}"})
+                    self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
 
-                    # 触发工具调用事件
-                    await self._emit_event(
-                        EventType.TOOL_CALL,
+                    await self._emit_tool_call_event(
                         on_tool_call,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        args=arguments,
-                        step=current_step
+                        tool_name,
+                        tool_call_id,
+                        arguments,
+                        current_step,
                     )
 
                     self._render_tool_call(
@@ -1599,38 +1639,9 @@ class ReActAgent(Agent):
                         step=current_step,
                     )
 
-                    # 异步执行工具
-                    tool = self.tool_registry.get_tool(tool_name)
-                    if not tool:
-                        result_content = f"❌ 工具 {tool_name} 不存在"
-                        result_status = "error"
-                    else:
-                        try:
-                            tool_response = await tool.arun_with_timing(arguments)
-                            if tool_response.status == ToolStatus.ERROR:
-                                error_code = (
-                                    tool_response.error_info.get("code", "UNKNOWN")
-                                    if tool_response.error_info
-                                    else "UNKNOWN"
-                                )
-                                result_content = f"❌ 错误 [{error_code}]: {tool_response.text}"
-                                result_status = "error"
-                            elif tool_response.status == ToolStatus.PARTIAL:
-                                result_content = f"⚠️ 部分成功: {tool_response.text}"
-                                result_status = "success"
-                            else:
-                                result_content = tool_response.text
-                                result_status = "success"
-
-                            # 应用截断
-                            truncate_result = self.truncator.truncate(
-                                tool_name=tool_name,
-                                output=result_content
-                            )
-                            result_content = truncate_result.get('preview', result_content)
-                        except Exception as e:
-                            result_content = f"❌ 工具执行失败: {str(e)}"
-                            result_status = "error"
+                    tool_response = await self._aexecute_tool_response(tool_name, arguments)
+                    result_content = self._format_tool_response_text(tool_name, tool_response)
+                    result_status = "error" if tool_response.status == ToolStatus.ERROR else "success"
 
                     self._render_tool_result(
                         result_content,

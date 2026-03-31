@@ -20,6 +20,7 @@ class Config(BaseModel):
     context_window: int = 262144
     compression_threshold: float = 0.85
     min_retain_rounds: int = 3
+    max_rounds_before_compression: int = 8
     
     # Context Compact Config
     compact_enabled: bool = True
@@ -28,12 +29,6 @@ class Config(BaseModel):
     compact_transcript_dir: str = "memory/transcripts"
     summary_max_tokens: int = 4096
     summary_temperature: float = 0.3
-
-    # 工具输出截断配置
-    tool_output_max_lines: int = 1024   # 工具输出最大行数
-    tool_output_max_bytes: int = 25600  # 工具输出最大字节数
-    tool_output_dir: str = "memory/tool-output"   # 完整输出保存目录
-    tool_output_truncate_direction: str = "head"  # 截断方向：head/tail/head_tail
 
     # 可观测性配置
     trace_enabled: bool = True  # 是否启用 Trace 记录
@@ -66,7 +61,7 @@ class Config(BaseModel):
 
     # TodoWrite 进度管理配置
     todowrite_enabled: bool = True  # 是否启用 TodoWrite 工具
-    todowrite_persistence_dir: str = "memory/todos"  # 任务列表持久化目录
+    todowrite_persistence_dir: str = "memory/todos"  # session 级 todo 快照目录
 
     # 异步生命周期配置
     async_enabled: bool = True     # 是否启用异步执行
@@ -113,4 +108,6 @@ class Config(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
+        if hasattr(self, "model_dump"):
+            return self.model_dump()
         return self.dict()

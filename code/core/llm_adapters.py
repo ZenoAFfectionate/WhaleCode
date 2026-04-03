@@ -7,6 +7,7 @@ from typing import Optional, Iterator, List, Dict, Any, Union, AsyncIterator
 
 from .llm_response import LLMResponse, StreamStats
 from .exceptions import HelloAgentsException
+from .reasoning import extract_reasoning_payload
 
 
 class BaseLLMAdapter(ABC):
@@ -128,16 +129,9 @@ class OpenAIAdapter(BaseLLMAdapter):
             # 提取内容和推理过程
             choice = response.choices[0]
             content = choice.message.content or ""
-            reasoning_content = None
-            
-            # Thinking model特殊处理
-            if self._is_thinking_model(self.model):
-                # OpenAI o1系列：reasoning_content在message中
-                if hasattr(choice.message, 'reasoning_content'):
-                    reasoning_content = choice.message.reasoning_content
-                # DeepSeek reasoner：可能在其他字段
-                elif hasattr(choice, 'reasoning_content'):
-                    reasoning_content = choice.reasoning_content
+            reasoning_content = extract_reasoning_payload(choice.message).content
+            if reasoning_content is None:
+                reasoning_content = extract_reasoning_payload(choice).content
             
             # 提取usage信息
             usage = {}
@@ -187,12 +181,14 @@ class OpenAIAdapter(BaseLLMAdapter):
                         collected_content.append(delta.content)
                         yield delta.content
                     
-                    # Thinking model的推理过程
-                    if self._is_thinking_model(self.model):
-                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                            if reasoning_content is None:
-                                reasoning_content = ""
-                            reasoning_content += delta.reasoning_content
+                    reasoning_piece = extract_reasoning_payload(
+                        delta,
+                        preserve_whitespace=True,
+                    ).content
+                    if reasoning_piece is not None:
+                        if reasoning_content is None:
+                            reasoning_content = ""
+                        reasoning_content += reasoning_piece
 
                 # 提取usage（流式最后一个chunk可能包含）
                 if hasattr(chunk, 'usage') and chunk.usage:
@@ -203,6 +199,9 @@ class OpenAIAdapter(BaseLLMAdapter):
                     }
 
             latency_ms = int((time.time() - start_time) * 1000)
+
+            if reasoning_content is not None:
+                reasoning_content = reasoning_content.strip() or None
 
             # 返回统计信息（存储到适配器，供外部获取）
             self.last_stats = StreamStats(
@@ -243,12 +242,14 @@ class OpenAIAdapter(BaseLLMAdapter):
                         collected_content.append(delta.content)
                         yield delta.content
 
-                    # Thinking model的推理过程
-                    if self._is_thinking_model(self.model):
-                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                            if reasoning_content is None:
-                                reasoning_content = ""
-                            reasoning_content += delta.reasoning_content
+                    reasoning_piece = extract_reasoning_payload(
+                        delta,
+                        preserve_whitespace=True,
+                    ).content
+                    if reasoning_piece is not None:
+                        if reasoning_content is None:
+                            reasoning_content = ""
+                        reasoning_content += reasoning_piece
 
                 # 提取usage（流式最后一个chunk可能包含）
                 if hasattr(chunk, 'usage') and chunk.usage:
@@ -259,6 +260,9 @@ class OpenAIAdapter(BaseLLMAdapter):
                     }
 
             latency_ms = int((time.time() - start_time) * 1000)
+
+            if reasoning_content is not None:
+                reasoning_content = reasoning_content.strip() or None
 
             # 返回统计信息（存储到适配器，供外部获取）
             self.last_stats = StreamStats(
@@ -644,4 +648,3 @@ def create_adapter(
 
     # 默认使用OpenAI适配器（兼容所有OpenAI格式接口）
     return OpenAIAdapter(api_key, base_url, timeout, model)
-

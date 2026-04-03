@@ -1,7 +1,8 @@
-"""ReAct Agent - 基于 Function Calling 的实现"""
+"""ReAct agent built on top of tool-calling chat models."""
 
 import json
 import asyncio
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +12,7 @@ from ..core.llm import HelloAgentsLLM
 from ..core.config import Config
 from ..core.message import Message
 from ..core.lifecycle import EventType, LifecycleHook
+from ..core.reasoning import extract_reasoning_payload
 from ..core.streaming import StreamEvent, StreamEventType
 from ..tools.registry import ToolRegistry
 from ..tools.response import ToolStatus
@@ -19,26 +21,16 @@ from ..context.compactor import ContextCompactor
 
 DEFAULT_REACT_SYSTEM_PROMPT = """You are an AI assistant with reasoning and action capabilities.
 
-## Workflow
-You complete tasks by calling tools:
-
-1. **Thought tool**: Record your reasoning process and analysis
-   - Call when you need to think
-   - Parameter: reasoning (your reasoning content)
-
-2. **Action tools**: Retrieve information or perform operations
-   - Choose appropriate tools based on the task
-   - You may call different tools multiple times
-
-3. **Finish tool**: Return the final answer
-   - Call when you have enough information to conclude
-   - Parameter: answer (the final answer)
-
-## Important
-- Actively use the Thought tool to record your reasoning
-- You may call tools multiple times to gather information
-- Only call Finish when you are confident you have enough information
+Use tools whenever they are helpful for gathering information or performing work.
+You may call tools multiple times. If you already have enough information and no
+more tools are needed, respond directly with the final answer.
 """
+
+STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
+DEFAULT_STRUCTURED_OUTPUT_DESCRIPTION = (
+    "Return the final answer in the required structured format. "
+    "Call this tool exactly once after all other tool usage is complete."
+)
 
 
 @dataclass
@@ -54,18 +46,19 @@ class _ExecutionState:
     last_test_output_hash: Optional[int] = None
     consecutive_same_tests: int = 0
     stagnation_detected: bool = False
+    last_reasoning_content: Optional[str] = None
+    last_reasoning_source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _StructuredOutputSpec:
+    name: str
+    description: str
+    schema: Dict[str, Any]
 
 
 class ReActAgent(Agent):
-    """
-    ReAct Agent - 基于 Function Calling 的推理与行动
-
-    核心改进：
-    - 使用 OpenAI Function Calling（结构化输出）
-    - 支持 Thought 工具（显式推理）
-    - 支持 Finish 工具（结束流程）
-    - 无需正则解析，解析成功率 99%+
-    """
+    """ReAct-style agent that loops on tool calls until the model finishes."""
     
     def __init__(
         self,
@@ -76,18 +69,7 @@ class ReActAgent(Agent):
         config: Optional[Config] = None,
         max_steps: int = 5
     ):
-        """
-        初始化 ReActAgent
-
-        Args:
-            name: Agent 名称
-            llm: LLM 实例
-            tool_registry: 工具注册表（可选）
-            system_prompt: 系统提示词（可选）
-            config: 配置对象
-            max_steps: 最大执行步数
-        """
-        # 传递 tool_registry 到基类
+        """Initialize the agent with an optional tool registry."""
         super().__init__(
             name,
             llm,
@@ -102,9 +84,6 @@ class ReActAgent(Agent):
         )
 
         self.max_steps = max_steps
-
-        # 内置工具标记（用于特殊处理）
-        self._builtin_tools = {"Thought", "Finish"}
 
     # ==================== Console / render hooks ====================
 
@@ -132,7 +111,7 @@ class ReActAgent(Agent):
             self._console(f"❌ LLM call failed: {payload.get('error')}")
         elif event_type == "direct_response":
             self._console(f"💬 Response: {payload.get('final_answer', '')}")
-        elif event_type == "builtin_tool":
+        elif event_type == "control_tool":
             self._console(f"🔧 {payload.get('tool_name')}: {payload.get('result_content', '')}")
         elif event_type == "tool_call":
             self._console(f"🎬 Tool call: {payload.get('tool_name')}({payload.get('arguments', {})})")
@@ -177,10 +156,21 @@ class ReActAgent(Agent):
     def _render_llm_error(self, error: Exception | str, *, step: Optional[int] = None) -> None:
         self._render_event("llm_error", {"error": str(error), "step": step})
 
-    def _render_direct_response(self, final_answer: str) -> None:
-        self._render_event("direct_response", {"final_answer": final_answer})
+    def _render_direct_response(
+        self,
+        final_answer: str,
+        *,
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> None:
+        payload = {"final_answer": final_answer}
+        if reasoning_content is not None:
+            payload["reasoning_content"] = reasoning_content
+        if reasoning_source is not None:
+            payload["reasoning_source"] = reasoning_source
+        self._render_event("direct_response", payload)
 
-    def _render_builtin_tool(
+    def _render_control_tool(
         self,
         tool_name: str,
         result_content: str,
@@ -189,7 +179,7 @@ class ReActAgent(Agent):
         step: Optional[int] = None,
     ) -> None:
         self._render_event(
-            "builtin_tool",
+            "control_tool",
             {
                 "tool_name": tool_name,
                 "result_content": result_content,
@@ -238,8 +228,20 @@ class ReActAgent(Agent):
             },
         )
 
-    def _render_final_answer(self, final_answer: str, *, step: Optional[int] = None) -> None:
-        self._render_event("final_answer", {"final_answer": final_answer, "step": step})
+    def _render_final_answer(
+        self,
+        final_answer: str,
+        *,
+        step: Optional[int] = None,
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> None:
+        payload = {"final_answer": final_answer, "step": step}
+        if reasoning_content is not None:
+            payload["reasoning_content"] = reasoning_content
+        if reasoning_source is not None:
+            payload["reasoning_source"] = reasoning_source
+        self._render_event("final_answer", payload)
 
     def _render_timeout(self) -> None:
         self._render_event("timeout", {})
@@ -265,16 +267,80 @@ class ReActAgent(Agent):
     def _invalid_tool_arguments_content(exc: json.JSONDecodeError) -> str:
         return f"Error: Invalid argument format - {exc}"
 
-    def _split_tool_calls(self, tool_calls: List[Any]) -> tuple[List[Any], List[Any]]:
-        """Split tool calls into builtin and user-defined groups."""
-        builtin_calls: List[Any] = []
+    def _extract_structured_output_spec(self, kwargs: Dict[str, Any]) -> Optional[_StructuredOutputSpec]:
+        schema = kwargs.pop("structured_output_schema", kwargs.pop("output_schema", None))
+        if schema is None:
+            return None
+
+        name = kwargs.pop("structured_output_name", STRUCTURED_OUTPUT_TOOL_NAME)
+        description = kwargs.pop(
+            "structured_output_description",
+            DEFAULT_STRUCTURED_OUTPUT_DESCRIPTION,
+        )
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("structured_output_name must be a non-empty string.")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("structured_output_description must be a non-empty string.")
+
+        normalized_schema = self._normalize_structured_output_schema(schema)
+        self._ensure_structured_output_name_available(name.strip())
+
+        return _StructuredOutputSpec(
+            name=name.strip(),
+            description=description.strip(),
+            schema=normalized_schema,
+        )
+
+    @staticmethod
+    def _normalize_structured_output_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(schema, dict):
+            raise TypeError("structured_output_schema must be a JSON schema dictionary.")
+
+        normalized = deepcopy(schema)
+        if normalized.get("type") != "object":
+            raise ValueError("structured_output_schema must declare type='object'.")
+
+        properties = normalized.get("properties")
+        if properties is None:
+            normalized["properties"] = {}
+        elif not isinstance(properties, dict):
+            raise ValueError("structured_output_schema.properties must be a dictionary.")
+
+        required = normalized.get("required")
+        if required is not None and not isinstance(required, list):
+            raise ValueError("structured_output_schema.required must be a list when provided.")
+
+        return normalized
+
+    def _ensure_structured_output_name_available(self, tool_name: str) -> None:
+        if not self.tool_registry:
+            return
+
+        if self.tool_registry.get_tool(tool_name) or self.tool_registry.get_function(tool_name):
+            raise ValueError(
+                f"Structured output tool name '{tool_name}' conflicts with an existing tool."
+            )
+
+    def _split_tool_calls(
+        self,
+        tool_calls: List[Any],
+        structured_output: Optional[_StructuredOutputSpec] = None,
+    ) -> tuple[List[Any], List[Any]]:
+        """Split tool calls into control and user-defined groups."""
+        control_calls: List[Any] = []
         user_calls: List[Any] = []
+        control_name = structured_output.name if structured_output else None
 
         for tool_call in tool_calls:
-            target = builtin_calls if tool_call.function.name in self._builtin_tools else user_calls
+            target = (
+                control_calls
+                if control_name and tool_call.function.name == control_name
+                else user_calls
+            )
             target.append(tool_call)
 
-        return builtin_calls, user_calls
+        return control_calls, user_calls
 
     def _decode_tool_call(self, tool_call: Any) -> tuple[str, str, Optional[Dict[str, Any]], Optional[str]]:
         """Decode a single tool call payload into structured arguments."""
@@ -369,6 +435,48 @@ class ReActAgent(Agent):
     def _create_execution_state(self, start_step: int) -> _ExecutionState:
         return _ExecutionState(current_step=start_step)
 
+    @staticmethod
+    def _structured_output_instruction(spec: _StructuredOutputSpec) -> str:
+        return (
+            "Structured output mode is enabled.\n"
+            f"- Use the {spec.name} tool for the final answer.\n"
+            "- Do not return the final answer as plain text.\n"
+            "- Keep using normal tools as needed before that final tool call.\n"
+            f"- The {spec.name} arguments must match its JSON schema exactly."
+        )
+
+    def _apply_structured_output_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        spec: _StructuredOutputSpec,
+    ) -> None:
+        instruction = self._structured_output_instruction(spec)
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content", "")
+            message["content"] = f"{content}\n\n{instruction}" if content else instruction
+            return
+
+        messages.insert(0, {"role": "system", "content": instruction})
+
+    @staticmethod
+    def _tool_choice_for(structured_output: Optional[_StructuredOutputSpec]) -> str:
+        return "required" if structured_output else "auto"
+
+    def _build_structured_output_tool_schema(
+        self,
+        spec: _StructuredOutputSpec,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": deepcopy(spec.schema),
+            },
+        }
+
     def _trace_user_message(self, input_text: str) -> None:
         if self.trace_logger:
             self.trace_logger.log_event(
@@ -376,9 +484,15 @@ class ReActAgent(Agent):
                 {"role": "user", "content": input_text},
             )
 
-    def _prepare_execution(self, input_text: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _prepare_execution(
+        self,
+        input_text: str,
+        structured_output: Optional[_StructuredOutputSpec] = None,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         messages = self._build_messages(input_text)
-        tool_schemas = self._build_tool_schemas()
+        if structured_output:
+            self._apply_structured_output_prompt(messages, structured_output)
+        tool_schemas = self._build_tool_schemas(structured_output)
         self._trace_user_message(input_text)
         self._render_agent_start(input_text)
         return messages, tool_schemas
@@ -386,12 +500,20 @@ class ReActAgent(Agent):
     def _maybe_compact_messages(self, messages: List[Dict[str, Any]]) -> None:
         if self._compactor and self.config.compact_enabled:
             self._compactor.micro_compact(messages)
-            if self._compactor.estimate_tokens(messages) > self.config.compact_token_threshold:
+            if self._compactor.should_compact(
+                messages,
+                latest_prompt_tokens=getattr(self, "_last_prompt_tokens", 0),
+            ):
                 self._render_compaction_notice()
                 messages[:] = self._compactor.auto_compact(messages, self.llm)
+                self._last_prompt_tokens = self._compactor.estimate_tokens(messages)
 
     def _record_model_response(self, response: Any, current_step: int, state: _ExecutionState) -> Any:
         response_message = response.choices[0].message
+        message_reasoning = extract_reasoning_payload(response_message)
+        choice_reasoning = extract_reasoning_payload(response.choices[0]) if message_reasoning.content is None else None
+        reasoning_content = None
+        reasoning_source = None
 
         if response.usage:
             state.total_tokens += response.usage.total_tokens
@@ -402,17 +524,44 @@ class ReActAgent(Agent):
             self._turn_completion_tokens = state.total_completion_tokens
             self._last_prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
 
-        if self.trace_logger:
-            self.trace_logger.log_event(
+        if message_reasoning.content is not None:
+            reasoning_content = message_reasoning.content
+            reasoning_source = f"message.{message_reasoning.source}"
+        elif choice_reasoning and choice_reasoning.content is not None:
+            reasoning_content = choice_reasoning.content
+            reasoning_source = f"choice.{choice_reasoning.source}"
+
+        state.last_reasoning_content = reasoning_content
+        state.last_reasoning_source = reasoning_source
+
+        if reasoning_content is not None:
+            self._render_event(
                 "model_output",
                 {
                     "content": response_message.content or "",
                     "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
-                    "usage": {
-                        "total_tokens": response.usage.total_tokens if response.usage else 0,
-                        "cost": 0.0,
-                    },
+                    "reasoning_content": reasoning_content,
+                    "reasoning_source": reasoning_source,
+                    "step": current_step,
                 },
+            )
+
+        if self.trace_logger:
+            trace_payload = {
+                "content": response_message.content or "",
+                "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
+                "usage": {
+                    "total_tokens": response.usage.total_tokens if response.usage else 0,
+                    "cost": 0.0,
+                },
+            }
+            if reasoning_content is not None:
+                trace_payload["reasoning_content"] = reasoning_content
+                trace_payload["reasoning_source"] = reasoning_source
+
+            self.trace_logger.log_event(
+                "model_output",
+                trace_payload,
                 step=current_step,
             )
 
@@ -448,9 +597,33 @@ class ReActAgent(Agent):
             }
         )
 
-    def _append_final_history(self, input_text: str, final_answer: str) -> None:
+    @staticmethod
+    def _assistant_reasoning_metadata(
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        if reasoning_content is not None:
+            metadata["reasoning_content"] = reasoning_content
+        if reasoning_source is not None:
+            metadata["reasoning_source"] = reasoning_source
+        return metadata
+
+    def _append_final_history(
+        self,
+        input_text: str,
+        final_answer: str,
+        *,
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> None:
         self.add_message(Message(input_text, "user"))
-        self.add_message(Message(final_answer, "assistant"))
+        assistant_metadata = self._assistant_reasoning_metadata(
+            reasoning_content=reasoning_content,
+            reasoning_source=reasoning_source,
+        )
+        assistant_kwargs = {"metadata": assistant_metadata} if assistant_metadata else {}
+        self.add_message(Message(final_answer, "assistant", **assistant_kwargs))
 
     def _finalize_trace_session(
         self,
@@ -480,22 +653,71 @@ class ReActAgent(Agent):
         messages: List[Dict[str, Any]],
         text_content: str,
         state: _ExecutionState,
+        structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> bool:
-        if text_content or state.no_tool_call_retries >= state.max_no_tool_call_retries:
+        if structured_output is None and (
+            text_content or state.no_tool_call_retries >= state.max_no_tool_call_retries
+        ):
+            return False
+
+        if structured_output is not None and state.no_tool_call_retries >= state.max_no_tool_call_retries:
             return False
 
         state.no_tool_call_retries += 1
         state.is_retry = True
+        if structured_output is None:
+            reminder = (
+                "You have access to tools - please use them to complete the task. "
+                "Do not respond with text only. Call a tool now."
+            )
+        else:
+            reminder = (
+                f"Structured output is required. Do not answer with plain text. "
+                f"When you are ready to finish, call the {structured_output.name} tool "
+                "exactly once with arguments that match its schema."
+            )
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "You have access to tools — please use them to complete the task. "
-                    "Do not respond with text only. Call a tool now."
-                ),
+                "content": reminder,
             }
         )
         return True
+
+    def _resolve_no_tool_call_response(
+        self,
+        messages: List[Dict[str, Any]],
+        text_content: str,
+        state: _ExecutionState,
+        *,
+        structured_output: Optional[_StructuredOutputSpec] = None,
+        fallback_text: str = "",
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        if self._should_retry_without_tool_call(
+            messages,
+            text_content,
+            state,
+            structured_output=structured_output,
+        ):
+            return True, None, None
+
+        if structured_output is not None:
+            error_message = (
+                f"Sorry, structured output was requested, but the model did not call "
+                f"{structured_output.name} before finishing."
+            )
+            self._render_agent_error(error_message)
+            return False, error_message, "error"
+
+        final_answer = text_content or fallback_text or "Sorry, I cannot answer this question."
+        self._render_direct_response(
+            final_answer,
+            reasoning_content=reasoning_content,
+            reasoning_source=reasoning_source,
+        )
+        return False, final_answer, "success"
 
     @staticmethod
     def _extract_tool_command(tool_calls: List[Any], tool_call_id: str) -> str:
@@ -552,11 +774,17 @@ class ReActAgent(Agent):
         tool_results: List[tuple],
         current_step: int,
         state: _ExecutionState,
+        structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> Optional[str]:
         for tool_name, tool_call_id, result in tool_results:
-            if tool_name == "Finish" and result.get("finished"):
+            if structured_output and tool_name == structured_output.name and result.get("finished"):
                 final_answer = result["final_answer"]
-                self._render_final_answer(final_answer, step=current_step)
+                self._render_final_answer(
+                    final_answer,
+                    step=current_step,
+                    reasoning_content=state.last_reasoning_content,
+                    reasoning_source=state.last_reasoning_source,
+                )
                 return final_answer
 
             result_content = result.get("content", str(result))
@@ -574,47 +802,104 @@ class ReActAgent(Agent):
 
         return None
 
+    def _control_tool_usage_error(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        message: str,
+        *,
+        step: int,
+    ) -> tuple[str, str, Dict[str, str]]:
+        return self._tool_error_result(tool_name, tool_call_id, f"Error: {message}", step=step)
+
+    @staticmethod
+    def _format_structured_output(arguments: Dict[str, Any]) -> str:
+        return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+
+    def _handle_control_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        structured_output: _StructuredOutputSpec,
+    ) -> Dict[str, Any]:
+        final_answer = self._format_structured_output(arguments)
+        return {
+            "content": final_answer,
+            "finished": True,
+            "final_answer": final_answer,
+            "structured_output": arguments,
+        }
+
     def _execute_tools(
         self,
         tool_calls: List[Any],
         current_step: int,
+        structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> List[tuple]:
-        """Execute builtin tools serially and user tools with an optional shared executor."""
+        """Execute control tools locally and user tools via the shared executor."""
         results = []
-        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
+        control_calls, user_calls = self._split_tool_calls(tool_calls, structured_output)
 
-        for tc in builtin_calls:
-            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
-            if error_content is not None:
+        if control_calls:
+            if len(control_calls) > 1:
+                for tc in control_calls:
+                    tool_name, tool_call_id, _, _ = self._decode_tool_call(tc)
+                    results.append(
+                        self._control_tool_usage_error(
+                            tool_name,
+                            tool_call_id,
+                            f"{structured_output.name} must be called at most once per response.",
+                            step=current_step,
+                        )
+                    )
+                return results
+
+            if user_calls:
+                tc = control_calls[0]
+                tool_name, tool_call_id, _, _ = self._decode_tool_call(tc)
                 results.append(
-                    self._tool_error_result(
+                    self._control_tool_usage_error(
                         tool_name,
                         tool_call_id,
-                        error_content,
+                        f"{structured_output.name} must be called alone after all other tool work is complete.",
                         step=current_step,
                     )
                 )
-                continue
-
-            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
-
-            result = self._handle_builtin_tool(tool_name, arguments)
-            self._render_builtin_tool(
-                tool_name,
-                result["content"],
-                tool_call_id=tool_call_id,
-                step=current_step,
-            )
-
-            self._trace_tool_result(
-                tool_name,
-                tool_call_id,
-                result["content"],
-                step=current_step,
-                status="success",
-            )
-
-            results.append((tool_name, tool_call_id, result))
+            else:
+                tc = control_calls[0]
+                tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+                if error_content is not None:
+                    results.append(
+                        self._tool_error_result(
+                            tool_name,
+                            tool_call_id,
+                            error_content,
+                            step=current_step,
+                        )
+                    )
+                else:
+                    self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+                    result = self._handle_control_tool(
+                        tool_name,
+                        arguments,
+                        structured_output=structured_output,
+                    )
+                    self._render_control_tool(
+                        tool_name,
+                        result["content"],
+                        tool_call_id=tool_call_id,
+                        step=current_step,
+                    )
+                    self._trace_tool_result(
+                        tool_name,
+                        tool_call_id,
+                        result["content"],
+                        step=current_step,
+                        status="success",
+                    )
+                    results.append((tool_name, tool_call_id, result))
+                    return results
 
         prepared_user_calls = []
         for tc in user_calls:
@@ -744,22 +1029,17 @@ class ReActAgent(Agent):
             raise
 
     def _run_impl(self, input_text: str, session_start_time, **kwargs) -> str:
-        """
-        ReAct Agent 主逻辑实现
-
-        Args:
-            input_text: 用户问题
-            session_start_time: 会话开始时间
-            **kwargs: 其他参数
-
-        Returns:
-            最终答案
-        """
         start_step = int(kwargs.pop("start_step", 0) or 0)
         if start_step < 0:
             start_step = 0
 
-        messages, tool_schemas = self._prepare_execution(input_text)
+        structured_output = self._extract_structured_output_spec(kwargs)
+        tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
+
+        messages, tool_schemas = self._prepare_execution(
+            input_text,
+            structured_output=structured_output,
+        )
         state = self._create_execution_state(start_step)
 
         while self.max_steps <= 0 or state.current_step < self.max_steps:
@@ -777,8 +1057,8 @@ class ReActAgent(Agent):
                 response = self.llm.invoke_with_tools(
                     messages=messages,
                     tools=tool_schemas,
-                    tool_choice="auto",
-                    **kwargs
+                    tool_choice=tool_choice,
+                    **kwargs,
                 )
             except Exception as e:
                 self._render_llm_error(e, step=state.current_step)
@@ -794,34 +1074,54 @@ class ReActAgent(Agent):
             tool_calls = response_message.tool_calls
             if not tool_calls:
                 text_content = (response_message.content or "").strip()
-
-                if self._should_retry_without_tool_call(messages, text_content, state):
+                should_continue, final_answer, status = self._resolve_no_tool_call_response(
+                    messages,
+                    text_content,
+                    state,
+                    structured_output=structured_output,
+                    reasoning_content=state.last_reasoning_content,
+                    reasoning_source=state.last_reasoning_source,
+                )
+                if should_continue:
                     continue
 
-                final_answer = text_content or "Sorry, I cannot answer this question."
-                self._render_direct_response(final_answer)
-                self._append_final_history(input_text, final_answer)
+                self._append_final_history(
+                    input_text,
+                    final_answer,
+                    reasoning_content=state.last_reasoning_content,
+                    reasoning_source=state.last_reasoning_source,
+                )
                 self._finalize_trace_session(
                     session_start_time,
                     state.current_step,
                     final_answer,
-                    status="success",
+                    status=status,
                 )
                 return final_answer
 
             state.no_tool_call_retries = 0
             self._append_assistant_tool_call_message(messages, response_message)
 
-            tool_results = self._execute_tools(tool_calls, state.current_step)
+            tool_results = self._execute_tools(
+                tool_calls,
+                state.current_step,
+                structured_output=structured_output,
+            )
             final_answer = self._process_tool_results(
                 messages,
                 tool_calls,
                 tool_results,
                 state.current_step,
                 state,
+                structured_output=structured_output,
             )
             if final_answer is not None:
-                self._append_final_history(input_text, final_answer)
+                self._append_final_history(
+                    input_text,
+                    final_answer,
+                    reasoning_content=state.last_reasoning_content,
+                    reasoning_source=state.last_reasoning_source,
+                )
                 self._finalize_trace_session(
                     session_start_time,
                     state.current_step,
@@ -846,22 +1146,11 @@ class ReActAgent(Agent):
         return final_answer
 
     def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """构建消息列表"""
+        """Build the base message list for a single run."""
         messages = []
-
-        # 添加系统提示词
         if self.system_prompt:
-            messages.append({
-                "role": "system",
-                "content": self.system_prompt
-            })
-
-        # 添加用户问题
-        messages.append({
-            "role": "user",
-            "content": input_text
-        })
-
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": input_text})
         return messages
 
     def _before_model_call(self, messages: List[Dict[str, Any]], current_step: int) -> None:
@@ -872,78 +1161,15 @@ class ReActAgent(Agent):
         """Async wrapper for the pre-model-call hook."""
         self._before_model_call(messages, current_step)
 
-    def _build_tool_schemas(self) -> List[Dict[str, Any]]:
-        """构建工具 JSON Schema（包含内置工具和用户工具）
-
-        复用基类的 _build_tool_schemas()，并追加 ReAct 内置工具
-        """
-        schemas = []
-
-        # 1. 添加内置工具：Thought
-        schemas.append({
-            "type": "function",
-            "function": {
-                "name": "Thought",
-                "description": "Analyze the problem, plan strategy, and record your reasoning process. Call this tool when you need to think.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Your reasoning process and analysis"
-                        }
-                    },
-                    "required": ["reasoning"]
-                }
-            }
-        })
-
-        # 2. 添加内置工具：Finish
-        schemas.append({
-            "type": "function",
-            "function": {
-                "name": "Finish",
-                "description": "When you have enough information to reach a conclusion, use this tool to return the final answer.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "answer": {
-                       "type": "string",
-                            "description": "The final answer"
-                        }
-                    },
-                    "required": ["answer"]
-                }
-            }
-        })
-
-        # 3. 添加用户工具（复用基类方法）
-        if self.tool_registry:
-            user_tool_schemas = super()._build_tool_schemas()
-            schemas.extend(user_tool_schemas)
-
+    def _build_tool_schemas(
+        self,
+        structured_output: Optional[_StructuredOutputSpec] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build user tool schemas and an optional structured-output tool."""
+        schemas = super()._build_tool_schemas()
+        if structured_output is not None:
+            schemas.append(self._build_structured_output_tool_schema(structured_output))
         return schemas
-
-    def _handle_builtin_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """处理内置工具调用"""
-        if tool_name == "Thought":
-            reasoning = arguments.get("reasoning", "")
-            return {
-                "content": f"Reasoning: {reasoning}",
-                "finished": False
-            }
-        elif tool_name == "Finish":
-            answer = arguments.get("answer", "")
-            return {
-                "content": f"Final answer: {answer}",
-                "finished": True,
-                "final_answer": answer
-            }
-        else:
-            return {
-                "content": f"Unknown builtin tool: {tool_name}",
-                "finished": False
-            }
 
 
     async def arun(
@@ -956,40 +1182,25 @@ class ReActAgent(Agent):
         on_error: LifecycleHook = None,
         **kwargs
     ) -> str:
-        """
-        异步执行 ReAct Agent（完整版本）
-
-        支持：
-        - 工具并行执行（独立工具）
-        - 生命周期钩子
-        - 异步 LLM 调用
-
-        Args:
-            input_text: 用户问题
-            on_start: Agent 开始执行时的钩子
-            on_step: 每个推理步骤的钩子
-            on_tool_call: 工具调用时的钩子
-            on_finish: Agent 执行完成时的钩子
-            on_error: 发生错误时的钩子
-            **kwargs: 其他参数
-
-        Returns:
-            最终答案
-        """
+        """Run the ReAct agent asynchronously."""
         session_start_time = datetime.now()
         start_step = int(kwargs.pop("start_step", 0) or 0)
         if start_step < 0:
             start_step = 0
+        structured_output = self._extract_structured_output_spec(kwargs)
+        tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
 
-        # 触发开始事件
         await self._emit_event(
             EventType.AGENT_START,
             on_start,
-            input_text=input_text
+            input_text=input_text,
         )
 
         try:
-            messages, tool_schemas = self._prepare_execution(input_text)
+            messages, tool_schemas = self._prepare_execution(
+                input_text,
+                structured_output=structured_output,
+            )
             state = self._create_execution_state(start_step)
 
             while self.max_steps <= 0 or state.current_step < self.max_steps:
@@ -1004,7 +1215,7 @@ class ReActAgent(Agent):
                 await self._emit_event(
                     EventType.STEP_START,
                     on_step,
-                    step=state.current_step
+                    step=state.current_step,
                 )
 
                 await self._abefore_model_call(messages, state.current_step)
@@ -1013,8 +1224,8 @@ class ReActAgent(Agent):
                     response = await self.llm.ainvoke_with_tools(
                         messages=messages,
                         tools=tool_schemas,
-                        tool_choice="auto",
-                        **kwargs
+                        tool_choice=tool_choice,
+                        **kwargs,
                     )
                 except Exception as e:
                     self._render_llm_error(e, step=state.current_step)
@@ -1022,7 +1233,7 @@ class ReActAgent(Agent):
                         EventType.AGENT_ERROR,
                         on_error,
                         error=str(e),
-                        step=state.current_step
+                        step=state.current_step,
                     )
                     break
 
@@ -1030,27 +1241,36 @@ class ReActAgent(Agent):
                 tool_calls = response_message.tool_calls
                 if not tool_calls:
                     text_content = (response_message.content or "").strip()
-
-                    if self._should_retry_without_tool_call(messages, text_content, state):
+                    should_continue, final_answer, status = self._resolve_no_tool_call_response(
+                        messages,
+                        text_content,
+                        state,
+                        structured_output=structured_output,
+                        reasoning_content=state.last_reasoning_content,
+                        reasoning_source=state.last_reasoning_source,
+                    )
+                    if should_continue:
                         continue
 
-                    final_answer = text_content or "Sorry, I cannot answer this question."
-                    self._render_direct_response(final_answer)
-                    self._append_final_history(input_text, final_answer)
-
+                    self._append_final_history(
+                        input_text,
+                        final_answer,
+                        reasoning_content=state.last_reasoning_content,
+                        reasoning_source=state.last_reasoning_source,
+                    )
                     await self._emit_event(
                         EventType.AGENT_FINISH,
                         on_finish,
                         result=final_answer,
                         total_steps=state.current_step,
-                        total_tokens=state.total_tokens
+                        total_tokens=state.total_tokens,
+                        status=status,
                     )
-
                     self._finalize_trace_session(
                         session_start_time,
                         state.current_step,
                         final_answer,
-                        status="success",
+                        status=status,
                     )
                     return final_answer
 
@@ -1060,7 +1280,8 @@ class ReActAgent(Agent):
                 tool_results = await self._execute_tools_async(
                     tool_calls,
                     state.current_step,
-                    on_tool_call
+                    on_tool_call,
+                    structured_output=structured_output,
                 )
 
                 final_answer = self._process_tool_results(
@@ -1069,15 +1290,21 @@ class ReActAgent(Agent):
                     tool_results,
                     state.current_step,
                     state,
+                    structured_output=structured_output,
                 )
                 if final_answer is not None:
-                    self._append_final_history(input_text, final_answer)
+                    self._append_final_history(
+                        input_text,
+                        final_answer,
+                        reasoning_content=state.last_reasoning_content,
+                        reasoning_source=state.last_reasoning_source,
+                    )
                     await self._emit_event(
                         EventType.AGENT_FINISH,
                         on_finish,
                         result=final_answer,
                         total_steps=state.current_step,
-                        total_tokens=state.total_tokens
+                        total_tokens=state.total_tokens,
                     )
                     self._finalize_trace_session(
                         session_start_time,
@@ -1094,7 +1321,7 @@ class ReActAgent(Agent):
                     EventType.STEP_FINISH,
                     on_step,
                     step=state.current_step,
-                    tool_calls=len(tool_calls)
+                    tool_calls=len(tool_calls),
                 )
 
             if not state.stagnation_detected:
@@ -1108,7 +1335,7 @@ class ReActAgent(Agent):
                 result=final_answer,
                 total_steps=state.current_step,
                 total_tokens=state.total_tokens,
-                status="timeout"
+                status="timeout",
             )
 
             self._finalize_trace_session(
@@ -1124,81 +1351,89 @@ class ReActAgent(Agent):
                 EventType.AGENT_ERROR,
                 on_error,
                 error=str(e),
-                error_type=type(e).__name__
+                error_type=type(e).__name__,
             )
             raise
-
     async def _execute_tools_async(
         self,
         tool_calls: List[Any],
         current_step: int,
-        on_tool_call: LifecycleHook = None
+        on_tool_call: LifecycleHook = None,
+        structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> List[tuple]:
-        """
-        异步并行执行工具
-
-        策略：
-        1. 内置工具（Thought/Finish）串行执行
-        2. 用户工具并行执行（最多 max_concurrent_tools 个）
-
-        Args:
-            tool_calls: 工具调用列表
-            current_step: 当前步骤
-            on_tool_call: 工具调用钩子
-
-        Returns:
-            [(tool_name, tool_call_id, result), ...]
-        """
+        """Execute control tools locally and user tools concurrently."""
         results = []
-        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
+        control_calls, user_calls = self._split_tool_calls(tool_calls, structured_output)
 
-        # 1. 串行执行内置工具
-        for tc in builtin_calls:
-            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
-            if error_content is not None:
+        if control_calls:
+            if len(control_calls) > 1:
+                for tc in control_calls:
+                    tool_name, tool_call_id, _, _ = self._decode_tool_call(tc)
+                    results.append(
+                        self._control_tool_usage_error(
+                            tool_name,
+                            tool_call_id,
+                            f"{structured_output.name} must be called at most once per response.",
+                            step=current_step,
+                        )
+                    )
+                return results
+
+            if user_calls:
+                tc = control_calls[0]
+                tool_name, tool_call_id, _, _ = self._decode_tool_call(tc)
                 results.append(
-                    self._tool_error_result(
+                    self._control_tool_usage_error(
                         tool_name,
                         tool_call_id,
-                        error_content,
+                        f"{structured_output.name} must be called alone after all other tool work is complete.",
                         step=current_step,
                     )
                 )
-                continue
+            else:
+                tc = control_calls[0]
+                tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
+                if error_content is not None:
+                    results.append(
+                        self._tool_error_result(
+                            tool_name,
+                            tool_call_id,
+                            error_content,
+                            step=current_step,
+                        )
+                    )
+                else:
+                    self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+                    await self._emit_tool_call_event(
+                        on_tool_call,
+                        tool_name,
+                        tool_call_id,
+                        arguments,
+                        current_step,
+                    )
+                    result = self._handle_control_tool(
+                        tool_name,
+                        arguments,
+                        structured_output=structured_output,
+                    )
+                    self._render_control_tool(
+                        tool_name,
+                        result["content"],
+                        tool_call_id=tool_call_id,
+                        step=current_step,
+                    )
+                    self._trace_tool_result(
+                        tool_name,
+                        tool_call_id,
+                        result["content"],
+                        step=current_step,
+                        status="success",
+                    )
+                    results.append((tool_name, tool_call_id, result))
+                    return results
 
-            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
-
-            await self._emit_tool_call_event(
-                on_tool_call,
-                tool_name,
-                tool_call_id,
-                arguments,
-                current_step,
-            )
-
-            result = self._handle_builtin_tool(tool_name, arguments)
-            self._render_builtin_tool(
-                tool_name,
-                result['content'],
-                tool_call_id=tool_call_id,
-                step=current_step,
-            )
-
-            self._trace_tool_result(
-                tool_name,
-                tool_call_id,
-                result["content"],
-                step=current_step,
-                status="success",
-            )
-
-            results.append((tool_name, tool_call_id, result))
-
-        # 2. 并行执行用户工具
         if user_calls:
-            max_concurrent = getattr(self.config, 'max_concurrent_tools', 3)
-
-            # 使用 Semaphore 限制并发数
+            max_concurrent = getattr(self.config, "max_concurrent_tools", 3)
             semaphore = asyncio.Semaphore(max_concurrent)
 
             async def execute_one(tc):
@@ -1213,7 +1448,6 @@ class ReActAgent(Agent):
                         )
 
                     self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
-
                     await self._emit_tool_call_event(
                         on_tool_call,
                         tool_name,
@@ -1221,7 +1455,6 @@ class ReActAgent(Agent):
                         arguments,
                         current_step,
                     )
-
                     self._render_tool_call(
                         tool_name,
                         arguments,
@@ -1240,7 +1473,6 @@ class ReActAgent(Agent):
                         step=current_step,
                         status=result_status,
                     )
-
                     self._render_tool_result(
                         result_content,
                         tool_name=tool_name,
@@ -1248,15 +1480,12 @@ class ReActAgent(Agent):
                         status=result_status,
                         step=current_step,
                     )
-
                     return (tool_name, tool_call_id, {"content": result_content})
 
-            # 并行执行
             user_results = await asyncio.gather(*[execute_one(tc) for tc in user_calls])
             results.extend(user_results)
 
         return results
-
     async def arun_stream(
         self,
         input_text: str,
@@ -1267,109 +1496,80 @@ class ReActAgent(Agent):
         on_error: LifecycleHook = None,
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
-        """
-        ReActAgent 真正的流式执行
-
-        实时返回：
-        - LLM 输出的每个文本块
-        - 工具调用的开始和结束
-        - 步骤的开始和结束
-
-        Args:
-            input_text: 用户问题
-            on_start: 开始钩子
-            on_step: 步骤钩子
-            on_tool_call: 工具调用钩子
-            on_finish: 完成钩子
-            on_error: 错误钩子
-            **kwargs: 其他参数
-
-        Yields:
-            StreamEvent: 流式事件
-        """
+        """Run the ReAct agent with streamed assistant text events."""
         session_start_time = datetime.now()
         start_step = int(kwargs.pop("start_step", 0) or 0)
         if start_step < 0:
             start_step = 0
+        structured_output = self._extract_structured_output_spec(kwargs)
+        tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
 
-        # 发送开始事件
         yield StreamEvent.create(
             StreamEventType.AGENT_START,
             self.name,
-            input_text=input_text
+            input_text=input_text,
         )
 
         await self._emit_event(EventType.AGENT_START, on_start, input_text=input_text)
 
         try:
-            messages, tool_schemas = self._prepare_execution(input_text)
+            messages, tool_schemas = self._prepare_execution(
+                input_text,
+                structured_output=structured_output,
+            )
             state = self._create_execution_state(start_step)
             final_answer = None
 
             while self.max_steps <= 0 or state.current_step < self.max_steps:
-                state.current_step += 1
+                if not state.is_retry:
+                    state.current_step += 1
+                state.is_retry = False
                 self._current_step = state.current_step
                 self._maybe_compact_messages(messages)
 
-                # 发送步骤开始事件
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
                     self.name,
                     step=state.current_step,
-                    max_steps=self.max_steps
+                    max_steps=self.max_steps,
                 )
-
                 await self._emit_event(EventType.STEP_START, on_step, step=state.current_step)
 
                 self._render_step_start(state.current_step)
-
                 await self._abefore_model_call(messages, state.current_step)
 
-                # LLM 流式调用
                 full_response = ""
-
                 try:
-                    # 使用 LLM 的异步流式方法
                     async for chunk in self.llm.astream_invoke(messages, **kwargs):
                         full_response += chunk
-
-                        # 发送 LLM 输出块
                         yield StreamEvent.create(
                             StreamEventType.LLM_CHUNK,
                             self.name,
                             chunk=chunk,
-                            step=state.current_step
+                            step=state.current_step,
                         )
-
                         self._render_stream_chunk(chunk)
 
                     self._render_stream_newline()
-
                 except Exception as e:
                     error_msg = f"LLM call failed: {str(e)}"
                     self._render_agent_error(error_msg)
-
                     yield StreamEvent.create(
                         StreamEventType.ERROR,
                         self.name,
                         error=error_msg,
-                        step=state.current_step
+                        step=state.current_step,
                     )
-
                     await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
                     break
 
-                # 解析工具调用（需要完整响应）
-                # 注意：流式输出后需要重新调用 LLM 获取 tool_calls
-                # 这里简化处理：使用非流式调用获取工具调用
                 try:
                     response = self.llm.invoke_with_tools(
                         messages=messages,
                         tools=tool_schemas,
-                        tool_choice="auto",
-                        **kwargs
+                        tool_choice=tool_choice,
+                        **kwargs,
                     )
-
                     response_message = self._record_model_response(
                         response,
                         state.current_step,
@@ -1378,8 +1578,18 @@ class ReActAgent(Agent):
                     tool_calls = response_message.tool_calls
 
                     if not tool_calls:
-                        # 没有工具调用，直接返回
-                        final_answer = response_message.content or full_response or "Sorry, I cannot answer this question."
+                        text_content = (response_message.content or "").strip()
+                        should_continue, final_answer, status = self._resolve_no_tool_call_response(
+                            messages,
+                            text_content,
+                            state,
+                            structured_output=structured_output,
+                            fallback_text=full_response.strip(),
+                            reasoning_content=state.last_reasoning_content,
+                            reasoning_source=state.last_reasoning_source,
+                        )
+                        if should_continue:
+                            continue
 
                         yield StreamEvent.create(
                             StreamEventType.AGENT_FINISH,
@@ -1387,36 +1597,39 @@ class ReActAgent(Agent):
                             result=final_answer,
                             total_steps=state.current_step,
                             total_tokens=state.total_tokens,
+                            status=status,
                         )
-
                         await self._emit_event(
                             EventType.AGENT_FINISH,
                             on_finish,
                             result=final_answer,
                             total_steps=state.current_step,
                             total_tokens=state.total_tokens,
+                            status=status,
                         )
-
-                        self._append_final_history(input_text, final_answer)
+                        self._append_final_history(
+                            input_text,
+                            final_answer,
+                            reasoning_content=state.last_reasoning_content,
+                            reasoning_source=state.last_reasoning_source,
+                        )
                         self._finalize_trace_session(
                             session_start_time,
                             state.current_step,
                             final_answer,
-                            status="success",
+                            status=status,
                         )
-
                         return
 
+                    state.no_tool_call_retries = 0
                     self._append_assistant_tool_call_message(messages, response_message)
-
-                    # 执行工具调用
                     tool_results = await self._execute_tools_async_stream(
                         tool_calls,
                         state.current_step,
-                        on_tool_call
+                        on_tool_call,
+                        structured_output=structured_output,
                     )
 
-                    # 发送工具结果事件并添加到消息
                     for tool_name, tool_call_id, result_dict in tool_results:
                         yield StreamEvent.create(
                             StreamEventType.TOOL_CALL_FINISH,
@@ -1424,11 +1637,40 @@ class ReActAgent(Agent):
                             tool_name=tool_name,
                             tool_call_id=tool_call_id,
                             result=result_dict["content"],
-                            step=state.current_step
+                            step=state.current_step,
                         )
 
-                        self._append_tool_message(messages, tool_call_id, result_dict["content"])
+                        if structured_output and tool_name == structured_output.name and result_dict.get("finished"):
+                            final_answer = result_dict.get("final_answer", result_dict["content"])
+                            yield StreamEvent.create(
+                                StreamEventType.AGENT_FINISH,
+                                self.name,
+                                result=final_answer,
+                                total_steps=state.current_step,
+                                total_tokens=state.total_tokens,
+                            )
+                            await self._emit_event(
+                                EventType.AGENT_FINISH,
+                                on_finish,
+                                result=final_answer,
+                                total_steps=state.current_step,
+                                total_tokens=state.total_tokens,
+                            )
+                            self._append_final_history(
+                                input_text,
+                                final_answer,
+                                reasoning_content=state.last_reasoning_content,
+                                reasoning_source=state.last_reasoning_source,
+                            )
+                            self._finalize_trace_session(
+                                session_start_time,
+                                state.current_step,
+                                final_answer,
+                                status="success",
+                            )
+                            return
 
+                        self._append_tool_message(messages, tool_call_id, result_dict["content"])
                         self._update_stagnation_state(
                             tool_name,
                             tool_call_id,
@@ -1437,49 +1679,17 @@ class ReActAgent(Agent):
                             state.current_step,
                             state,
                         )
-
-                        # 检查是否是 Finish 工具
-                        if tool_name == "Finish" and result_dict.get("finished"):
-                            final_answer = result_dict.get("final_answer", result_dict["content"])
-
-                            yield StreamEvent.create(
-                                StreamEventType.AGENT_FINISH,
-                                self.name,
-                                result=final_answer,
-                                total_steps=state.current_step,
-                                total_tokens=state.total_tokens,
-                            )
-
-                            await self._emit_event(
-                                EventType.AGENT_FINISH,
-                                on_finish,
-                                result=final_answer,
-                                total_steps=state.current_step,
-                                total_tokens=state.total_tokens,
-                            )
-
-                            self._append_final_history(input_text, final_answer)
-                            self._finalize_trace_session(
-                                session_start_time,
-                                state.current_step,
-                                final_answer,
-                                status="success",
-                            )
-
-                            return
                         if state.stagnation_detected:
                             break
 
                     if state.stagnation_detected:
                         break
 
-                    # 发送步骤完成事件
                     yield StreamEvent.create(
                         StreamEventType.STEP_FINISH,
                         self.name,
-                        step=state.current_step
+                        step=state.current_step,
                     )
-
                     await self._emit_event(
                         EventType.STEP_FINISH,
                         on_step,
@@ -1490,23 +1700,19 @@ class ReActAgent(Agent):
                 except Exception as e:
                     error_msg = f"Tool execution failed: {str(e)}"
                     self._render_agent_error(error_msg)
-
                     yield StreamEvent.create(
                         StreamEventType.ERROR,
                         self.name,
                         error=error_msg,
-                        step=state.current_step
+                        step=state.current_step,
                     )
-
                     await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
                     break
 
-            # 达到最大步数
             if not final_answer:
                 if not state.stagnation_detected:
                     self._render_timeout()
                 final_answer = "Sorry, I could not complete this task within the step limit."
-
                 yield StreamEvent.create(
                     StreamEventType.AGENT_FINISH,
                     self.name,
@@ -1515,7 +1721,6 @@ class ReActAgent(Agent):
                     total_tokens=state.total_tokens,
                     max_steps_reached=not state.stagnation_detected,
                 )
-
                 await self._emit_event(
                     EventType.AGENT_FINISH,
                     on_finish,
@@ -1524,7 +1729,6 @@ class ReActAgent(Agent):
                     total_tokens=state.total_tokens,
                     status="timeout",
                 )
-
                 self._append_final_history(input_text, final_answer)
                 self._finalize_trace_session(
                     session_start_time,
@@ -1535,126 +1739,25 @@ class ReActAgent(Agent):
 
         except Exception as e:
             error_msg = f"Agent execution failed: {str(e)}"
-
             yield StreamEvent.create(
                 StreamEventType.ERROR,
                 self.name,
                 error=error_msg,
-                error_type=type(e).__name__
+                error_type=type(e).__name__,
             )
-
             await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
             raise
-
     async def _execute_tools_async_stream(
         self,
         tool_calls: List[Any],
         current_step: int,
-        on_tool_call: LifecycleHook = None
+        on_tool_call: LifecycleHook = None,
+        structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> List[tuple]:
-        """
-        异步执行工具调用（流式版本，发送工具调用开始事件）
-
-        Args:
-            tool_calls: 工具调用列表
-            current_step: 当前步骤
-            on_tool_call: 工具调用钩子
-
-        Returns:
-            List[tuple]: (tool_name, tool_call_id, result_dict) 列表
-        """
-        results = []
-        builtin_calls, user_calls = self._split_tool_calls(tool_calls)
-
-        # 1. 串行执行内置工具
-        for tc in builtin_calls:
-            tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
-            if error_content is not None:
-                results.append(
-                    self._tool_error_result(
-                        tool_name,
-                        tool_call_id,
-                        error_content,
-                        step=current_step,
-                    )
-                )
-                continue
-
-            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
-
-            await self._emit_tool_call_event(
-                on_tool_call,
-                tool_name,
-                tool_call_id,
-                arguments,
-                current_step,
-            )
-
-            result = self._handle_builtin_tool(tool_name, arguments)
-            self._render_builtin_tool(
-                tool_name,
-                result["content"],
-                tool_call_id=tool_call_id,
-                step=current_step,
-            )
-            self._trace_tool_result(
-                tool_name,
-                tool_call_id,
-                result["content"],
-                step=current_step,
-                status="success",
-            )
-            results.append((tool_name, tool_call_id, result))
-
-        # 2. 并行执行用户工具
-        if user_calls:
-            max_concurrent = getattr(self.config, 'max_concurrent_tools', 3)
-            semaphore = asyncio.Semaphore(max_concurrent)
-
-            async def execute_one(tc):
-                async with semaphore:
-                    tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tc)
-                    if error_content is not None:
-                        return self._tool_error_result(
-                            tool_name,
-                            tool_call_id,
-                            error_content,
-                            step=current_step,
-                        )
-
-                    self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
-
-                    await self._emit_tool_call_event(
-                        on_tool_call,
-                        tool_name,
-                        tool_call_id,
-                        arguments,
-                        current_step,
-                    )
-
-                    self._render_tool_call(
-                        tool_name,
-                        arguments,
-                        tool_call_id=tool_call_id,
-                        step=current_step,
-                    )
-
-                    tool_response = await self._aexecute_tool_response(tool_name, arguments)
-                    result_content = self._format_tool_response_text(tool_name, tool_response)
-                    result_status = "error" if tool_response.status == ToolStatus.ERROR else "success"
-
-                    self._render_tool_result(
-                        result_content,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        status=result_status,
-                        step=current_step,
-                    )
-
-                    return (tool_name, tool_call_id, {"content": result_content})
-
-            # 并行执行
-            user_results = await asyncio.gather(*[execute_one(tc) for tc in user_calls])
-            results.extend(user_results)
-
-        return results
+        """Async streaming wrapper around the shared async tool executor."""
+        return await self._execute_tools_async(
+            tool_calls,
+            current_step,
+            on_tool_call,
+            structured_output=structured_output,
+        )

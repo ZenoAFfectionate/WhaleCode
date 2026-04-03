@@ -346,7 +346,7 @@ class SimpleAgent(Agent):
         Args:
             input_text: User input
             on_start: Start hook
-            on_finish: Finish hook
+            on_finish: Completion hook
             on_error: Error hook
             **kwargs: Additional parameters
 

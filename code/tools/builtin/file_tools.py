@@ -786,10 +786,6 @@ class WriteTool(_WorkspaceFileTool):
                             message=f"File '{path}' is a binary file, refusing to overwrite as text",
                         )
 
-                    require_read_error = self._require_prior_read(rel_path)
-                    if require_read_error:
-                        return require_read_error
-
                     old_content, encoding = read_text_file(full_path)
                     line_ending = detect_line_ending(old_content)
                     current_state = _snapshot_file(full_path, encoding=encoding)
@@ -1043,11 +1039,6 @@ class DeleteTool(_WorkspaceFileTool):
 
             rel_path = self._display_path(full_path)
             with _path_lock(full_path):
-                if full_path.is_file():
-                    require_read_error = self._require_prior_read(rel_path)
-                    if require_read_error:
-                        return require_read_error
-
                 stat = full_path.stat()
                 current_state = FileState(
                     mtime_ms=int(stat.st_mtime * 1000),

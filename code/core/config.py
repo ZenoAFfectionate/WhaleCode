@@ -10,7 +10,7 @@ class Config(BaseModel):
     default_model: str = "Qwen/Qwen3.5-35B-A3B-FP8"
     default_provider: str = "vllm"
     temperature: float = 1.0
-    max_tokens: Optional[int] = 65536
+    max_tokens: Optional[int] = 128000
 
     debug: bool = False
     log_level: str = "INFO"
@@ -18,17 +18,25 @@ class Config(BaseModel):
 
     # Context Engineering Config
     context_window: int = 262144
-    compression_threshold: float = 0.85
+    compression_threshold: float = 0.8
     min_retain_rounds: int = 3
     max_rounds_before_compression: int = 8
-    
+
     # Context Compact Config
     compact_enabled: bool = True
     compact_token_threshold: int = 225000
+    compact_output_buffer: int = 16000
+    compact_preserve_recent_rounds: int = 5
     compact_keep_recent_tool_results: int = 5
     compact_transcript_dir: str = "memory/transcripts"
-    summary_max_tokens: int = 4096
+    summary_max_tokens: int = 8192
     summary_temperature: float = 0.3
+    smart_summary_enabled: bool = True
+    # Backward-compatibility alias used by older tests/configs.
+    enable_smart_compression: Optional[bool] = None
+    # Reserved for future dedicated summary model routing.
+    summary_llm_provider: Optional[str] = None
+    summary_llm_model: Optional[str] = None
 
     # 可观测性配置
     trace_enabled: bool = True  # 是否启用 Trace 记录
@@ -76,6 +84,11 @@ class Config(BaseModel):
     stream_include_thinking: bool = True    # 是否包含思考过程
     stream_include_tool_calls: bool = True  # 是否包含工具调用
 
+    def __init__(self, **data):
+        super().__init__(**data)
+        if self.enable_smart_compression is not None:
+            self.smart_summary_enabled = bool(self.enable_smart_compression)
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置
@@ -101,10 +114,39 @@ class Config(BaseModel):
             kwargs["llm_async_timeout"] = int(os.getenv("LLM_TIMEOUT"))
         if os.getenv("CONTEXT_WINDOW"):
             kwargs["context_window"] = int(os.getenv("CONTEXT_WINDOW"))
+        if os.getenv("COMPRESSION_THRESHOLD"):
+            kwargs["compression_threshold"] = float(os.getenv("COMPRESSION_THRESHOLD"))
         if os.getenv("COMPACT_TOKEN_THRESHOLD"):
             kwargs["compact_token_threshold"] = int(os.getenv("COMPACT_TOKEN_THRESHOLD"))
+        if os.getenv("COMPACT_OUTPUT_BUFFER"):
+            kwargs["compact_output_buffer"] = int(os.getenv("COMPACT_OUTPUT_BUFFER"))
+        if os.getenv("ENABLE_SMART_COMPRESSION"):
+            kwargs["enable_smart_compression"] = (
+                os.getenv("ENABLE_SMART_COMPRESSION", "true").lower() == "true"
+            )
 
         return cls(**kwargs)
+
+    def get_compact_trigger_limit(self) -> int:
+        """Return the effective prompt-token limit that should trigger compact.
+
+        Compaction starts once prompt usage approaches the configured fraction
+        of the model context window. ``compact_output_buffer`` still reserves
+        room for the next completion, and ``compact_token_threshold`` remains an
+        explicit upper bound for compatibility.
+        """
+        context_window = max(1, int(self.context_window))
+        compression_threshold = float(self.compression_threshold or 0.8)
+        compression_threshold = min(max(compression_threshold, 0.01), 1.0)
+
+        percentage_limit = max(1, int(context_window * compression_threshold))
+        buffer_limit = max(1, context_window - max(0, int(self.compact_output_buffer)))
+        effective_limit = min(percentage_limit, buffer_limit)
+
+        threshold = int(self.compact_token_threshold)
+        if threshold > 0:
+            effective_limit = min(effective_limit, threshold)
+        return max(1, effective_limit)
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

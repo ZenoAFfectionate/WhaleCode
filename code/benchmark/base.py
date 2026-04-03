@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -39,11 +42,7 @@ def _bootstrap_package() -> None:
 
 
 _bootstrap_package()
-
-from hello_agents.agents.code_agent import CodeAgent
-from hello_agents.core.config import Config
-from hello_agents.core.llm import HelloAgentsLLM
-from hello_agents.tools.registry import ToolRegistry
+CodeAgent = importlib.import_module("hello_agents.agents.code_agent").CodeAgent
 
 try:
     from rich.align import Align
@@ -65,6 +64,7 @@ except Exception:
 
 _DEFAULT_RESULTS_DIR = _PROJECT_ROOT / "data" / "_results"
 _DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "data" / "_trajectory"
+_MINIMAL_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
 
 
 def _safe_name(value: Any) -> str:
@@ -78,6 +78,41 @@ def _clip_text(value: Any, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _char_width(ch: str) -> int:
+    """Return the display width of a single character (1 or 2)."""
+    eaw = unicodedata.east_asian_width(ch)
+    return 2 if eaw in ("W", "F") else 1
+
+
+def _display_width(text: str) -> int:
+    """Return the total display width of *text* accounting for wide characters."""
+    return sum(_char_width(ch) for ch in text)
+
+
+def _clip_display(text: str, width: int) -> str:
+    """Clip *text* so that its display width does not exceed *width*.
+
+    If clipping is needed, the last 3 display columns are replaced with ``...``.
+    """
+    if _display_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        cw = _char_width(ch)
+        if used + cw > width - 3:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out).rstrip() + "..."
+
+
+def _ljust_display(text: str, width: int, fillchar: str = " ") -> str:
+    """Left-justify *text* to *width* display columns using *fillchar*."""
+    pad = max(0, width - _display_width(text))
+    return text + fillchar * pad
 
 
 def _json_safe(value: Any, *, max_depth: int = 4, max_items: int = 40, max_string: int = 12000) -> Any:
@@ -127,6 +162,33 @@ def _human_elapsed(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def build_minimal_child_env() -> Dict[str, str]:
+    """Return a small, stable child-process environment for benchmark evaluators."""
+    env = {key: os.environ[key] for key in _MINIMAL_CHILD_ENV_KEYS if key in os.environ}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def truncate_feedback(
+    text: str,
+    *,
+    max_lines: int,
+    max_chars: int,
+    marker: str = "[feedback truncated]",
+) -> str:
+    """Bound feedback size while preserving the leading diagnostic context."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [marker]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip() + f"\n{marker}"
+    return clipped
 
 
 class BenchmarkProgressManager:
@@ -211,7 +273,7 @@ class BenchmarkProgressManager:
         else:
             self.unfinished += 1
             self.current_status = "Pending"
-        self.current_detail = _clip_text(result.get("error") or result.get("exit_status") or "done", 80)
+        self.current_detail = _clip_display(result.get("error") or result.get("exit_status") or "done", 80)
         self._record_status(result.get("task_id", self.current_task_id), self._result_label(result))
         self._refresh(force=True)
 
@@ -240,25 +302,33 @@ class BenchmarkProgressManager:
 
     def _renderable(self):
         width = self._target_width()
+        content_w = self._content_width()
         header = Group(
-            Text(_clip_text(f"Benchmark  {self.benchmark_name}", self._content_width()), style="bold white"),
             Text(
-                _clip_text(
+                _clip_display(f"Benchmark  {self.benchmark_name}", content_w),
+                style="bold white",
+                no_wrap=True,
+                overflow="ellipsis",
+            ),
+            Text(
+                _clip_display(
                     (
                         f"Completed  {self.completed}/{self.total}    "
                         f"Elapsed  {_human_elapsed(time.time() - self.started_at)}"
                     ),
-                    self._content_width(),
+                    content_w,
                 ),
                 style="bold bright_blue",
+                no_wrap=True,
+                overflow="ellipsis",
             ),
-            Text(self._counts_line(), style="dim"),
+            Text(self._counts_line(), style="dim", no_wrap=True, overflow="ellipsis"),
         )
         progress_panel = Panel(
             Group(
-                Text(self._progress_line(), style="bold bright_blue"),
-                Text(self._timing_line(), style="dim"),
-                Text(self._status_line(), style="bold white"),
+                Text(self._progress_line(), style="bold bright_blue", no_wrap=True, overflow="ellipsis"),
+                Text(self._timing_line(), style="dim", no_wrap=True, overflow="ellipsis"),
+                Text(self._status_line(), style="bold white", no_wrap=True, overflow="ellipsis"),
             ),
             title=" Progress ",
             title_align="left",
@@ -267,32 +337,33 @@ class BenchmarkProgressManager:
             width=width,
         )
         return Group(
-            Align.left(
-                Panel(
-                    header,
-                    title=f"  {self.benchmark_name}  ",
-                    title_align="left",
-                    border_style="bright_blue",
-                    padding=(0, 1),
-                    width=width,
-                )
+            Panel(
+                header,
+                title=f"  {self.benchmark_name}  ",
+                title_align="left",
+                border_style="bright_blue",
+                padding=(0, 1),
+                width=width,
             ),
-            Align.left(progress_panel),
-            Align.left(
-                Panel(
-                    self._status_table(),
-                    title=" Recent Outcomes ",
-                    title_align="left",
-                    border_style="blue",
-                    padding=(0, 1),
-                    width=width,
-                )
+            progress_panel,
+            Panel(
+                self._status_table(),
+                title=" Recent Outcomes ",
+                title_align="left",
+                border_style="blue",
+                padding=(0, 1),
+                width=width,
             ),
         )
 
     def _render_fallback(self, force: bool = False) -> None:
         lines = self._fallback_panels()
         if self._ansi and not self._append_mode:
+            # Calculate actual visible lines accounting for potential wrapping
+            try:
+                term_cols = os.get_terminal_size().columns
+            except OSError:
+                term_cols = 120
             if self._fallback_lines:
                 sys.stdout.write("\r")
                 for idx in range(self._fallback_lines):
@@ -300,10 +371,15 @@ class BenchmarkProgressManager:
                     if idx < self._fallback_lines - 1:
                         sys.stdout.write("\x1b[1A")
                 sys.stdout.write("\r")
+            # Count visible lines: each line may wrap if wider than terminal
+            visible_count = 0
+            for line in lines:
+                dw = _display_width(line)
+                visible_count += max(1, -(-dw // term_cols))  # ceiling division
             sys.stdout.write("\n".join(lines))
             sys.stdout.write("\n")
             sys.stdout.flush()
-            self._fallback_lines = len(lines)
+            self._fallback_lines = visible_count
             return
         if force:
             print("\n".join(lines))
@@ -315,20 +391,21 @@ class BenchmarkProgressManager:
         prefix = f"[{self.current_index}/{self.total}] "
         middle = f" | {step_label} | "
         suffix = f" ({task_elapsed})"
-        remaining = max(16, inner - len(prefix) - len(middle) - len(suffix))
-        task_budget = max(10, min(30, remaining // 2))
-        detail_budget = max(10, remaining - task_budget)
-        task_label = _clip_text(self.current_task_id or "-", task_budget)
-        detail = _clip_text(self.current_detail or self.current_status, detail_budget)
+        fixed_len = _display_width(prefix) + _display_width(middle) + _display_width(suffix)
+        remaining = max(0, inner - fixed_len)
+        task_budget = min(30, max(0, remaining // 2))
+        detail_budget = max(0, remaining - task_budget)
+        task_label = _clip_display(self.current_task_id or "-", task_budget) if task_budget > 0 else ""
+        detail = _clip_display(self.current_detail or self.current_status, detail_budget) if detail_budget > 0 else ""
         line = f"{prefix}{task_label}{middle}{detail}{suffix}"
-        return _clip_text(line, inner)
+        return _clip_display(line, inner)
 
     def _counts_line(self) -> str:
         line = (
             f"Passed {self.passed}   Failed {self.failed}   "
             f"Pending {self.unfinished}   Skipped {self.skipped}"
         )
-        return _clip_text(line, self._content_width())
+        return _clip_display(line, self._content_width())
 
     def _progress_line(self) -> str:
         inner = self._content_width()
@@ -336,10 +413,10 @@ class BenchmarkProgressManager:
         percent = self.completed / total
         prefix = "Overall Progress "
         suffix = f" {self.completed}/{self.total} {percent * 100:>3.0f}%"
-        bar_width = max(10, inner - len(prefix) - len(suffix) - 2)
+        bar_width = max(10, inner - _display_width(prefix) - _display_width(suffix) - 2)
         filled = min(bar_width, max(0, int(round(bar_width * percent))))
-        bar = ("#" * filled) + ("-" * (bar_width - filled))
-        return _clip_text(f"{prefix}[{bar}]{suffix}", inner)
+        bar = ("█" * filled) + ("░" * (bar_width - filled))
+        return _clip_display(f"{prefix}[{bar}]{suffix}", inner)
 
     def _timing_line(self) -> str:
         elapsed_s = max(0.0, time.time() - self.started_at)
@@ -349,7 +426,7 @@ class BenchmarkProgressManager:
             remaining = max(0, self.total - self.completed)
             avg = elapsed_s / max(self.completed, 1)
             eta = _human_elapsed(avg * remaining)
-        return _clip_text(
+        return _clip_display(
             f"Elapsed {_human_elapsed(elapsed_s)}   ETA {eta}",
             self._content_width(),
         )
@@ -386,11 +463,11 @@ class BenchmarkProgressManager:
 
     def _status_table(self):
         if not self._status_counts:
-            return Text("No completed items yet.", style="dim")
+            return Text("No completed items yet.", style="dim", no_wrap=True)
 
-        lines = [Text(self._status_header_line(), style="bold cyan")]
+        lines = [Text(self._status_header_line(), style="bold cyan", no_wrap=True, overflow="ellipsis")]
         for label, count, recent in self._status_rows():
-            lines.append(Text(self._status_row_line(label, count, recent), style="white"))
+            lines.append(Text(self._status_row_line(label, count, recent), style="white", no_wrap=True, overflow="ellipsis"))
         return Group(*lines)
 
     def _status_rows(self) -> List[tuple[str, int, str]]:
@@ -398,25 +475,25 @@ class BenchmarkProgressManager:
         items = sorted(self._status_counts.items(), key=lambda item: (-item[1], item[0]))
         for label, count in items[:6]:
             recent = ", ".join(self._recent_instances.get(label, []))
-            rows.append((label, count, _clip_text(recent, self._recent_text_width())))
+            rows.append((label, count, _clip_display(recent, self._recent_text_width())))
         return rows
 
     def _fallback_panels(self) -> List[str]:
-        try:
-            columns = os.get_terminal_size().columns
-        except OSError:
-            columns = 120
-        width = self._target_width(columns)
+        width = self._target_width()
         left_pad = ""
 
         def panel(title: str, body_lines: List[str]) -> List[str]:
             inner_width = max(20, width - 4)
             title_text = f" {title} "
-            title_segment = f"┌{title_text}".ljust(width - 1, "─") + "┐"
+            # Build top border: ┌ title ──...──┐  total display width = width
+            top_content = f"┌{title_text}"
+            top_fill = max(0, width - _display_width(top_content) - 1)
+            title_segment = top_content + ("─" * top_fill) + "┐"
             lines = [left_pad + title_segment]
             for line in body_lines:
-                clipped = _clip_text(line, inner_width)
-                lines.append(left_pad + f"│ {clipped.ljust(inner_width)} │")
+                clipped = _clip_display(line, inner_width)
+                padded = _ljust_display(clipped, inner_width)
+                lines.append(left_pad + f"│ {padded} │")
             lines.append(left_pad + "└" + ("─" * (width - 2)) + "┘")
             return lines
 
@@ -472,14 +549,16 @@ class BenchmarkProgressManager:
         recent_width = self._recent_text_width()
         return (
             f"{'Status':<14} {'Count':>5}  "
-            f"{_clip_text('Recent', recent_width):<{recent_width}}"
+            + _ljust_display(_clip_display("Recent", recent_width), recent_width)
         )
 
     def _status_row_line(self, label: str, count: int, recent: str) -> str:
         recent_width = self._recent_text_width()
+        clipped_label = _clip_display(label, 14)
         return (
-            f"{_clip_text(label, 14):<14} {count:>5}  "
-            f"{_clip_text(recent, recent_width):<{recent_width}}"
+            _ljust_display(clipped_label, 14)
+            + f" {count:>5}  "
+            + _ljust_display(_clip_display(recent, recent_width), recent_width)
         )
 
 
@@ -715,7 +794,20 @@ class BenchmarkRunner(ABC):
         error_extra: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         try:
-            return agent.run(prompt_text, **(run_kwargs or {})), None
+            effective_kwargs = dict(run_kwargs or {})
+            if effective_kwargs:
+                run_signature = inspect.signature(agent.run)
+                accepts_var_kwargs = any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in run_signature.parameters.values()
+                )
+                if not accepts_var_kwargs:
+                    effective_kwargs = {
+                        key: value
+                        for key, value in effective_kwargs.items()
+                        if key in run_signature.parameters
+                    }
+            return agent.run(prompt_text, **effective_kwargs), None
         except Exception as exc:
             return "", self._build_result(
                 task_id,
@@ -747,6 +839,8 @@ class BenchmarkRunner(ABC):
 
     def _create_agent(self, workspace: Path) -> CodeAgent:
         """Create a fresh CodeAgent with coding tools only (no web tools)."""
+        from hello_agents.core.config import Config
+        from hello_agents.core.llm import HelloAgentsLLM
         from hello_agents.tools.builtin.bash import BashTool
         from hello_agents.tools.builtin.file_tools import (
             DeleteTool,
@@ -758,6 +852,7 @@ class BenchmarkRunner(ABC):
         from hello_agents.tools.builtin.glob_tool import GlobTool
         from hello_agents.tools.builtin.grep_tool import GrepTool
         from hello_agents.tools.builtin.todowrite_tool import TodoWriteTool
+        from hello_agents.tools.registry import ToolRegistry
 
         llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
         if self.model:
@@ -841,41 +936,41 @@ class BenchmarkRunner(ABC):
         status = None
         if event_type == "agent_start":
             status = "Running"
-            detail = "agent started"
+            detail = "Agent init"
         elif event_type == "step_start":
             status = "Running"
-            detail = "thinking"
-        elif event_type in {"tool_call", "builtin_tool"}:
+            detail = "Thinking"
+        elif event_type in {"tool_call", "control_tool", "builtin_tool"}:
             tool_name = payload.get("tool_name") or event_type
             status = "Running"
             detail = tool_name
             if tool_name == "Bash":
                 command = ((payload.get("arguments") or {}).get("command") or "").strip()
                 if command:
-                    detail = f"Bash: {_clip_text(command, 56)}"
+                    detail = f"Bash: {_clip_display(command, 56)}"
         elif event_type == "tool_result":
             tool_name = payload.get("tool_name") or "tool"
             tool_status = payload.get("status") or "success"
             status = "Running" if tool_status == "success" else "Error"
             detail = tool_name if tool_status == "success" else f"{tool_name}: error"
         elif event_type == "final_answer":
-            status = "Finishing"
-            detail = "final answer"
+            status = "Completing"
+            detail = "Final answer"
         elif event_type == "timeout":
             status = "Timeout"
-            detail = "step limit reached"
+            detail = "Step limit reached"
         elif event_type == "stagnation_detected":
             status = "Stalled"
-            detail = payload.get("reason") or "stagnation detected"
+            detail = payload.get("reason") or "Stagnation detected"
         elif event_type == "llm_error":
             status = "Error"
             detail = payload.get("error") or "LLM error"
         elif event_type == "agent_error":
             status = "Error"
-            detail = payload.get("message") or "agent error"
+            detail = payload.get("message") or "Agent error"
         elif event_type == "background_update":
             status = "Running"
-            detail = "background update"
+            detail = "Background update"
         elif event_type == "compaction_notice":
             status = "Running"
             detail = "compacting context"
@@ -1007,7 +1102,7 @@ class BenchmarkRunner(ABC):
             event_payload = event.get("payload") or {}
             step = event_payload.get("step")
             prefix = f"step {step} " if step is not None else ""
-            if event_type in {"tool_call", "builtin_tool"}:
+            if event_type in {"tool_call", "control_tool", "builtin_tool"}:
                 detail = event_payload.get("tool_name") or event_type
             elif event_type == "tool_result":
                 detail = event_payload.get("tool_name") or event_type
@@ -1095,7 +1190,12 @@ class BenchmarkRunner(ABC):
         history: List[Dict[str, Any]] = []
         events: List[Dict[str, Any]] = []
         if agent is not None:
-            history = [msg.to_dict() if hasattr(msg, "to_dict") else _json_safe(msg) for msg in agent.get_history()]
+            get_history = getattr(agent, "get_history", None)
+            if callable(get_history):
+                history = [
+                    msg.to_dict() if hasattr(msg, "to_dict") else _json_safe(msg)
+                    for msg in get_history()
+                ]
             events = list(getattr(agent, "benchmark_events", []))
             if getattr(agent, "tool_registry", None) is not None:
                 read_cache = dict(getattr(agent.tool_registry, "read_metadata_cache", {}))
@@ -1328,7 +1428,7 @@ class BenchmarkRunner(ABC):
         if resume:
             if not resume_path.exists():
                 print(f"  ▶ Resume target does not exist yet: {resume}")
-                print(f"    A new results file will be created at this path.\n")
+                print("    A new results file will be created at this path.\n")
             else:
                 completed_ids = self._load_completed_ids(resume_path)
                 print(f"  ▶ Resuming from: {resume}")
@@ -1372,36 +1472,37 @@ class BenchmarkRunner(ABC):
         progress.start()
 
         try:
-            for i, task in enumerate(tasks):
-                task_id = str(task.get("task_id", f"task_{i}"))
-                self._current_task_id = task_id
+            with open(results_file, "a", encoding="utf-8") as result_stream:
+                for i, task in enumerate(tasks):
+                    task_id = str(task.get("task_id", f"task_{i}"))
+                    self._current_task_id = task_id
 
-                if task_id in completed_ids:
-                    skipped += 1
-                    progress.skip_task(i + 1, task_id)
-                    continue
+                    if task_id in completed_ids:
+                        skipped += 1
+                        progress.skip_task(i + 1, task_id)
+                        continue
 
-                progress.begin_task(i + 1, task_id)
+                    progress.begin_task(i + 1, task_id)
 
-                try:
-                    result = self._evaluate_task_with_timeout(task, task_id)
-                except Exception as exc:
-                    result = {
-                        "task_id": task_id,
-                        "passed": False,
-                        "error": f"Runner exception: {exc}",
-                        "elapsed_s": 0.0,
-                    }
+                    try:
+                        result = self._evaluate_task_with_timeout(task, task_id)
+                    except Exception as exc:
+                        result = {
+                            "task_id": task_id,
+                            "passed": False,
+                            "error": f"Runner exception: {exc}",
+                            "elapsed_s": 0.0,
+                        }
 
-                self._drain_progress_queue(self._progress_queue)
-                results.append(result)
-                if result.get("passed") is True:
-                    passed_count += 1
-                total_time += result.get("elapsed_s", 0)
-                progress.finish_task(result)
+                    self._drain_progress_queue(self._progress_queue)
+                    results.append(result)
+                    if result.get("passed") is True:
+                        passed_count += 1
+                    total_time += result.get("elapsed_s", 0)
+                    progress.finish_task(result)
 
-                with open(results_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    result_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    result_stream.flush()
         finally:
             progress.close()
             self._progress_manager = None

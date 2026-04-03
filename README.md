@@ -48,25 +48,37 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
-    --port 8001 \
+CUDA_VISIBLE_DEVICES=1,2 vllm serve google/gemma-4-31B-it \
+    --port 8000 \
+    --tensor-parallel-size 2 \
+    --max-model-len=256000 \
     --gpu-memory-utilization 0.90 \
-    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
     --enable-auto-tool-choice \
-    --language-model-only \
-    --tool-call-parser qwen3_xml
+    --reasoning-parser gemma4 \
+    --tool-call-parser gemma4 \
+    --async-scheduling
 
-CUDA_VISIBLE_DEVICES=1,2 vllm serve Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
-    --dtype bfloat16 \
-    --tensor-parallel-size 2 \
-    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
     --enable-auto-tool-choice \
     --language-model-only \
-    --tool-call-parser qwen3_xml \
-    --trust-remote-code
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml
 ```
+
+#### Tool Call Parser: `qwen3_xml` vs `qwen3_coder`
+
+When serving Qwen models with vLLM, you must choose the correct `--tool-call-parser` to match the model's native tool call output format:
+
+| Parser | Output Format | Designed For |
+|---|---|---|
+| `qwen3_xml` | `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` (JSON-in-XML) | Qwen3 base models (e.g. Qwen3-235B-A22B) |
+| `qwen3_coder` | `<function=name><parameter=...>` (pythonic string), multiple calls wrapped in `<function_calls>` | Qwen3-Coder / Qwen3.5 series |
+
+**Known issue with `qwen3_xml`**: When `tool_choice="auto"` and the model outputs mixed content (explanation text followed by a `<tool_call>` tag), the parser may fail to extract tool calls — they remain as raw text in the `content` field while `tool_calls` returns an empty array. Setting `tool_choice="required"` forces the model to emit a tool call immediately, which the parser handles correctly.
 
 ```bash
 python run_cli.py --workspace /working/space
@@ -352,14 +364,27 @@ bash scripts/run_hevp.sh  # run HumanEval benchmark
 bash scripts/run_clev.sh  # run ClassEval benchmark
 bash scripts/run_mbpp.sh  # run MBPP benchmark
 bash scripts/run_aime.sh  # run AIME benchmark
-bash scripts/run_lcb6.sh  # 
-# run SWEV benchmark and evaluation
-bash scripts/run_swev.sh  # (Phase 1: agent inference)
+bash scripts/run_lcb6.sh  # run LiveCode benchmark
 
-bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
+# run Software Engineering Verified benchmark
+...
 ```
 
 ### Result
+
+> Model: **Qwen3.5-27B-FP8**
+
+| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
+|-----------|------:|-------:|----------:|---------:|------|
+| **MBPP+**         | 378 |  | **** |  | 2026-03- |
+| **HumanEval+**    | 164 |  | **** |  | 2026-03- |
+| **ClassEval**     | 100 |  | **** |  | 2026-03- |
+| **LiveCodeBench** |     |  | **** |  | 2026-03- |
+| **SWE--Verified** |     |  | **** |  | 2026-03- |
+
+| **AIME 24** | 30  |  | **** |  | 2026-03- |
+| **AIME 25** | 30  |  | **** |  | 2026-03- |
+| **AIME 26** | 30  |  | **** |  | 2026-03- |
 
 > Model: **Qwen3.5-35B-A3B-FP8**
 
@@ -374,20 +399,6 @@ bash scripts/run_swev_eval.sh data/_results/swevbench_verified_<timestamp>.jsonl
 | **AIME 24** | 30  | 25  | **83.3%** | 216.86 | 2026-03-28 |
 | **AIME 25** | 30  | 25  | **83.3%** | 171.1s | 2026-03-28 |
 | **AIME 26** | 30  | 26  | **86.7%** | 196.3s | 2026-03-28 |
-
-> Model: **Qwen3.5-27B-Opus-Distilled**
-
-| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
-|-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**         | 378 |  | **** |  | 2026-03- |
-| **HumanEval+**    | 164 |  | **** |  | 2026-03- |
-| **ClassEval**     | 100 |  | **** |  | 2026-03- |
-| **LiveCodeBench** |     |  | **** |  | 2026-03- |
-| **SWE--Verified** |     |  | **** |  | 2026-03- |
-
-| **AIME 24** | 30  |  | **** |  | 2026-03- |
-| **AIME 25** | 30  |  | **** |  | 2026-03- |
-| **AIME 26** | 30  |  | **** |  | 2026-03- |
 
 ---
 

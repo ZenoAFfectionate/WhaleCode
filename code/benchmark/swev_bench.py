@@ -763,7 +763,6 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         agent_prompt = ""
         error: Optional[str] = None
         exit_status = "Unknown"
-        trajectory_path = ""
         is_temp = False
 
         # Step 1: Clone repo
@@ -886,7 +885,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 "elapsed_s": round(time.time() - start, 2),
             }
         finally:
-            trajectory_path = self._save_trajectory(
+            self._save_trajectory(
                 task=task,
                 workspace=workspace,
                 docker_workspace=docker_workspace,
@@ -990,7 +989,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         print(f"\n{'=' * 60}")
         print(f"  Predictions: {predictions_file}")
         print(f"  Diffs produced: {diff_count}/{total}")
-        print(f"\n  To evaluate with Docker:")
+        print("\n  To evaluate with Docker:")
         print(f"  bash scripts/run_swev_eval.sh {predictions_file}")
         print(f"{'=' * 60}\n")
 

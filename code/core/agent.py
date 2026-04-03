@@ -27,6 +27,17 @@ class Agent(ABC):
     - add_message/clear_history/get_history 方法保持不变
     """
 
+    COMPACTABLE_TOOL_OUTPUTS = {
+        "Read",
+        "Bash",
+        "Grep",
+        "Glob",
+        "WebSearch",
+        "WebFetch",
+        "Edit",
+        "Write",
+    }
+
     def __init__(
         self,
         name: str,
@@ -55,10 +66,14 @@ class Agent(ABC):
         from ..context.token_counter import TokenCounter
         self.token_counter = TokenCounter(model=self.llm.model)
         self._history_token_count = 0  # 缓存历史 Token 数
+        self._last_prompt_tokens = 0
+        self._turn_prompt_tokens = 0
+        self._turn_completion_tokens = 0
+        self._total_tokens = 0
 
         # 统一暴露截断器，便于工具层和测试使用相同的上下文能力
         from ..context.truncator import ObservationTruncator
-        self.truncator = ObservationTruncator()
+        self.truncator = ObservationTruncator(token_counter=self.token_counter)
 
         # 新增：可观测性组件
         from ..observability import TraceLogger
@@ -312,6 +327,9 @@ class Agent(ABC):
         self.history_manager.clear()
         # 重置 Token 计数
         self._history_token_count = 0
+        self._last_prompt_tokens = 0
+        self._turn_prompt_tokens = 0
+        self._turn_completion_tokens = 0
         self.token_counter.clear_cache()
 
     def get_history(self) -> List[Message]:
@@ -321,14 +339,18 @@ class Agent(ABC):
     def _should_compress(self) -> bool:
         """判断是否需要压缩历史
 
-        优先基于缓存 Token 数判断；同时增加轮次上限兜底，
-        避免在短消息、高上下文窗口场景下历史永远不压缩。
+        优先使用真实 prompt_tokens；若不可用，则回退到历史缓存 Token 数。
+        同时保留轮次上限兜底，避免在短消息场景下历史永远不压缩。
 
         Returns:
             是否需要压缩
         """
-        threshold = int(self.config.context_window * self.config.compression_threshold)
-        if self._history_token_count > threshold:
+        if not self.config.compact_enabled:
+            return False
+
+        prompt_tokens = int(getattr(self, "_last_prompt_tokens", 0) or 0)
+        token_signal = prompt_tokens if prompt_tokens > 0 else int(self._history_token_count)
+        if token_signal >= self.config.get_compact_trigger_limit():
             return True
 
         round_limit = getattr(self.config, "max_rounds_before_compression", 0)
@@ -340,16 +362,13 @@ class Agent(ABC):
     def _compress_history(self):
         """压缩历史
 
-        默认使用简单摘要策略
-        如果启用 compact_enabled，子类可以重写此方法调用 LLM 生成智能摘要
+        默认使用简单摘要策略；启用 ``smart_summary_enabled`` 时使用 LLM 摘要。
         """
         history = self.history_manager.get_history()
 
-        if self.config.compact_enabled:
-            # 智能摘要（需要子类实现）
+        if self.config.smart_summary_enabled:
             summary = self._generate_smart_summary(history)
         else:
-            # 简单摘要
             summary = self._generate_simple_summary(history)
 
         self.history_manager.compress(summary)
@@ -357,6 +376,7 @@ class Agent(ABC):
         # 重新计算 Token 数（压缩后）
         new_history = self.history_manager.get_history()
         self._history_token_count = self.token_counter.count_messages(new_history)
+        self._last_prompt_tokens = self._history_token_count
 
     def _generate_simple_summary(self, history: List[Message]) -> str:
         """生成简单摘要（统计信息）
@@ -390,7 +410,11 @@ class Agent(ABC):
         Returns:
             Summary text
         """
-        from ..context.compactor import SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
+        from ..context.compactor import (
+            SUMMARY_SYSTEM_PROMPT,
+            SUMMARY_USER_TEMPLATE,
+            format_compact_summary,
+        )
 
         # 1. Extract the history segment to compress using the shared HistoryManager logic
         split = self.history_manager.get_compression_split(history)
@@ -408,6 +432,7 @@ class Agent(ABC):
             conversation=history_text,
             focus_instruction="",
             max_tokens=min(self.config.summary_max_tokens, 2048),
+            transcript_path="[unavailable]",
         )
 
         # 3. Call LLM to generate the summary
@@ -423,7 +448,9 @@ class Agent(ABC):
                 max_tokens=min(self.config.summary_max_tokens, 2048)
             )
 
-            summary_text = getattr(summary_response, "content", str(summary_response)).strip()
+            summary_text = format_compact_summary(
+                getattr(summary_response, "content", str(summary_response))
+            )
             if not summary_text:
                 return self._generate_simple_summary(history)
 
@@ -620,9 +647,89 @@ class Agent(ABC):
         if response.status == ToolStatus.ERROR:
             error_code = response.error_info.get("code", "UNKNOWN") if response.error_info else "UNKNOWN"
             return f"❌ Error [{error_code}]: {response.text}"
+        rendered_text = self._slim_tool_response_text(_tool_name, response)
         if response.status == ToolStatus.PARTIAL:
-            return f"⚠️ Partial success: {response.text}"
-        return response.text
+            return f"⚠️ Partial success: {rendered_text}"
+        return rendered_text
+
+    def _slim_tool_response_text(self, tool_name: str, response) -> str:
+        """Persist and slim oversized tool observations for compactable tools."""
+        if tool_name not in self.COMPACTABLE_TOOL_OUTPUTS:
+            return response.text
+
+        source_text, metadata = self._tool_observation_source_text(tool_name, response)
+        if not source_text:
+            return response.text
+
+        if self.token_counter.count_text(source_text) <= (
+            self.truncator.DEFAULT_HEAD_TOKENS + self.truncator.DEFAULT_TAIL_TOKENS
+        ):
+            return source_text
+
+        truncation = self.truncator.truncate_for_context(
+            tool_name=tool_name,
+            output=source_text,
+            metadata=metadata,
+        )
+
+        if isinstance(getattr(response, "data", None), dict):
+            response.data["full_output_path"] = truncation.get("full_output_path")
+            response.data["tool_observation_truncated"] = truncation.get("truncated", False)
+            response.data["tool_observation_stats"] = truncation.get("stats", {})
+
+        return truncation.get("display_preview", truncation.get("preview", source_text))
+
+    def _tool_observation_source_text(self, tool_name: str, response) -> tuple[str, Dict[str, Any]]:
+        """Build the fullest available text form of a tool response for LLM consumption."""
+        payload = response.data if isinstance(getattr(response, "data", None), dict) else {}
+        metadata: Dict[str, Any] = {"tool_name": tool_name}
+        if payload:
+            metadata["tool_data"] = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"content", "output", "stdout", "stderr"}
+            }
+
+        full_output_path = payload.get("full_output_path")
+        if isinstance(full_output_path, str) and full_output_path:
+            metadata["full_output_path"] = full_output_path
+
+        if tool_name == "Bash":
+            raw_output = self._load_tool_output_payload(full_output_path)
+            if raw_output is None:
+                raw_output = payload.get("output") or response.text
+
+            parts: List[str] = []
+            if payload.get("description"):
+                parts.append(f"Description: {payload['description']}")
+            if payload.get("command"):
+                parts.append(f"Command: {payload['command']}")
+            if payload.get("working_directory"):
+                parts.append(f"Directory: {payload['working_directory']}")
+            exit_code = payload.get("exit_code")
+            if exit_code is not None:
+                exit_status = "success" if exit_code == 0 else "failure"
+                parts.append(f"Exit code: {exit_code} ({exit_status})")
+            if raw_output:
+                parts.extend(["", "--- output ---", raw_output])
+            else:
+                parts.extend(["", "[no output]"])
+            return "\n".join(parts), metadata
+
+        raw_output = self._load_tool_output_payload(full_output_path)
+        if raw_output is not None:
+            return raw_output, metadata
+        return response.text, metadata
+
+    def _load_tool_output_payload(self, full_output_path: Any) -> Optional[str]:
+        """Load the persisted full output payload if one exists."""
+        if not isinstance(full_output_path, str) or not full_output_path:
+            return None
+        payload = self.truncator.load_saved_output(full_output_path)
+        if not isinstance(payload, dict):
+            return None
+        output = payload.get("output")
+        return output if isinstance(output, str) else None
 
     def _prepare_tool_registry_input(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Normalize agent-side tool arguments before registry dispatch."""

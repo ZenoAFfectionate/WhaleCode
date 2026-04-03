@@ -10,7 +10,8 @@ from __future__ import annotations
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+import re
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from ..core.message import Message
 
@@ -142,6 +143,36 @@ class TokenCounter:
     def count_text(self, text: str) -> int:
         """Calculate the token count for raw text without message overhead."""
         return self._count_text(text)
+
+    def encode_text(self, text: str) -> Optional[Sequence[Any]]:
+        """Best-effort tokenization for preview slicing."""
+        payload = text or ""
+        if not payload:
+            return []
+
+        if self._encoding is not None:
+            try:
+                return self._encoding.encode(payload)
+            except Exception:
+                pass
+
+        fallback_tokens = re.findall(r"\S+\s*", payload)
+        if fallback_tokens:
+            return fallback_tokens
+        return [payload]
+
+    def decode_tokens(self, tokens: Sequence[Any]) -> str:
+        """Best-effort decode for tokens produced by ``encode_text``."""
+        if not tokens:
+            return ""
+
+        if self._encoding is not None:
+            try:
+                return self._encoding.decode(list(tokens))
+            except Exception:
+                pass
+
+        return "".join(str(token) for token in tokens)
 
     def _count_text(self, text: str) -> int:
         payload = text or ""

@@ -304,13 +304,13 @@ Please provide an improved answer."""}
 
         Returns in real-time:
         - LLM output during the initial execution phase
-        - Thought process during the reflection phase
+        - Reflection output during the critique phase
         - LLM output during the optimization phase
 
         Args:
             input_text: User input
             on_start: Start hook
-            on_finish: Finish hook
+            on_finish: Completion hook
             on_error: Error hook
             **kwargs: Additional parameters
 

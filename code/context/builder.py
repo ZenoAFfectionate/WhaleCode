@@ -12,9 +12,10 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..core.message import Message
+from .token_counter import TokenCounter
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]", re.IGNORECASE)
 _DEFAULT_OUTPUT_SECTION = "\n".join(
@@ -30,28 +31,13 @@ _DEFAULT_OUTPUT_SECTION = "\n".join(
 
 
 @lru_cache(maxsize=1)
-def _get_default_encoding():
-    try:
-        import tiktoken
-
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        return None
+def _get_default_token_counter() -> TokenCounter:
+    return TokenCounter(model="gpt-4")
 
 
 def count_tokens(text: str) -> int:
-    """Estimate token count using ``tiktoken`` when available."""
-    payload = text or ""
-    if not payload:
-        return 0
-
-    encoding = _get_default_encoding()
-    if encoding is not None:
-        try:
-            return len(encoding.encode(payload))
-        except Exception:
-            pass
-    return max(1, len(payload) // 4)
+    """Estimate token count using the shared context token counter."""
+    return _get_default_token_counter().count_text(text or "")
 
 
 def _tokenize_for_relevance(text: str) -> Set[str]:
@@ -167,7 +153,7 @@ class ContextBuilder:
 
         remaining_budget = max(0, available_tokens - used_tokens)
         if self.config.enable_mmr:
-            selected.extend(self._select_with_mmr(candidate_packets, remaining_budget, query_tokens))
+            selected.extend(self._select_with_mmr(candidate_packets, remaining_budget))
         else:
             for packet in candidate_packets:
                 if packet.token_count > remaining_budget:
@@ -180,11 +166,17 @@ class ContextBuilder:
     def _score_packet(self, packet: ContextPacket, query_tokens: Set[str]) -> ContextPacket:
         content_tokens = _tokenize_for_relevance(packet.content)
         relevance = self._compute_relevance(query_tokens, content_tokens)
-        score = 0.7 * relevance + 0.3 * self._compute_recency(packet.timestamp)
+        recency = self._compute_recency(packet.timestamp)
+        score = 0.7 * relevance + 0.3 * recency
         return replace(
             packet,
             relevance_score=relevance,
-            metadata={**packet.metadata, "_content_tokens": content_tokens, "_rank_score": score},
+            metadata={
+                **packet.metadata,
+                "_content_tokens": content_tokens,
+                "_rank_score": score,
+                "_recency_score": recency,
+            },
         )
 
     def _compute_relevance(self, query_tokens: Set[str], content_tokens: Set[str]) -> float:
@@ -207,7 +199,6 @@ class ContextBuilder:
         self,
         packets: Sequence[ContextPacket],
         available_tokens: int,
-        query_tokens: Set[str],
     ) -> List[ContextPacket]:
         selected: List[ContextPacket] = []
         selected_token_sets: List[Set[str]] = []
@@ -228,9 +219,12 @@ class ContextBuilder:
                         for selected_tokens in selected_token_sets
                     )
 
-                relevance = self._compute_relevance(query_tokens, content_tokens)
+                relevance = packet.relevance_score
+                recency = packet.metadata.get("_recency_score")
+                if not isinstance(recency, (int, float)):
+                    recency = self._compute_recency(packet.timestamp)
                 mmr_score = self.config.mmr_lambda * relevance - (1 - self.config.mmr_lambda) * diversity_penalty
-                mmr_score += 0.1 * self._compute_recency(packet.timestamp)
+                mmr_score += 0.1 * float(recency)
 
                 if mmr_score > best_score:
                     best_index = index
@@ -264,31 +258,41 @@ class ContextBuilder:
 
     def _structure(self, selected_packets: List[ContextPacket], user_query: str) -> str:
         sections: List[str] = []
+        grouped = self._group_selected_packets(selected_packets)
 
-        instructions = [packet.content for packet in selected_packets if packet.metadata.get("type") == "instructions"]
+        instructions = grouped.get("instructions", [])
         if instructions:
             sections.append("[Role & Policies]\n" + "\n".join(instructions))
 
         sections.append(f"[Task]\nUser Query: {user_query}")
 
-        task_state = [packet.content for packet in selected_packets if packet.metadata.get("type") == "task_state"]
+        task_state = grouped.get("task_state", [])
         if task_state:
             sections.append("[State]\nKey Progress and Pending Issues:\n" + "\n".join(task_state))
 
-        evidence = [
-            packet.content
-            for packet in selected_packets
-            if packet.metadata.get("type") in {"related_memory", "knowledge_base", "retrieval", "tool_result"}
-        ]
+        evidence = grouped.get("related_memory", [])
+        evidence.extend(grouped.get("knowledge_base", []))
+        evidence.extend(grouped.get("retrieval", []))
+        evidence.extend(grouped.get("tool_result", []))
         if evidence:
             sections.append("[Evidence]\nFacts and References:\n" + "\n\n".join(evidence))
 
-        history = [packet.content for packet in selected_packets if packet.metadata.get("type") == "history"]
+        history = grouped.get("history", [])
         if history:
             sections.append("[Context]\nConversation History and Background:\n" + "\n".join(history))
 
         sections.append(_DEFAULT_OUTPUT_SECTION)
         return "\n\n".join(section.strip() for section in sections if section.strip())
+
+    @staticmethod
+    def _group_selected_packets(selected_packets: Sequence[ContextPacket]) -> Dict[str, List[str]]:
+        grouped: Dict[str, List[str]] = {}
+        for packet in selected_packets:
+            packet_type = str(packet.metadata.get("type") or "")
+            if not packet_type:
+                continue
+            grouped.setdefault(packet_type, []).append(packet.content)
+        return grouped
 
     def _compress(self, context: str) -> str:
         if not self.config.enable_compression:

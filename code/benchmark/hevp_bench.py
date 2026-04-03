@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 try:
-    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from .base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 except ImportError:
-    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 
 
 _HEVP_ADDENDUM = """\
@@ -26,14 +37,14 @@ correctly by reading the provided signature and docstring, then writing the body
 **Workflow**
 1. Read `solution.py` — understand the function signature, docstring, and examples.
 2. Implement the function body using Edit or Write.
-3. When ready, call `Finish` to submit your current implementation.
+3. When ready, respond with a short plain-text summary of the current implementation.
 4. The benchmark runner will execute hidden tests outside the workspace and send \
 back controlled feedback if another revision is needed.
-5. Revise `solution.py` based on that feedback and submit again.
+5. Revise `solution.py` based on that feedback and respond again.
 
 **Rules**
 - You MUST implement the function. Never refuse or say you cannot.
-- Always use tools to take action — do NOT respond with text only.
+- Use tools to inspect and modify the workspace, then give a normal text response once you are ready for evaluation.
 - Do NOT modify the function signature, parameter names, or docstring.
 - Keep all existing imports; add new imports only if necessary.
 - Write clean, correct, and efficient code. Prefer simple solutions.
@@ -50,9 +61,6 @@ _HEVP_SYSTEM_PROMPT = (
     + "\n\n---\n\n## HumanEval+ Benchmark Override\n\n"
     + _HEVP_ADDENDUM
 )
-
-
-_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
 
 
 # ---------------------------------------------------------------------------
@@ -201,26 +209,6 @@ def assertion(out, exp, atol):
 
     return "\n".join(out)
 
-
-def _minimal_child_env() -> Dict[str, str]:
-    env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
-
-
-def _truncate_feedback(text: str, max_lines: int = 60, max_chars: int = 10000) -> str:
-    if not text:
-        return text
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + ["[feedback truncated]"]
-    clipped = "\n".join(lines)
-    if len(clipped) > max_chars:
-        clipped = clipped[:max_chars].rstrip() + "\n[feedback truncated]"
-    return clipped
-
-
 def _evaluate_solution(
     workspace: Path,
     solution_file: Path,
@@ -244,7 +232,7 @@ def _evaluate_solution(
             text=True,
             timeout=timeout,
             cwd=str(workspace),
-            env=_minimal_child_env(),
+            env=build_minimal_child_env(),
         )
     except subprocess.TimeoutExpired:
         return False, f"TIMEOUT: hidden evaluation exceeded {timeout}s."
@@ -300,12 +288,12 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                 f"Submission policy:\n"
                 f"- Hidden tests are evaluated only by the benchmark runner.\n"
                 f"- Do not create your own uncontrolled benchmark loop.\n"
-                f"- Each time you call `Finish`, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
+                f"- Each time you finish with a normal text response, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
                 f"Steps:\n"
                 f"1. Read `solution.py` to see the signature, docstring, and examples.\n"
                 f"2. Implement the function body using Edit or Write.\n"
                 f"3. Perform lightweight self-checks if useful, but do not rely on local benchmark tests.\n"
-                f"4. Call `Finish` when you want a controlled submission.\n\n"
+                f"4. When you want a controlled submission, stop and provide a brief plain-text summary.\n\n"
                 f"Important:\n"
                 f"- Do NOT change the function signature or docstring.\n"
                 f"- The function must handle edge cases (empty inputs, boundary values, etc.).\n"
@@ -327,7 +315,7 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                     f"Revise `solution.py` based on this feedback.\n"
                     f"- The failing hidden test index is reliable.\n"
                     f"- The input/expected/actual previews are intentionally truncated.\n"
-                    f"- Use this feedback to reason about edge cases and logic errors, then submit again with `Finish`.\n"
+                    f"- Use this feedback to reason about edge cases and logic errors, then respond again with a brief plain-text summary.\n"
                 )
                 prompt_history.append(prompt_text)
 
@@ -362,7 +350,7 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                 )
                 if passed:
                     break
-                feedback = _truncate_feedback(output)
+                feedback = truncate_feedback(output, max_lines=60, max_chars=10000)
 
             elapsed = round(time.time() - start, 2)
 

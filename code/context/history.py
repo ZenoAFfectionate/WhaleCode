@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..core.message import Message
 
@@ -33,23 +33,12 @@ class HistoryManager:
     def estimate_rounds(self, history: Optional[Sequence[Message]] = None) -> int:
         """Estimate complete rounds, where each user message starts a new round."""
         source = self._resolve_history(history)
-        rounds = 0
-        index = 0
-        while index < len(source):
-            if source[index].role != "user":
-                index += 1
-                continue
-
-            rounds += 1
-            index += 1
-            while index < len(source) and source[index].role != "user":
-                index += 1
-        return rounds
+        return len(self._round_boundaries(source))
 
     def find_round_boundaries(self, history: Optional[Sequence[Message]] = None) -> List[int]:
         """Return the starting index of each round."""
         source = self._resolve_history(history)
-        return [index for index, message in enumerate(source) if message.role == "user"]
+        return self._round_boundaries(source)
 
     def get_compression_split(
         self,
@@ -57,7 +46,7 @@ class HistoryManager:
     ) -> Optional[Tuple[List[Message], List[Message]]]:
         """Split history into ``(to_compress, retained_recent_rounds)`` when eligible."""
         source = self._resolve_history(history)
-        boundaries = self.find_round_boundaries(source)
+        boundaries = self._round_boundaries(source)
         if len(boundaries) <= self.min_retain_rounds:
             return None
 
@@ -145,3 +134,7 @@ class HistoryManager:
         if isinstance(history, list):
             return history
         return list(history)
+
+    @staticmethod
+    def _round_boundaries(history: Sequence[Message]) -> List[int]:
+        return [index for index, message in enumerate(history) if message.role == "user"]

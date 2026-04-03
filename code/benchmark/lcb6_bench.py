@@ -7,7 +7,6 @@ import ast
 import base64
 import decimal
 import json
-import os
 import pickle
 import re
 import shutil
@@ -21,9 +20,21 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 try:
-    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from .base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 except ImportError:
-    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 
 
 _LCB6_ADDENDUM = """\
@@ -32,23 +43,34 @@ You are solving LiveCodeBench v6 code-generation tasks.
 The workspace contains:
 - `problem.txt`: full problem statement and metadata
 - `solution.py`: your answer file
-- `public_tests.json`: public test inputs/outputs for reference only
+
+# Core Principle: Analyze First, Code Second
+
+Before writing or revising code, you MUST reason through the problem itself.
+For algorithmic or math-heavy tasks, first identify the exact input/output model,
+the governing constraints, the key invariant/lemma/recurrence, and the target
+time and memory complexity. Only then implement the solution.
 
 Workflow:
 1. Read `problem.txt` carefully.
-2. Inspect `solution.py`. If it already contains starter code, preserve the required function/class signature.
-3. Implement the solution in `solution.py`.
-4. When you are ready for a controlled benchmark submission, call `Finish` with a short summary.
-5. The benchmark runner will execute both public and hidden tests, then send structured feedback if another revision is needed.
+2. Extract the interface, constraints, edge cases, and any mathematical structure before touching the code.
+3. Inspect `solution.py`. If it already contains starter code, preserve the required function/class signature.
+4. Implement the solution in `solution.py` only after you have a clear algorithmic plan.
+5. When you are ready for a controlled benchmark submission, stop and provide a short plain-text summary.
+6. The benchmark runner will execute both public and hidden tests, then send structured feedback if another revision is needed.
 
 Rules:
 - For stdin/stdout tasks, `solution.py` must be a complete Python program reading from stdin and writing to stdout.
 - For call-based tasks, preserve the provided function/class structure exactly.
-- `public_tests.json` contains only public tests and public I/O examples. It is not a complete test suite.
-- Do not create your own uncontrolled submission loop. Wait for benchmark feedback after each `Finish`.
+- Benchmark test data is not stored in the workspace. Do not ask for raw test cases.
+- Do not create your own uncontrolled submission loop. Wait for benchmark feedback after each completed response.
 - Do not try to access hidden tests, hidden directories, environment variables, or files outside the workspace.
 - Do not attempt to print environment variables or discover hidden paths.
 - Prefer clean, correct code over clever shortcuts.
+- Do not treat sample outputs, a few hand-picked checks, or numerical experiments as proof of correctness.
+- Use local experiments only to validate an already-reasoned hypothesis, not to invent the final algorithm.
+- If a result depends on math, derive the formula or invariant first; do not extrapolate from small cases and hope it generalizes.
+- If feedback contradicts your code, revisit the underlying reasoning before making patches.
 
 Functional-task rules:
 - Keep the starter-code interface exactly.
@@ -248,9 +270,6 @@ if __name__ == "__main__":
 """.replace("__OFFICIAL_IMPORT_STRING__", repr(_OFFICIAL_IMPORT_STRING))
 
 
-_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
-
-
 def _parse_public_cases(raw: Any) -> List[Dict[str, Any]]:
     if isinstance(raw, list):
         return raw
@@ -304,32 +323,6 @@ def _parse_metadata(raw: Any) -> Dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
-
-
-def _minimal_child_env() -> Dict[str, str]:
-    env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
-
-
-def _build_public_tests_manifest(mode: str, public_cases: List[Dict[str, Any]]) -> str:
-    manifest = {
-        "mode": mode,
-        "note": "These are public tests only. Hidden tests are not stored in the workspace.",
-        "cases": [],
-    }
-    for idx, case in enumerate(public_cases, start=1):
-        manifest["cases"].append(
-            {
-                "case_index": idx,
-                "input": case.get("input", ""),
-                "output": case.get("output", ""),
-                "testtype": case.get("testtype", ""),
-            }
-        )
-    return json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
-
 
 def _initial_solution_contents(task: Dict[str, Any], mode: str) -> str:
     starter = str(task.get("starter_code") or "")
@@ -516,7 +509,7 @@ def _evaluate_stdin_solution(
                 capture_output=True,
                 timeout=10,
                 cwd=str(solution_file.parent),
-                env=_minimal_child_env(),
+                env=build_minimal_child_env(),
             )
         except subprocess.TimeoutExpired:
             failed += 1
@@ -608,7 +601,7 @@ def _evaluate_functional_solution(
                 capture_output=True,
                 timeout=10,
                 cwd=str(solution_file.parent),
-                env=_minimal_child_env(),
+                env=build_minimal_child_env(),
             )
         except subprocess.TimeoutExpired:
             failed += 1
@@ -709,8 +702,8 @@ class LCB6Benchmark(BenchmarkRunner):
 
         public_cases = [_normalize_case(case) for case in _parse_public_cases(task.get("public_test_cases", []))]
         private_cases = [_normalize_case(case) for case in _decode_private_cases(task.get("private_test_cases", ""))]
-        all_cases = public_cases + private_cases if private_cases else public_cases
-        mode = _infer_mode(task, public_cases or private_cases)
+        all_cases = public_cases + private_cases
+        mode = _infer_mode(task, all_cases)
 
         workspace = self._make_workspace(f"lcb6_{task_id.replace('/', '_')}_")
         agent = None
@@ -724,16 +717,11 @@ class LCB6Benchmark(BenchmarkRunner):
                 f"Platform: {platform}\n"
                 f"Difficulty: {difficulty}\n"
                 f"Contest date: {contest_date}\n"
-                f"Mode: {mode}\n\n"
+                f"Mode: {mode}\n"
+                f"Benchmark tests available only via controlled evaluation feedback.\n\n"
                 f"{question}\n",
                 encoding="utf-8",
             )
-            if public_cases:
-                with open(workspace / "public_tests.json", "w", encoding="utf-8") as f:
-                    f.write(_build_public_tests_manifest(mode, public_cases))
-            else:
-                with open(workspace / "public_tests.json", "w", encoding="utf-8") as f:
-                    f.write(_build_public_tests_manifest(mode, []))
 
             solution_file = workspace / "solution.py"
             solution_file.write_text(_initial_solution_contents(task, mode), encoding="utf-8")
@@ -748,18 +736,22 @@ class LCB6Benchmark(BenchmarkRunner):
                 f"Submission policy:\n"
                 f"- This benchmark uses controlled submissions.\n"
                 f"- Do not run your own benchmark test loop.\n"
-                f"- Public examples are in `public_tests.json` for reference only.\n"
-                f"- After each `Finish`, the runner will execute public + hidden tests and send feedback if needed.\n\n"
+                f"- Benchmark test data is not present in the workspace.\n"
+                f"- After each completed response, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
                 f"Instructions:\n"
                 f"1. Read `problem.txt`.\n"
-                f"2. Read `public_tests.json` to understand the visible examples.\n"
-                f"3. Implement the solution in `solution.py`.\n"
-                f"4. You may run lightweight self-checks or syntax checks, but do not rely on any local benchmark runner.\n"
-                f"5. When ready for submission, call `Finish` with a brief summary.\n\n"
+                f"2. Before editing `solution.py`, analyze the task constraints, derive the algorithm, and identify the edge cases that could break a naive approach.\n"
+                f"3. If the task is math-heavy, first derive the key formula, invariant, recurrence, or correctness argument before using numerical checks.\n"
+                f"4. Implement the solution in `solution.py` only after you have a clear plan and complexity target.\n"
+                f"5. You may run lightweight self-checks or syntax checks of your own design, but use them to validate your reasoning rather than replace it.\n"
+                f"6. When ready for submission, stop and provide a brief plain-text summary.\n\n"
                 f"Important:\n"
                 f"- Hidden benchmark checks will run outside the workspace and are not directly accessible.\n"
+                f"- The runner may return bounded diagnostics such as failing case visibility, input snippets, and error traces.\n"
                 f"- Do not change the required interface in starter code when it exists.\n"
                 f"- For stdin tasks, write a complete executable program.\n"
+                f"- Do not jump from samples or a few numerical results directly to final code.\n"
+                f"- Only submit once you have a general argument for why the algorithm handles all valid inputs.\n"
             )
 
             agent = self._create_agent(workspace)
@@ -790,8 +782,10 @@ class LCB6Benchmark(BenchmarkRunner):
                     f"Revise `solution.py` based on this feedback.\n"
                     f"- Public-case details are exact.\n"
                     f"- Private-case feedback is intentionally limited.\n"
-                    f"- Do not search for hidden tests; use the feedback above plus the problem statement and public examples.\n"
-                    f"When you are ready for the next controlled submission, call `Finish` with a brief summary."
+                    f"- Do not search for hidden tests; use the feedback above plus the problem statement.\n"
+                    f"- Re-check the underlying reasoning, invariants, and complexity before patching the code.\n"
+                    f"- Do not overfit to the observed failing cases; fix the general logic, proof, or interface.\n"
+                    f"When you are ready for the next controlled submission, stop and provide a brief plain-text summary."
                 )
                 prompt_history.append(prompt)
 
@@ -851,7 +845,7 @@ class LCB6Benchmark(BenchmarkRunner):
                     )
                     break
 
-                last_feedback = _truncate_feedback(evaluation["output"])
+                last_feedback = truncate_feedback(evaluation["output"], max_lines=80, max_chars=12000)
 
             elapsed = round(time.time() - start, 2)
             if evaluation is None:
@@ -903,7 +897,7 @@ class LCB6Benchmark(BenchmarkRunner):
                 agent=agent,
                 prompt_texts=prompt_history,
                 result=result,
-                artifact_paths=["problem.txt", "public_tests.json", "solution.py"],
+                artifact_paths=["problem.txt", "solution.py"],
                 extra={"mode": mode},
             )
             shutil.rmtree(workspace, ignore_errors=True)

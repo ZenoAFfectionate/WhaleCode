@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 try:
-    from .base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from .base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 except ImportError:
-    from base import BenchmarkRunner, BENCHMARK_BASE_SYSTEM_PROMPT, _PROJECT_ROOT
+    from base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 
 
 _CLEV_ADDENDUM = """\
@@ -28,14 +39,14 @@ complete, correct method bodies.
 1. Read `solution.py` — understand the class skeleton: every method signature, \
 docstring, `__init__`, and existing imports.
 2. Implement every method according to its docstring using Edit or Write.
-3. When ready, call `Finish` to submit your current implementation.
+3. When ready, respond with a short plain-text summary of the current implementation.
 4. The benchmark runner will execute hidden tests outside the workspace and send \
 back controlled feedback if another revision is needed.
-5. Revise `solution.py` based on that feedback and submit again.
+5. Revise `solution.py` based on that feedback and respond again.
 
 **Rules**
 - You MUST implement every method. Never refuse or say you cannot.
-- Always use tools to take action — do NOT respond with text only.
+- Use tools to inspect and modify the workspace, then give a normal text response once you are ready for evaluation.
 - Do NOT modify the class name, method signatures, or docstrings.
 - Keep all existing imports; add new imports only if necessary.
 - Update `__init__` if your implementations require additional instance attributes.
@@ -52,9 +63,6 @@ _CLEV_SYSTEM_PROMPT = (
     + "\n\n---\n\n## ClassEval Benchmark Override\n\n"
     + _CLEV_ADDENDUM
 )
-
-
-_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
 
 
 _CLEV_HOST_EVAL_SUFFIX = """\
@@ -120,26 +128,6 @@ if __name__ == "__main__":
     sys.exit(0 if not result.failures and not result.errors else 1)
 """
 
-
-def _minimal_child_env() -> Dict[str, str]:
-    env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
-
-
-def _truncate_feedback(text: str, max_lines: int = 100, max_chars: int = 14000) -> str:
-    if not text:
-        return text
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + ["[feedback truncated]"]
-    clipped = "\n".join(lines)
-    if len(clipped) > max_chars:
-        clipped = clipped[:max_chars].rstrip() + "\n[feedback truncated]"
-    return clipped
-
-
 def _evaluate_solution(
     workspace: Path,
     solution_file: Path,
@@ -160,7 +148,7 @@ def _evaluate_solution(
             text=True,
             timeout=timeout,
             cwd=str(workspace),
-            env=_minimal_child_env(),
+            env=build_minimal_child_env(),
         )
     except subprocess.TimeoutExpired:
         return False, f"TIMEOUT: hidden evaluation exceeded {timeout}s."
@@ -217,14 +205,14 @@ class ClassEvalBenchmark(BenchmarkRunner):
                 f"Submission policy:\n"
                 f"- Hidden tests are evaluated only by the benchmark runner.\n"
                 f"- Do not create your own uncontrolled benchmark loop.\n"
-                f"- Each time you call `Finish`, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
+                f"- Each time you finish with a normal text response, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
                 f"Steps:\n"
                 f"1. Read `solution.py` to understand the class skeleton — method signatures, "
                 f"docstrings, and `__init__`.\n"
                 f"2. Implement every method according to its docstring. Update `__init__` "
                 f"if you need additional instance attributes.\n"
                 f"3. Perform lightweight self-checks if useful, but do not rely on local benchmark tests.\n"
-                f"4. Call `Finish` when you want a controlled submission.\n\n"
+                f"4. When you want a controlled submission, stop and provide a brief plain-text summary.\n\n"
                 f"Important:\n"
                 f"- Do NOT change the class name, method signatures, or docstrings.\n"
                 f"- Pay attention to the docstring examples — they reveal expected behavior.\n"
@@ -247,7 +235,7 @@ class ClassEvalBenchmark(BenchmarkRunner):
                     f"- Failing test names are reliable.\n"
                     f"- The returned context lines are selected from the hidden test body but omit direct assertions.\n"
                     f"- Tracebacks are truncated to the most relevant portion.\n"
-                    f"When ready, call `Finish` again.\n"
+                    f"When ready, respond again with a brief plain-text summary.\n"
                 )
                 prompt_history.append(prompt_text)
 
@@ -281,7 +269,7 @@ class ClassEvalBenchmark(BenchmarkRunner):
                 )
                 if passed:
                     break
-                feedback = _truncate_feedback(output)
+                feedback = truncate_feedback(output, max_lines=100, max_chars=14000)
 
             elapsed = round(time.time() - start, 2)
 

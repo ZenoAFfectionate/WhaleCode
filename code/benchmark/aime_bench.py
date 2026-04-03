@@ -79,14 +79,14 @@ AIME answers are always integers from 000 to 999.
 
 # Core Principle: Think First, Code Second
 
-Before writing any code, you MUST reason about the problem mathematically using \
-the Thought tool. Identify the domain, key constraints, and a clear solution \
+Before writing any code, you MUST reason carefully about the problem \
+mathematically. Identify the domain, key constraints, and a clear solution \
 strategy. Only then write code to execute your plan.
 
 # Workflow
 
-1. **Analyze** — Use Thought to identify the mathematical domain (number theory, \
-combinatorics, geometry, algebra, probability) and outline your approach. This is \
+1. **Analyze** — Identify the mathematical domain (number theory, \
+combinatorics, geometry, algebra, probability) and outline your approach before using any tools. This is \
 the most important step.
 2. **Explore** (optional) — Use `Bash` with `python3 -c "..."` for quick \
 computations to test conjectures or verify small cases. Keep explorations focused \
@@ -95,8 +95,7 @@ computations to test conjectures or verify small cases. Keep explorations focuse
 one integer (the answer) as its only output. No debug prints.
 4. **Verify** — Run `python3 solution.py` via Bash. The output must be a single \
 integer in 0-999. If it is not, your approach is wrong — go back to step 1.
-5. **Finish** — Call `Finish` with your answer. You MUST run solution.py before \
-calling Finish.
+5. **Respond** — After `solution.py` prints the correct integer, respond with the final answer in plain text. You MUST run `solution.py` before responding.
 
 # Strategy Guidelines
 
@@ -192,7 +191,7 @@ print(answer)
                 f"Solve this AIME problem. The answer is an integer from 0 to 999.\n\n"
                 f"**Problem:**\n{problem}\n\n"
                 f"**Instructions:**\n"
-                f"1. First, use Thought to analyze the problem mathematically. "
+                f"1. First, analyze the problem mathematically before using any tools. "
                 f"Identify the domain and plan your approach before writing any code.\n"
                 f"2. Optionally use `python3 -c \"...\"` via Bash to explore ideas "
                 f"(sympy, itertools, numpy are available). Keep this to 2-3 attempts.\n"
@@ -200,7 +199,7 @@ print(answer)
                 f"result. The template already handles printing and sanity checking.\n"
                 f"4. Run `python3 solution.py` via Bash. If it raises a ValueError, "
                 f"your answer is wrong — rethink your approach.\n"
-                f"5. Call `Finish` with your answer.\n"
+                f"5. Respond with your final answer in plain text.\n"
             )
 
             start = time.time()

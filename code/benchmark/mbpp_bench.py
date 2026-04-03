@@ -5,21 +5,57 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 try:
-    from .base import BenchmarkRunner, _PROJECT_ROOT
+    from .base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
 except ImportError:
-    from base import BenchmarkRunner, _PROJECT_ROOT
+    from base import (
+        BenchmarkRunner,
+        BENCHMARK_BASE_SYSTEM_PROMPT,
+        _PROJECT_ROOT,
+        build_minimal_child_env,
+        truncate_feedback,
+    )
+
+_MBPP_ADDENDUM = """\
+You are implementing MBPP+ Python programming tasks.
+
+Workflow:
+1. Read the task description carefully and identify the required function behavior.
+2. Implement the function in `solution.py`.
+3. Use only your own lightweight checks if you want to validate ideas locally.
+4. When ready for a controlled submission, stop and provide a short plain-text summary.
+5. The benchmark runner will execute the benchmark tests outside the workspace and return bounded feedback if another revision is needed.
+
+Rules:
+- Benchmark test files are not available in the workspace.
+- Do not create your own uncontrolled benchmark test loop.
+- Do not try to reconstruct hidden benchmark files or inspect anything outside the workspace.
+- Keep the required function signature intact.
+- Prefer simple, readable, correct code.
+"""
+
+_MBPP_SYSTEM_PROMPT = (
+    BENCHMARK_BASE_SYSTEM_PROMPT
+    + "\n\n---\n\n## MBPP+ Benchmark Override\n\n"
+    + _MBPP_ADDENDUM
+)
 
 
-# ---------------------------------------------------------------------------
-# tests.py wrapper — transforms plain assert into informative checks
-# ---------------------------------------------------------------------------
-_MBPP_TESTS_PY_TEMPLATE = """\
+_MBPP_VERIFY_TEMPLATE = """\
 import sys
 sys.path.insert(0, ".")
 from solution import *
@@ -54,8 +90,8 @@ except Exception as _e:
 """
 
 
-def _build_tests_py(assertion_code: str) -> str:
-    """Convert plain assert statements into a tests.py with detailed output."""
+def _build_verify_script(assertion_code: str) -> str:
+    """Convert plain assert statements into an internal verifier with detailed output."""
     checks = []
     for line in assertion_code.strip().splitlines():
         line = line.strip()
@@ -85,7 +121,43 @@ def _build_tests_py(assertion_code: str) -> str:
                 f'    print(f"[ERROR] {escaped}")\n'
                 f'    print(f"  {{type(_e).__name__}}: {{_e}}")\n'
             )
-    return _MBPP_TESTS_PY_TEMPLATE.format(checks="\n".join(checks))
+    return _MBPP_VERIFY_TEMPLATE.format(checks="\n".join(checks))
+
+
+def _evaluate_solution(
+    workspace: Path,
+    solution_file: Path,
+    assertion_code: str,
+    timeout: int,
+) -> tuple[bool, str]:
+    if not solution_file.exists():
+        return False, "solution.py not found"
+
+    verify_script = workspace / "._mbpp_verify.py"
+    verify_script.write_text(_build_verify_script(assertion_code), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(verify_script)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(workspace),
+            env=build_minimal_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"TIMEOUT: benchmark evaluation exceeded {timeout}s."
+    except Exception as exc:
+        return False, f"ERROR: benchmark evaluation failed: {exc}"
+    finally:
+        try:
+            verify_script.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return True, output or "All tests passed!"
+    return False, output or "Benchmark evaluation failed."
 
 
 class MBPPPlusBenchmark(BenchmarkRunner):
@@ -101,18 +173,15 @@ class MBPPPlusBenchmark(BenchmarkRunner):
 
     benchmark_name = "mbpp_plus"
 
+    def __init__(self, *args, max_submission_rounds: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_submission_rounds = max(1, int(max_submission_rounds))
+
+    def _get_system_prompt(self) -> str:
+        return _MBPP_SYSTEM_PROMPT
+
     def _load_tasks(self) -> List[Dict[str, Any]]:
         return self._load_jsonl_tasks()
-
-    def _build_test_code(self, task: Dict[str, Any], solution_code: str) -> str:
-        """Build a verification script from solution + assertions.
-
-        MBPP+ provides both ``base_input`` + ``plus_input`` for functional
-        testing and ``assertion`` for simple assert-based checks.  We use
-        the assertion string which is the most straightforward.
-        """
-        assertion_code = task.get("assertion", "")
-        return f"{solution_code}\n\n{assertion_code}\n"
 
     def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
@@ -123,71 +192,89 @@ class MBPPPlusBenchmark(BenchmarkRunner):
         workspace = self._make_workspace(f"mbpp_{task_id.replace('/', '_')}_")
         agent = None
         agent_response = ""
-        agent_prompt = ""
+        prompt_history: List[str] = []
         result: Optional[Dict[str, Any]] = None
         try:
-            # Write an empty solution file with a hint comment
             solution_file = workspace / "solution.py"
             solution_file.write_text(
                 f"# Implement the function: {entry_point}\n",
                 encoding="utf-8",
             )
 
-            # tests.py — assertion wrapper with detailed error output
-            (workspace / "tests.py").write_text(
-                _build_tests_py(assertion_code), encoding="utf-8"
-            )
-
-            # Run the agent
             agent = self._create_agent(workspace)
-            agent_prompt = (
+            initial_prompt = (
                 f"Your task is to implement the Python function `{entry_point}` "
                 f"in `solution.py`.\n\n"
                 f"**Task description:**\n{prompt_text}\n\n"
+                f"Submission policy:\n"
+                f"- This benchmark uses controlled submissions.\n"
+                f"- Benchmark test files are not present in the workspace.\n"
+                f"- Do not run your own benchmark test loop.\n"
+                f"- After each completed response, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
                 f"Follow these steps:\n"
                 f"1. Carefully analyze the task description and identify edge cases.\n"
                 f"2. Implement the function in `solution.py` using the Edit or Write tool.\n"
-                f"3. Run `python3 tests.py` to verify. If tests fail, analyze the error, "
-                f"fix your code, and re-run until all tests pass.\n"
-                f"4. Once all tests pass, call `Finish` with a brief summary.\n\n"
-                f"Rules:\n"
-                f"- The function must satisfy all the assertions in the task description.\n"
+                f"3. You may run lightweight self-checks of your own design, but do not rely on benchmark tests.\n"
+                f"4. When ready for a controlled submission, stop and provide a brief summary in plain text.\n\n"
+                f"Important:\n"
+                f"- The function must satisfy the task requirements and examples.\n"
                 f"- Include any necessary imports at the top of the file.\n"
                 f"- Handle edge cases gracefully (empty inputs, special values).\n"
                 f"- Prefer simple, readable implementations over clever one-liners.\n"
-                f"- Only `solution.py` and `tests.py` exist in the workspace.\n"
+                f"- Only `solution.py` exists in the workspace.\n"
             )
 
             start = time.time()
-            agent_response, error_result = self._run_agent_prompt(
-                agent=agent,
-                task_id=task_id,
-                prompt_text=agent_prompt,
-                start_time=start,
-            )
-            if error_result is not None:
-                result = error_result
-                return result
-            elapsed = round(time.time() - start, 2)
+            feedback = None
+            passed = False
+            output = ""
+            rounds_used = 0
 
-            # Read the solution
-            if solution_file.exists():
-                solution_code = solution_file.read_text(encoding="utf-8")
-            else:
-                result = self._missing_output_result(
-                    task_id,
-                    path_label="solution.py",
-                    elapsed_s=elapsed,
-                    agent_response=agent_response,
+            for round_idx in range(1, self.max_submission_rounds + 1):
+                rounds_used = round_idx
+                prompt = initial_prompt if round_idx == 1 else (
+                    f"Controlled evaluation feedback for submission round {round_idx - 1}:\n\n"
+                    f"{feedback}\n\n"
+                    f"Revise `solution.py` based on this feedback.\n"
+                    f"- The failing check summaries are reliable.\n"
+                    f"- Actual/expected values are intentionally bounded.\n"
+                    f"- Use the feedback above plus the task description, not hidden benchmark files.\n"
+                    f"When ready for the next controlled submission, stop and provide a brief plain-text summary."
                 )
-                return result
+                prompt_history.append(prompt)
 
-            # Build and run the test
-            test_code = self._build_test_code(task, solution_code)
-            verify_script = workspace / "verify.py"
-            verify_script.write_text(test_code, encoding="utf-8")
+                agent_response, error_result = self._run_agent_prompt(
+                    agent=agent,
+                    task_id=task_id,
+                    prompt_text=prompt,
+                    start_time=start,
+                    error_extra={"submission_rounds": round_idx},
+                )
+                if error_result is not None:
+                    result = error_result
+                    return result
 
-            passed, output = self._run_script_in_sandbox(verify_script, cwd=workspace)
+                if not solution_file.exists():
+                    result = self._missing_output_result(
+                        task_id,
+                        path_label="solution.py",
+                        start_time=start,
+                        agent_response=agent_response,
+                        extra={"submission_rounds": round_idx},
+                    )
+                    return result
+
+                passed, output = _evaluate_solution(
+                    workspace=workspace,
+                    solution_file=solution_file,
+                    assertion_code=assertion_code,
+                    timeout=self.timeout,
+                )
+                if passed:
+                    break
+                feedback = truncate_feedback(output, max_lines=80, max_chars=12000)
+
+            elapsed = round(time.time() - start, 2)
 
             result = self._build_result(
                 task_id,
@@ -195,6 +282,7 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 error=output if not passed else None,
                 agent_response=agent_response,
                 elapsed_s=elapsed,
+                extra={"submission_rounds": rounds_used},
             )
             return result
         finally:
@@ -202,9 +290,9 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 task=task,
                 workspace=workspace,
                 agent=agent,
-                prompt_texts=[agent_prompt] if agent_prompt else [],
+                prompt_texts=prompt_history,
                 result=result,
-                artifact_paths=["solution.py", "tests.py", "verify.py"],
+                artifact_paths=["solution.py"],
                 extra={"entry_point": entry_point},
             )
             shutil.rmtree(workspace, ignore_errors=True)
@@ -225,6 +313,7 @@ def main():
         default_max_steps=64,
         default_timeout=60,
     )
+    parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = MBPPPlusBenchmark(
@@ -232,6 +321,7 @@ def main():
         output_dir=args.output_dir,
         temperature=args.temperature,
         max_steps=args.max_steps,
+        max_submission_rounds=args.max_submission_rounds,
         timeout=args.timeout,
         trajectory_dir=args.trajectory_dir,
     )

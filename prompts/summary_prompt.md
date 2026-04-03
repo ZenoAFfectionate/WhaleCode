@@ -1,37 +1,46 @@
 # Summary Prompts for Context Compression
 
-Prompts used by the context compression engine (ContextCompactor) for generating
-structured conversation summaries when the context window approaches its limit.
+Prompts used by the context compression engine (`ContextCompactor`) when the
+conversation approaches the model context limit.
 
 ---
 
 ## 1. Conversation Structure
 
-The conversations being summarized follow this structure:
+The summarized conversation may contain:
 
 | Role        | Content                                                              |
 |-------------|----------------------------------------------------------------------|
 | `system`    | Agent role definition and workspace context                          |
-| `user`      | Task requests, follow-up instructions, and clarifications            |
-| `assistant` | Reasoning (Thought), tool calls, and text responses                  |
-| `tool`      | Tool execution results (file contents, command output, search hits)  |
+| `user`      | Task requests, follow-up instructions, clarifications, compact notes |
+| `assistant` | Tool calls, direct answers, and progress updates                     |
+| `tool`      | Tool execution results, file content, diagnostics, shell output      |
+
+The compactor will preserve the newest raw tail separately. It will also
+re-inject a deterministic "essential context" snapshot after the summary.
+The summary should therefore focus on chronology, rationale, unresolved work,
+and any details that would be risky to lose if the raw history disappears.
 
 ---
 
 ## 2. System Prompt
 
 <!-- SUMMARY_SYSTEM_PROMPT_START -->
-You are an expert at summarizing software engineering conversations between a user and a coding agent.
+You are summarizing a software-engineering conversation for a coding agent that is running out of context.
 
-When summarizing, follow these rules:
+Return plain text only. Do not call tools. Do not ask follow-up questions.
 
-1. **Preserve exact file paths** — never paraphrase, abbreviate, or shorten them.
-2. **Preserve exact commands** — record executed command lines and their outcomes (pass / fail / error).
-3. **Separate done from pending** — clearly distinguish completed work from remaining or blocked work.
-4. **Collapse verbose outputs** — replace full tool results with one-line summaries (e.g. "Read src/main.py — 200 lines, Python module").
-5. **Keep decisions and rationale** — technical choices and the reasoning behind them are critical for continuation.
-6. **Omit noise** — remove pleasantries, acknowledgments, and redundant back-and-forth.
-7. **Stay concise** — the summary replaces the full conversation in the context window; every token must earn its place.
+Before the final summary, write a private drafting scratchpad inside `<analysis>...</analysis>`.
+Then write the final summary inside `<summary>...</summary>`.
+
+Rules:
+
+1. Preserve exact file paths, commands, error strings, test names, and user constraints when they matter.
+2. Distinguish clearly between completed work, pending work, and uncertain work.
+3. Keep the summary continuation-oriented: a future agent should be able to resume work immediately.
+4. Prefer compact factual statements over narrative filler.
+5. Do not rely on future recovery to save critical context. If a fact would be expensive or dangerous to lose, keep it in the summary.
+6. The compactor will preserve a separate structured state snapshot for active todos, recent files, recent commands, loaded skills, and recoverable output pointers. Do not waste tokens restating those mechanically unless they are important to the reasoning.
 <!-- SUMMARY_SYSTEM_PROMPT_END -->
 
 ---
@@ -39,49 +48,73 @@ When summarizing, follow these rules:
 ## 3. User Template
 
 <!-- SUMMARY_USER_TEMPLATE_START -->
-Create a compressed summary of the following coding agent conversation.
+Create a continuation-ready compact summary of the coding-agent conversation excerpt below.
 
-Use the following structure:
+Compaction constraints:
 
-## Archived Session Summary
+- The full pre-compaction transcript has been archived at: {transcript_path}
+- Future recovery is budget-limited. Assume only a small amount of older context can be re-opened cheaply.
+- Recent file recovery budget:
+  - at most 3 files
+  - 20000 tokens total
+  - 5000 tokens per file
+- Skill recovery budget:
+  - 10000 tokens total
+  - 5000 tokens per skill
 
-### Objectives & Status
-* **Original Goal**: [What the user initially wanted]
-* **Current State**: [What has been accomplished so far, what remains]
+Because of those limits, preserve the information that is hardest to reconstruct later:
 
-### Files Read / Modified
-* [List file paths that were inspected or changed, with brief notes on what was done]
+- the user's true goal and latest active requirements
+- decisions and why they were made
+- blockers, failed attempts, and exact errors
+- important verification results
+- the current state of implementation and the next step
 
-### Key Decisions
-* [Important technical choices made during the task]
-* [Rejected alternatives, if any, and why]
+First, analyze the conversation chronologically inside `<analysis>...</analysis>`.
+In that analysis, check:
 
-### Errors Encountered
-* [Any failures, issues, or blockers — include exact error messages when available]
+1. What the user asked for and how the request changed over time
+2. What work was completed
+3. What is still pending, blocked, or risky
+4. Which files, commands, tests, APIs, or configs matter for continuation
+5. Which mistakes, regressions, or dead ends must not be repeated
 
-### Insights & Preferences
-* [Discovered configs, API formats, project conventions, or pitfalls]
-* [Any stated user preferences for tools, coding style, or workflow]
+Then output the final summary inside `<summary>...</summary>` using this structure:
 
----
+## Primary Request and Intent
+- What the user ultimately wants
 
-Conversation:
+## Current State
+- What has already been completed
+- What still remains
+
+## Important Technical Details
+- Critical files, code paths, commands, errors, interfaces, and constraints
+
+## Decisions and Rationale
+- Important choices, tradeoffs, and rejected approaches
+
+## Risks and Open Questions
+- Known risks, blockers, missing verification, or unresolved ambiguity
+
+## Next Step
+- The exact next thing the agent should do when the conversation resumes
+
+Conversation to summarize:
 {conversation}
 
 {focus_instruction}
 
-Output a structured summary in markdown (under {max_tokens} tokens).
+Stay under {max_tokens} tokens in the final `<summary>` section.
 <!-- SUMMARY_USER_TEMPLATE_END -->
 
 ---
 
 ## 4. Extraction Guide
 
-The two prompts above are delimited by HTML comment markers for programmatic extraction:
+The prompts above are extracted programmatically from the HTML comment markers:
 
-| Prompt               | Start Marker                          | End Marker                          |
-|----------------------|---------------------------------------|-------------------------------------|
-| System Prompt        | `<!-- SUMMARY_SYSTEM_PROMPT_START -->` | `<!-- SUMMARY_SYSTEM_PROMPT_END -->` |
-| User Template        | `<!-- SUMMARY_USER_TEMPLATE_START -->` | `<!-- SUMMARY_USER_TEMPLATE_END -->` |
-
-Loader code reads the raw markdown and extracts the text between each marker pair.
+| Prompt               | Start Marker                           | End Marker                             |
+|----------------------|----------------------------------------|----------------------------------------|
+| System Prompt        | `<!-- SUMMARY_SYSTEM_PROMPT_START -->` | `<!-- SUMMARY_SYSTEM_PROMPT_END -->`   |
+| User Template        | `<!-- SUMMARY_USER_TEMPLATE_START -->` | `<!-- SUMMARY_USER_TEMPLATE_END -->`   |

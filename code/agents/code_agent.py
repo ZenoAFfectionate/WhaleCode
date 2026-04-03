@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -249,7 +250,7 @@ class CodeAgent(ReActAgent):
 
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = self._normalize_compacted_message_content(msg)
             if role == "system":
                 continue
             if role == "assistant" and content == COMPACTION_ACKNOWLEDGEMENT:
@@ -258,7 +259,7 @@ class CodeAgent(ReActAgent):
                 content = self._extract_compaction_summary(content)
                 role = "summary"
 
-            if role not in {"user", "assistant", "summary"}:
+            if role not in {"user", "assistant", "summary", "tool"}:
                 continue
 
             message = Message(content, role)
@@ -272,6 +273,40 @@ class CodeAgent(ReActAgent):
             return content
         _, _, summary = content.partition(COMPACTION_SUMMARY_HEADING)
         return summary.lstrip("\n").strip()
+
+    @staticmethod
+    def _normalize_compacted_message_content(message: Dict) -> str:
+        """Convert compacted chat messages into durable text-only history entries."""
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = "\n".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in content
+                if item
+            )
+        else:
+            content = str(content)
+
+        if message.get("role") != "assistant":
+            return content
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return content
+
+        call_lines: List[str] = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {}) or {}
+            tool_name = function.get("name", "unknown")
+            arguments = function.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+            call_lines.append(f"- {tool_name}({arguments})")
+
+        tool_call_text = "[Assistant tool calls]\n" + "\n".join(call_lines)
+        if content.strip():
+            return f"{content.strip()}\n\n{tool_call_text}"
+        return tool_call_text
 
     def run(self, input_text: str, **kwargs) -> str:
         """Run with the shared ReActAgent contract and CodeAgent tracing metadata."""

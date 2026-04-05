@@ -20,7 +20,23 @@ class ToolRegistry:
     2. Direct function registration (Simple)
     """
 
-    def __init__(self, circuit_breaker: Optional[CircuitBreaker] = None, verbose: bool = True):
+    @staticmethod
+    def _default_circuit_breaker(config: Optional[Any] = None) -> CircuitBreaker:
+        if config is None:
+            return CircuitBreaker()
+        return CircuitBreaker(
+            failure_threshold=int(getattr(config, "circuit_failure_threshold", 3) or 3),
+            recovery_timeout=int(getattr(config, "circuit_recovery_timeout", 300) or 300),
+            enabled=bool(getattr(config, "circuit_enabled", True)),
+        )
+
+    def __init__(
+        self,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+        *,
+        config: Optional[Any] = None,
+        verbose: bool = True,
+    ):
         self._tools: dict[str, Tool] = {}
         self._functions: dict[str, dict[str, Any]] = {}
         self.verbose = verbose
@@ -29,7 +45,7 @@ class ToolRegistry:
         self.read_metadata_cache: Dict[str, Dict[str, Any]] = {}
 
         # Circuit breaker (enabled by default)
-        self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self.circuit_breaker = circuit_breaker or self._default_circuit_breaker(config)
 
     def _emit(self, message: str) -> None:
         if self.verbose:

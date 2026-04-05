@@ -10,7 +10,6 @@ from typing import Any
 
 __all__ = [
     "ContextBuilder",
-    "ContextCompactor",
     "ContextConfig",
     "ContextPacket",
     "HistoryManager",
@@ -20,7 +19,6 @@ __all__ = [
 
 _EXPORTS = {
     "ContextBuilder": (".builder", "ContextBuilder"),
-    "ContextCompactor": (".compactor", "ContextCompactor"),
     "ContextConfig": (".builder", "ContextConfig"),
     "ContextPacket": (".builder", "ContextPacket"),
     "HistoryManager": (".history", "HistoryManager"),

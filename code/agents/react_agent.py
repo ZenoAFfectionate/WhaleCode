@@ -15,8 +15,6 @@ from ..core.lifecycle import EventType, LifecycleHook
 from ..core.reasoning import extract_reasoning_payload
 from ..core.streaming import StreamEvent, StreamEventType
 from ..tools.registry import ToolRegistry
-from ..tools.response import ToolStatus
-from ..context.compactor import ContextCompactor
 
 
 DEFAULT_REACT_SYSTEM_PROMPT = """You are an AI assistant with reasoning and action capabilities.
@@ -75,12 +73,7 @@ class ReActAgent(Agent):
             llm,
             system_prompt or DEFAULT_REACT_SYSTEM_PROMPT,
             config,
-            tool_registry=tool_registry or ToolRegistry()
-        )
-
-        # 上下文压缩引擎
-        self._compactor = ContextCompactor(
-            config=self.config, token_counter=self.token_counter
+            tool_registry=tool_registry or ToolRegistry(config=config)
         )
 
         self.max_steps = max_steps
@@ -488,25 +481,63 @@ class ReActAgent(Agent):
         self,
         input_text: str,
         structured_output: Optional[_StructuredOutputSpec] = None,
-    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        messages = self._build_messages(input_text)
-        if structured_output:
-            self._apply_structured_output_prompt(messages, structured_output)
+    ) -> List[Dict[str, Any]]:
         tool_schemas = self._build_tool_schemas(structured_output)
         self._trace_user_message(input_text)
         self._render_agent_start(input_text)
-        return messages, tool_schemas
+        self._append_history_message(Message(input_text, "user"), allow_compact=False)
+        return tool_schemas
 
-    def _maybe_compact_messages(self, messages: List[Dict[str, Any]]) -> None:
-        if self._compactor and self.config.compact_enabled:
-            self._compactor.micro_compact(messages)
-            if self._compactor.should_compact(
-                messages,
-                latest_prompt_tokens=getattr(self, "_last_prompt_tokens", 0),
-            ):
-                self._render_compaction_notice()
-                messages[:] = self._compactor.auto_compact(messages, self.llm)
-                self._last_prompt_tokens = self._compactor.estimate_tokens(messages)
+    def _maybe_compact_history(
+        self,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Compact history if needed.
+
+        The ``tool_schemas`` parameter is accepted for backward compatibility
+        with older call sites that passed it through, but it is no longer used.
+        """
+        _ = tool_schemas
+        result = self.history_manager.maybe_compact(
+            llm=self.llm,
+            system_prompt=self._get_context_system_prompt(),
+            latest_prompt_tokens=getattr(self, "_last_prompt_tokens", 0),
+        )
+        self._sync_history_token_count()
+        self._estimated_next_prompt_tokens = self.history_manager.estimate_tokens(
+            system_prompt=self._get_context_system_prompt(),
+        )
+        if result is not None:
+            self._render_compaction_notice()
+
+    @staticmethod
+    def _extract_response_usage(response: Any) -> tuple[int, int, int]:
+        """Normalize provider usage fields into prompt/completion/total counts."""
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = getattr(usage, "input_tokens", 0)
+
+            completion_tokens = getattr(usage, "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = getattr(usage, "output_tokens", 0)
+
+            total_tokens = getattr(usage, "total_tokens", None)
+            if total_tokens is None:
+                total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+            return int(prompt_tokens or 0), int(completion_tokens or 0), int(total_tokens or 0)
+
+        usage_metadata = getattr(response, "usage_metadata", None)
+        if usage_metadata is not None:
+            prompt_tokens = int(getattr(usage_metadata, "prompt_token_count", 0) or 0)
+            completion_tokens = int(getattr(usage_metadata, "candidates_token_count", 0) or 0)
+            total_tokens = getattr(usage_metadata, "total_token_count", None)
+            if total_tokens is None:
+                total_tokens = prompt_tokens + completion_tokens
+            return prompt_tokens, completion_tokens, int(total_tokens or 0)
+
+        return 0, 0, 0
 
     def _record_model_response(self, response: Any, current_step: int, state: _ExecutionState) -> Any:
         response_message = response.choices[0].message
@@ -515,14 +546,21 @@ class ReActAgent(Agent):
         reasoning_content = None
         reasoning_source = None
 
-        if response.usage:
-            state.total_tokens += response.usage.total_tokens
-            state.total_prompt_tokens += getattr(response.usage, "prompt_tokens", 0)
-            state.total_completion_tokens += getattr(response.usage, "completion_tokens", 0)
+        prompt_tokens, completion_tokens, total_tokens = self._extract_response_usage(response)
+        if total_tokens or prompt_tokens or completion_tokens:
+            state.total_tokens += total_tokens
+            state.total_prompt_tokens += prompt_tokens
+            state.total_completion_tokens += completion_tokens
             self._total_tokens = state.total_tokens
             self._turn_prompt_tokens = state.total_prompt_tokens
             self._turn_completion_tokens = state.total_completion_tokens
-            self._last_prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+            self._last_prompt_tokens = prompt_tokens
+            self.history_manager.record_usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+            self._sync_history_token_count()
 
         if message_reasoning.content is not None:
             reasoning_content = message_reasoning.content
@@ -551,7 +589,9 @@ class ReActAgent(Agent):
                 "content": response_message.content or "",
                 "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
                 "usage": {
-                    "total_tokens": response.usage.total_tokens if response.usage else 0,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
                     "cost": 0.0,
                 },
             }
@@ -567,34 +607,45 @@ class ReActAgent(Agent):
 
         return response_message
 
-    def _append_assistant_tool_call_message(self, messages: List[Dict[str, Any]], response_message: Any) -> None:
+    def _append_assistant_tool_call_message(self, response_message: Any) -> None:
         tool_calls = response_message.tool_calls or []
-        messages.append(
-            {
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in tool_calls
-                ],
-            }
+        assistant_message = self.history_manager.build_assistant_tool_call_message(
+            tool_calls=[
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+            content=response_message.content,
         )
+        self._append_history_message(assistant_message, allow_compact=False)
 
-    @staticmethod
-    def _append_tool_message(messages: List[Dict[str, Any]], tool_call_id: str, result_content: str) -> None:
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_content,
-            }
+    def _append_tool_message(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        result_content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+        if metadata:
+            payload.update(metadata)
+        self._append_history_message(
+            Message(
+                result_content,
+                "tool",
+                metadata=payload,
+            ),
+            allow_compact=False,
         )
 
     @staticmethod
@@ -611,13 +662,11 @@ class ReActAgent(Agent):
 
     def _append_final_history(
         self,
-        input_text: str,
         final_answer: str,
         *,
         reasoning_content: Optional[str] = None,
         reasoning_source: Optional[str] = None,
     ) -> None:
-        self.add_message(Message(input_text, "user"))
         assistant_metadata = self._assistant_reasoning_metadata(
             reasoning_content=reasoning_content,
             reasoning_source=reasoning_source,
@@ -650,7 +699,6 @@ class ReActAgent(Agent):
 
     def _should_retry_without_tool_call(
         self,
-        messages: List[Dict[str, Any]],
         text_content: str,
         state: _ExecutionState,
         structured_output: Optional[_StructuredOutputSpec] = None,
@@ -676,17 +724,18 @@ class ReActAgent(Agent):
                 f"When you are ready to finish, call the {structured_output.name} tool "
                 "exactly once with arguments that match its schema."
             )
-        messages.append(
-            {
-                "role": "user",
-                "content": reminder,
-            }
+        self._append_history_message(
+            Message(
+                reminder,
+                "user",
+                metadata={"kind": "retry_reminder"},
+            ),
+            allow_compact=False,
         )
         return True
 
     def _resolve_no_tool_call_response(
         self,
-        messages: List[Dict[str, Any]],
         text_content: str,
         state: _ExecutionState,
         *,
@@ -696,7 +745,6 @@ class ReActAgent(Agent):
         reasoning_source: Optional[str] = None,
     ) -> tuple[bool, Optional[str], Optional[str]]:
         if self._should_retry_without_tool_call(
-            messages,
             text_content,
             state,
             structured_output=structured_output,
@@ -769,7 +817,6 @@ class ReActAgent(Agent):
 
     def _process_tool_results(
         self,
-        messages: List[Dict[str, Any]],
         tool_calls: List[Any],
         tool_results: List[tuple],
         current_step: int,
@@ -788,7 +835,12 @@ class ReActAgent(Agent):
                 return final_answer
 
             result_content = result.get("content", str(result))
-            self._append_tool_message(messages, tool_call_id, result_content)
+            self._append_tool_message(
+                tool_name,
+                tool_call_id,
+                result_content,
+                metadata=result.get("metadata"),
+            )
             self._update_stagnation_state(
                 tool_name,
                 tool_call_id,
@@ -937,22 +989,31 @@ class ReActAgent(Agent):
                     (
                         tool_name,
                         tool_call_id,
-                        executor.submit(self._execute_tool_call, tool_name, arguments),
+                        executor.submit(self._execute_tool_call_result, tool_name, arguments),
                     )
                     for tool_name, tool_call_id, arguments in prepared_user_calls
                 ]
 
                 for tool_name, tool_call_id, future in future_items:
                     try:
-                        result_content = future.result()
+                        result = future.result()
                     except Exception as exc:
-                        result_content = f"❌ Tool execution failed: {exc}"
+                        result = {
+                            "content": f"❌ Tool execution failed: {exc}",
+                            "metadata": {
+                                "tool_name": tool_name,
+                                "tool_execution_error": str(exc),
+                            },
+                            "status": "error",
+                        }
+                    result_content = result["content"]
 
                     self._trace_tool_result(
                         tool_name,
                         tool_call_id,
                         result_content,
                         step=current_step,
+                        status=result.get("status"),
                     )
 
                     self._render_tool_result(
@@ -960,17 +1021,20 @@ class ReActAgent(Agent):
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,
                         step=current_step,
+                        status=result.get("status"),
                     )
-                    results.append((tool_name, tool_call_id, {"content": result_content}))
+                    results.append((tool_name, tool_call_id, result))
         else:
             for tool_name, tool_call_id, arguments in prepared_user_calls:
-                result_content = self._execute_tool_call(tool_name, arguments)
+                result = self._execute_tool_call_result(tool_name, arguments)
+                result_content = result["content"]
 
                 self._trace_tool_result(
                     tool_name,
                     tool_call_id,
                     result_content,
                     step=current_step,
+                    status=result.get("status"),
                 )
 
                 self._render_tool_result(
@@ -978,8 +1042,9 @@ class ReActAgent(Agent):
                     tool_name=tool_name,
                     tool_call_id=tool_call_id,
                     step=current_step,
+                    status=result.get("status"),
                 )
-                results.append((tool_name, tool_call_id, {"content": result_content}))
+                results.append((tool_name, tool_call_id, result))
 
         return results
     
@@ -1036,7 +1101,7 @@ class ReActAgent(Agent):
         structured_output = self._extract_structured_output_spec(kwargs)
         tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
 
-        messages, tool_schemas = self._prepare_execution(
+        tool_schemas = self._prepare_execution(
             input_text,
             structured_output=structured_output,
         )
@@ -1049,8 +1114,11 @@ class ReActAgent(Agent):
             state.is_retry = False
 
             self._current_step = state.current_step
-            self._maybe_compact_messages(messages)
+            self._maybe_compact_history()
 
+            messages = self._build_messages()
+            if structured_output:
+                self._apply_structured_output_prompt(messages, structured_output)
             self._before_model_call(messages, state.current_step)
 
             try:
@@ -1075,7 +1143,6 @@ class ReActAgent(Agent):
             if not tool_calls:
                 text_content = (response_message.content or "").strip()
                 should_continue, final_answer, status = self._resolve_no_tool_call_response(
-                    messages,
                     text_content,
                     state,
                     structured_output=structured_output,
@@ -1086,7 +1153,6 @@ class ReActAgent(Agent):
                     continue
 
                 self._append_final_history(
-                    input_text,
                     final_answer,
                     reasoning_content=state.last_reasoning_content,
                     reasoning_source=state.last_reasoning_source,
@@ -1100,7 +1166,7 @@ class ReActAgent(Agent):
                 return final_answer
 
             state.no_tool_call_retries = 0
-            self._append_assistant_tool_call_message(messages, response_message)
+            self._append_assistant_tool_call_message(response_message)
 
             tool_results = self._execute_tools(
                 tool_calls,
@@ -1108,7 +1174,6 @@ class ReActAgent(Agent):
                 structured_output=structured_output,
             )
             final_answer = self._process_tool_results(
-                messages,
                 tool_calls,
                 tool_results,
                 state.current_step,
@@ -1117,7 +1182,6 @@ class ReActAgent(Agent):
             )
             if final_answer is not None:
                 self._append_final_history(
-                    input_text,
                     final_answer,
                     reasoning_content=state.last_reasoning_content,
                     reasoning_source=state.last_reasoning_source,
@@ -1136,7 +1200,7 @@ class ReActAgent(Agent):
         if not state.stagnation_detected:
             self._render_timeout()
         final_answer = "Sorry, I could not complete this task within the step limit."
-        self._append_final_history(input_text, final_answer)
+        self._append_final_history(final_answer)
         self._finalize_trace_session(
             session_start_time,
             state.current_step,
@@ -1145,13 +1209,12 @@ class ReActAgent(Agent):
         )
         return final_answer
 
-    def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """Build the base message list for a single run."""
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": input_text})
-        return messages
+    def _build_messages(self, input_text: Optional[str] = None) -> List[Dict[str, str]]:
+        """Build model messages directly from HistoryManager."""
+        return self.history_manager.build_llm_messages(
+            system_prompt=self._get_context_system_prompt(),
+            latest_user_input=input_text,
+        )
 
     def _before_model_call(self, messages: List[Dict[str, Any]], current_step: int) -> None:
         """Hook for subclasses to inject context before each model call."""
@@ -1197,7 +1260,7 @@ class ReActAgent(Agent):
         )
 
         try:
-            messages, tool_schemas = self._prepare_execution(
+            tool_schemas = self._prepare_execution(
                 input_text,
                 structured_output=structured_output,
             )
@@ -1210,7 +1273,7 @@ class ReActAgent(Agent):
                 state.is_retry = False
 
                 self._current_step = state.current_step
-                self._maybe_compact_messages(messages)
+                self._maybe_compact_history()
 
                 await self._emit_event(
                     EventType.STEP_START,
@@ -1218,6 +1281,9 @@ class ReActAgent(Agent):
                     step=state.current_step,
                 )
 
+                messages = self._build_messages()
+                if structured_output:
+                    self._apply_structured_output_prompt(messages, structured_output)
                 await self._abefore_model_call(messages, state.current_step)
 
                 try:
@@ -1242,7 +1308,6 @@ class ReActAgent(Agent):
                 if not tool_calls:
                     text_content = (response_message.content or "").strip()
                     should_continue, final_answer, status = self._resolve_no_tool_call_response(
-                        messages,
                         text_content,
                         state,
                         structured_output=structured_output,
@@ -1253,7 +1318,6 @@ class ReActAgent(Agent):
                         continue
 
                     self._append_final_history(
-                        input_text,
                         final_answer,
                         reasoning_content=state.last_reasoning_content,
                         reasoning_source=state.last_reasoning_source,
@@ -1275,7 +1339,7 @@ class ReActAgent(Agent):
                     return final_answer
 
                 state.no_tool_call_retries = 0
-                self._append_assistant_tool_call_message(messages, response_message)
+                self._append_assistant_tool_call_message(response_message)
 
                 tool_results = await self._execute_tools_async(
                     tool_calls,
@@ -1285,7 +1349,6 @@ class ReActAgent(Agent):
                 )
 
                 final_answer = self._process_tool_results(
-                    messages,
                     tool_calls,
                     tool_results,
                     state.current_step,
@@ -1294,7 +1357,6 @@ class ReActAgent(Agent):
                 )
                 if final_answer is not None:
                     self._append_final_history(
-                        input_text,
                         final_answer,
                         reasoning_content=state.last_reasoning_content,
                         reasoning_source=state.last_reasoning_source,
@@ -1327,7 +1389,7 @@ class ReActAgent(Agent):
             if not state.stagnation_detected:
                 self._render_timeout()
             final_answer = "Sorry, I could not complete this task within the step limit."
-            self._append_final_history(input_text, final_answer)
+            self._append_final_history(final_answer)
 
             await self._emit_event(
                 EventType.AGENT_FINISH,
@@ -1462,9 +1524,9 @@ class ReActAgent(Agent):
                         step=current_step,
                     )
 
-                    tool_response = await self._aexecute_tool_response(tool_name, arguments)
-                    result_content = self._format_tool_response_text(tool_name, tool_response)
-                    result_status = "error" if tool_response.status == ToolStatus.ERROR else "success"
+                    result = await self._aexecute_tool_call_result(tool_name, arguments)
+                    result_content = result["content"]
+                    result_status = result["status"]
 
                     self._trace_tool_result(
                         tool_name,
@@ -1480,7 +1542,7 @@ class ReActAgent(Agent):
                         status=result_status,
                         step=current_step,
                     )
-                    return (tool_name, tool_call_id, {"content": result_content})
+                    return (tool_name, tool_call_id, result)
 
             user_results = await asyncio.gather(*[execute_one(tc) for tc in user_calls])
             results.extend(user_results)
@@ -1513,7 +1575,7 @@ class ReActAgent(Agent):
         await self._emit_event(EventType.AGENT_START, on_start, input_text=input_text)
 
         try:
-            messages, tool_schemas = self._prepare_execution(
+            tool_schemas = self._prepare_execution(
                 input_text,
                 structured_output=structured_output,
             )
@@ -1525,7 +1587,11 @@ class ReActAgent(Agent):
                     state.current_step += 1
                 state.is_retry = False
                 self._current_step = state.current_step
-                self._maybe_compact_messages(messages)
+                self._maybe_compact_history()
+
+                messages = self._build_messages()
+                if structured_output:
+                    self._apply_structured_output_prompt(messages, structured_output)
 
                 yield StreamEvent.create(
                     StreamEventType.STEP_START,
@@ -1580,7 +1646,6 @@ class ReActAgent(Agent):
                     if not tool_calls:
                         text_content = (response_message.content or "").strip()
                         should_continue, final_answer, status = self._resolve_no_tool_call_response(
-                            messages,
                             text_content,
                             state,
                             structured_output=structured_output,
@@ -1608,7 +1673,6 @@ class ReActAgent(Agent):
                             status=status,
                         )
                         self._append_final_history(
-                            input_text,
                             final_answer,
                             reasoning_content=state.last_reasoning_content,
                             reasoning_source=state.last_reasoning_source,
@@ -1622,7 +1686,7 @@ class ReActAgent(Agent):
                         return
 
                     state.no_tool_call_retries = 0
-                    self._append_assistant_tool_call_message(messages, response_message)
+                    self._append_assistant_tool_call_message(response_message)
                     tool_results = await self._execute_tools_async_stream(
                         tool_calls,
                         state.current_step,
@@ -1657,7 +1721,6 @@ class ReActAgent(Agent):
                                 total_tokens=state.total_tokens,
                             )
                             self._append_final_history(
-                                input_text,
                                 final_answer,
                                 reasoning_content=state.last_reasoning_content,
                                 reasoning_source=state.last_reasoning_source,
@@ -1670,7 +1733,12 @@ class ReActAgent(Agent):
                             )
                             return
 
-                        self._append_tool_message(messages, tool_call_id, result_dict["content"])
+                        self._append_tool_message(
+                            tool_name,
+                            tool_call_id,
+                            result_dict["content"],
+                            metadata=result_dict.get("metadata"),
+                        )
                         self._update_stagnation_state(
                             tool_name,
                             tool_call_id,
@@ -1729,7 +1797,7 @@ class ReActAgent(Agent):
                     total_tokens=state.total_tokens,
                     status="timeout",
                 )
-                self._append_final_history(input_text, final_answer)
+                self._append_final_history(final_answer)
                 self._finalize_trace_session(
                     session_start_time,
                     state.current_step,

@@ -49,6 +49,23 @@ except ImportError:
 
 
 TODO_MUTATING_ACTIONS = {"create", "update", "bulk_create", "delete"}
+INTERACTIVE_EXIT_WORDS = frozenset({"exit"})
+INTERACTIVE_EXACT_COMMANDS = (
+    "/help",
+    "/info",
+    "/tools",
+    "/pwd",
+    "/log",
+    "/clear",
+    "/sessions",
+)
+INTERACTIVE_PREFIX_COMMANDS = (
+    "/cd",
+    "/history",
+    "/save",
+    "/resume",
+    "/compact",
+)
 
 
 class InputBuffer:
@@ -447,13 +464,13 @@ class CLIUI:
             ctx_used = getattr(agent, "_last_prompt_tokens", 0)
 
             token_parts = [
-                f"[green]⬆{prompt_t:,}[/green]",
-                f"[yellow]⬇{comp_t:,}[/yellow]",
+                f"[green]⬆Σ{prompt_t:,}[/green]",
+                f"[yellow]⬇Σ{comp_t:,}[/yellow]",
             ]
             if ctx_window > 0 and ctx_used > 0:
                 pct = ctx_used * 100 / ctx_window
                 token_parts.append(
-                    f"[cyan]📊 {ctx_used:,} / {ctx_window:,} ({pct:.0f}%)[/cyan]"
+                    f"[cyan]📊 last {ctx_used:,} / {ctx_window:,} ({pct:.0f}%)[/cyan]"
                 )
             self.console.print(
                 f"[dim]{time_part}    |    {' · '.join(token_parts)}[/dim]"
@@ -770,7 +787,7 @@ def create_agent(args, ui: CLIUI):
         llm_kwargs["temperature"] = args.temperature
 
     llm = HelloAgentsLLM(**llm_kwargs)
-    registry = ToolRegistry(verbose=False)
+    registry = ToolRegistry(config=config, verbose=False)
     agent = CLICodeAgent(
         name="code-agent",
         llm=llm,
@@ -1012,7 +1029,7 @@ def print_help(ui: CLIUI) -> None:
     lines = [
         "Commands:",
         "- /help                 Show this help message",
-        "- /info | /model        Show workspace, model, and runtime info",
+        "- /info                 Show workspace, model, and runtime info",
         "- /tools                Show registered tools and descriptions",
         "- /pwd                  Show the current working directory",
         "- /cd <path>            Change the agent working directory within the workspace",
@@ -1020,11 +1037,10 @@ def print_help(ui: CLIUI) -> None:
         "- /log                  View all terminal output in a scrollable pager",
         "- /clear                Clear in-memory conversation history",
         "- /save [name]          Save a session snapshot into the session directory",
-        "- /load [path|name]     Load a saved session (default: session-latest)",
-        "- /resume [path|name]   Alias of /load; restores dialogue + task snapshot",
+        "- /resume [path|name]   Load a saved session (default: session-latest)",
         "- /sessions             List saved sessions",
         "- /compact [focus]      Compact conversation context",
-        "- exit | quit | q       Exit the CLI",
+        "- exit                  Exit the CLI",
     ]
     if ui.use_rich:
         ui.console.print(Panel("\n".join(lines), title="Help", border_style="cyan", width=ui.console.width))
@@ -1203,7 +1219,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         except Exception as exc:
             ui.error(f"Save failed: {exc}")
 
-    def _cmd_load(raw, lowered):
+    def _cmd_resume(raw, lowered):
         parts = raw.split(maxsplit=1)
         load_session_and_tasks(
             agent,
@@ -1234,7 +1250,6 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
     _exact_cmds = {
         "/help": _cmd_help,
         "/info": _cmd_info,
-        "/model": _cmd_info,
         "/tools": _cmd_tools,
         "/pwd": _cmd_pwd,
         "/log": _cmd_log,
@@ -1247,8 +1262,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         ("/cd", _cmd_cd),
         ("/history", _cmd_history),
         ("/save", _cmd_save),
-        ("/load", _cmd_load),
-        ("/resume", _cmd_load),
+        ("/resume", _cmd_resume),
         ("/compact", _cmd_compact),
     ]
 
@@ -1286,7 +1300,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             continue
 
         lowered = user_input.lower()
-        if lowered in {"exit", "quit", "q"}:
+        if lowered in INTERACTIVE_EXIT_WORDS:
             maybe_auto_save(agent, args.session_name, not args.no_auto_save, ui, "exit")
             clear_todo_tasks(agent)
             return 0

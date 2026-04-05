@@ -284,7 +284,7 @@ class SimpleAgent(Agent):
         """
         if not self.tool_registry:
             from ..tools.registry import ToolRegistry
-            self.tool_registry = ToolRegistry()
+            self.tool_registry = ToolRegistry(config=self.config)
             self.enable_tool_calling = True
 
         # Use ToolRegistry's register_tool method directly

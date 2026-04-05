@@ -193,6 +193,53 @@ class _WorkspaceFileTool(Tool):
     def _display_path(self, path: Path) -> str:
         return relative_display(self.project_root, path)
 
+    def _nearest_existing_ancestor(self, path: Path) -> Path:
+        current = path.parent if not path.exists() else path
+        while current != self.project_root and not current.exists():
+            current = current.parent
+        return current if current.exists() else self.project_root
+
+    def _missing_path_response(
+        self,
+        requested_path: str,
+        full_path: Path,
+        *,
+        detail_line: str = "No content was read from the workspace.",
+    ) -> ToolResponse:
+        rel_path = self._display_path(full_path)
+        parent_path = full_path.parent
+        parent_display = self._display_path(parent_path)
+        parent_exists = parent_path.exists()
+        nearest_existing = self._nearest_existing_ancestor(full_path)
+        nearest_display = self._display_path(nearest_existing)
+        suggested_check_path = parent_display if parent_exists else nearest_display
+
+        text_lines = [
+            f"Path does not exist: {rel_path}",
+            detail_line,
+        ]
+        if requested_path != rel_path:
+            text_lines.append(f"Requested path: {requested_path}")
+        if not parent_exists:
+            text_lines.append(f"Nearest existing ancestor: {nearest_display}")
+        text_lines.append(
+            f"Please verify the path and inspect '{suggested_check_path}' to confirm the correct location or name."
+        )
+
+        return ToolResponse.partial(
+            text="\n".join(text_lines),
+            data={
+                "path": rel_path,
+                "requested_path": requested_path,
+                "exists": False,
+                "missing_path": True,
+                "parent_path": parent_display,
+                "parent_exists": parent_exists,
+                "nearest_existing_path": nearest_display,
+                "suggested_check_path": suggested_check_path,
+            },
+        )
+
     def _get_cached_metadata(self, rel_path: str) -> Optional[Dict[str, Any]]:
         if self.registry is None:
             return None
@@ -401,10 +448,7 @@ class ReadTool(_WorkspaceFileTool):
 
         try:
             if not full_path.exists():
-                return ToolResponse.error(
-                    code=ToolErrorCode.NOT_FOUND,
-                    message=f"Path '{path}' does not exist",
-                )
+                return self._missing_path_response(path, full_path)
 
             if full_path.is_dir():
                 return self._list_directory(full_path=full_path, offset=offset, limit=limit)
@@ -645,10 +689,7 @@ class ListFilesTool(ReadTool):
             )
 
         if not full_path.exists():
-            return ToolResponse.error(
-                code=ToolErrorCode.NOT_FOUND,
-                message=f"Path '{path}' does not exist",
-            )
+            return self._missing_path_response(path, full_path)
         if not full_path.is_dir():
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_PARAM,
@@ -1025,9 +1066,10 @@ class DeleteTool(_WorkspaceFileTool):
 
         try:
             if not full_path.exists():
-                return ToolResponse.error(
-                    code=ToolErrorCode.NOT_FOUND,
-                    message=f"Path '{path}' does not exist",
+                return self._missing_path_response(
+                    path,
+                    full_path,
+                    detail_line="Nothing was deleted.",
                 )
 
             protected_error = self._validate_protected_path(full_path)
@@ -1315,9 +1357,10 @@ class EditTool(_WorkspaceFileTool):
 
         try:
             if not full_path.exists():
-                return ToolResponse.error(
-                    code=ToolErrorCode.NOT_FOUND,
-                    message=f"File '{path}' does not exist",
+                return self._missing_path_response(
+                    path,
+                    full_path,
+                    detail_line="No edits were applied.",
                 )
             if full_path.is_dir():
                 return ToolResponse.error(

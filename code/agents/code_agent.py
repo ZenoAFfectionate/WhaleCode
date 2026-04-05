@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from ..context.compactor import (
-    COMPACTION_ACKNOWLEDGEMENT,
-    COMPACTION_PREFIX,
-    COMPACTION_SUMMARY_HEADING,
-)
 from ..core.config import Config
 from ..core.llm import HelloAgentsLLM
 from ..observability.trace_logger import TraceLogger
@@ -58,12 +52,11 @@ class CodeAgent(ReActAgent):
         effective_config = _copy_config(config)
         self._trace_enabled = bool(effective_config.trace_enabled)
         effective_config.trace_enabled = False
-        effective_config.subagent_enabled = False
         effective_config.todowrite_enabled = bool(
             register_default_tools and enable_task_tool and effective_config.todowrite_enabled
         )
 
-        registry = tool_registry or ToolRegistry()
+        registry = tool_registry or ToolRegistry(config=effective_config)
 
         super().__init__(
             name=name,
@@ -170,37 +163,29 @@ class CodeAgent(ReActAgent):
     # ------------------------------------------------------------------
 
     def compact(self, focus: str = None) -> str:
-        """Manually compact the conversation context.
-
-        Reconstructs messages from the HistoryManager, runs manual_compact,
-        and replaces the stored history with the compressed version.
-
-        Args:
-            focus: Optional focus string to guide the summary.
-
-        Returns:
-            Status message.
-        """
-        messages = self._build_workspace_messages()
-        if not messages:
+        """Manually compact the conversation context via HistoryManager."""
+        if not self.get_history():
             return "Nothing to compact."
 
-        before_tokens = self._compactor.estimate_tokens(messages)
-        compacted = self._compactor.manual_compact(messages, self.llm, focus=focus)
-        after_tokens = self._compactor.estimate_tokens(compacted)
-
-        # Replace history with the compacted summary
-        self._replace_history_from_messages(compacted)
+        result = self.history_manager.compact_with_llm(
+            llm=self.llm,
+            system_prompt=self._get_context_system_prompt(),
+            focus=focus,
+        )
+        self._sync_history_token_count()
+        self._estimated_next_prompt_tokens = self.history_manager.estimate_tokens(
+            system_prompt=self._get_context_system_prompt(),
+        )
+        if result is None:
+            return "Nothing to compact."
 
         return (
-            f"Context compacted: {before_tokens} -> {after_tokens} tokens "
-            f"(saved {before_tokens - after_tokens})"
+            f"Context compacted: estimated next prompt {result['before_tokens']} -> {result['after_tokens']} tokens "
+            f"(saved {result['saved_tokens']})"
         )
 
-    def _build_workspace_messages(self, input_text: Optional[str] = None) -> List[Dict[str, str]]:
-        """Build a single-system-message transcript with optional new user input."""
-        messages: List[Dict[str, str]] = []
-
+    def _get_context_system_prompt(self) -> str:
+        """Build the workspace-aware system prompt for all model calls."""
         system_parts: List[str] = []
         if self.system_prompt:
             system_parts.append(self.system_prompt)
@@ -209,104 +194,11 @@ class CodeAgent(ReActAgent):
             f"Current working directory: {self.working_dir}\n"
             "All file paths must stay within the workspace root."
         )
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+        return "\n\n".join(system_parts)
 
-        for message in self.get_history():
-            if message.role == "summary":
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[Conversation summary]\n{message.content}",
-                    }
-                )
-            elif message.role == "system":
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[System note]\n{message.content}",
-                    }
-                )
-            elif message.role in {"user", "assistant"}:
-                messages.append({"role": message.role, "content": message.content})
-            elif message.role == "tool":
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Previous tool result:\n{message.content}",
-                    }
-                )
-
-        if input_text is not None:
-            messages.append({"role": "user", "content": input_text})
-
-        return messages
-
-    def _replace_history_from_messages(self, messages: List[Dict]) -> None:
-        """Replace HistoryManager history with messages from a compacted list."""
-        from ..core.message import Message
-
-        self.history_manager.clear()
-        self._history_token_count = 0
-
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = self._normalize_compacted_message_content(msg)
-            if role == "system":
-                continue
-            if role == "assistant" and content == COMPACTION_ACKNOWLEDGEMENT:
-                continue
-            if role == "user" and isinstance(content, str) and content.startswith(COMPACTION_PREFIX):
-                content = self._extract_compaction_summary(content)
-                role = "summary"
-
-            if role not in {"user", "assistant", "summary", "tool"}:
-                continue
-
-            message = Message(content, role)
-            self.history_manager.append(message)
-            self._history_token_count += self.token_counter.count_message(message)
-
-    @staticmethod
-    def _extract_compaction_summary(content: str) -> str:
-        """Strip compaction wrappers and keep only the durable summary text."""
-        if COMPACTION_SUMMARY_HEADING not in content:
-            return content
-        _, _, summary = content.partition(COMPACTION_SUMMARY_HEADING)
-        return summary.lstrip("\n").strip()
-
-    @staticmethod
-    def _normalize_compacted_message_content(message: Dict) -> str:
-        """Convert compacted chat messages into durable text-only history entries."""
-        content = message.get("content") or ""
-        if isinstance(content, list):
-            content = "\n".join(
-                item.get("text", "") if isinstance(item, dict) else str(item)
-                for item in content
-                if item
-            )
-        else:
-            content = str(content)
-
-        if message.get("role") != "assistant":
-            return content
-
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            return content
-
-        call_lines: List[str] = []
-        for tool_call in tool_calls:
-            function = tool_call.get("function", {}) or {}
-            tool_name = function.get("name", "unknown")
-            arguments = function.get("arguments", "{}")
-            if not isinstance(arguments, str):
-                arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-            call_lines.append(f"- {tool_name}({arguments})")
-
-        tool_call_text = "[Assistant tool calls]\n" + "\n".join(call_lines)
-        if content.strip():
-            return f"{content.strip()}\n\n{tool_call_text}"
-        return tool_call_text
+    def _build_workspace_messages(self, input_text: Optional[str] = None):
+        """兼容旧调用点，实际复用共享的 HistoryManager 投影逻辑。"""
+        return self._build_messages(input_text)
 
     def run(self, input_text: str, **kwargs) -> str:
         """Run with the shared ReActAgent contract and CodeAgent tracing metadata."""
@@ -355,25 +247,15 @@ class CodeAgent(ReActAgent):
         finally:
             self.trace_logger = None
 
-    def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """Build messages with workspace context and preserved conversation history.
-
-        All system-level content is merged into a single system message at
-        position 0 so that models whose chat template forbids mid-conversation
-        system messages (e.g. Qwen served via vLLM) work correctly.
-        """
-        return self._build_workspace_messages(input_text)
-
     def _create_subagent(self, agent_type: str = "code") -> "CodeAgent":
         """Create a fresh sub-agent with isolated tool state."""
         sub_config = _copy_config(self.config)
         sub_config.trace_enabled = False
-        sub_config.subagent_enabled = False
 
         return CodeAgent(
             name=f"{self.name}-{agent_type}-subagent",
             llm=self.llm,
-            tool_registry=ToolRegistry(),
+            tool_registry=ToolRegistry(config=sub_config),
             project_root=str(self.project_root),
             working_dir=str(self.working_dir),
             config=sub_config,

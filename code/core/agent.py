@@ -37,6 +37,7 @@ class Agent(ABC):
         "Edit",
         "Write",
     }
+    TOOL_RESPONSE_METADATA_EXCLUDE_KEYS = frozenset({"content", "output", "stdout", "stderr"})
 
     def __init__(
         self,
@@ -54,22 +55,25 @@ class Agent(ABC):
         # 工具注册表（可选）
         self.tool_registry = tool_registry
 
+        # 新增：Token 计数器（缓存 + 增量计算）
+        from ..context.token_counter import TokenCounter
+        self.token_counter = TokenCounter(model=self.llm.model)
+        self._last_prompt_tokens = 0
+        self._estimated_next_prompt_tokens = 0
+        self._turn_prompt_tokens = 0
+        self._turn_completion_tokens = 0
+        self._total_tokens = 0
+
         # 新增：上下文工程组件
         from ..context.history import HistoryManager
 
         self.history_manager = HistoryManager(
-            min_retain_rounds=self.config.min_retain_rounds,
-            compression_threshold=self.config.compression_threshold
+            compression_threshold=self.config.compression_threshold,
+            token_counter=self.token_counter,
+            config=self.config,
         )
-
-        # 新增：Token 计数器（缓存 + 增量计算）
-        from ..context.token_counter import TokenCounter
-        self.token_counter = TokenCounter(model=self.llm.model)
-        self._history_token_count = 0  # 缓存历史 Token 数
-        self._last_prompt_tokens = 0
-        self._turn_prompt_tokens = 0
-        self._turn_completion_tokens = 0
-        self._total_tokens = 0
+        self._history_token_count = self.history_manager.get_token_count()
+        self._history_estimated_token_count = self.history_manager.get_estimated_token_count()
 
         # 统一暴露截断器，便于工具层和测试使用相同的上下文能力
         from ..context.truncator import ObservationTruncator
@@ -145,6 +149,7 @@ class Agent(ABC):
         self.history_manager.clear()
         for msg in value:
             self.history_manager.append(msg)
+        self._sync_history_token_count()
 
     @abstractmethod
     def run(self, input_text: str, **kwargs) -> str:
@@ -306,28 +311,15 @@ class Agent(ABC):
 
         自动检查是否需要压缩历史
         """
-        self.history_manager.append(message)
-
-        # 增量更新 Token 计数
-        new_tokens = self.token_counter.count_message(message)
-        self._history_token_count += new_tokens
-
-        # 检查是否需要压缩
-        if self._should_compress():
-            self._compress_history()
-
-        # 自动保存（如果启用）
-        if self.config.auto_save_enabled and self.session_store:
-            history_len = len(self.history_manager.get_history())
-            if history_len % self.config.auto_save_interval == 0:
-                self._auto_save()
+        self._append_history_message(message, allow_compact=True)
 
     def clear_history(self):
         """清空历史记录"""
         self.history_manager.clear()
         # 重置 Token 计数
-        self._history_token_count = 0
+        self._sync_history_token_count()
         self._last_prompt_tokens = 0
+        self._estimated_next_prompt_tokens = 0
         self._turn_prompt_tokens = 0
         self._turn_completion_tokens = 0
         self.token_counter.clear_cache()
@@ -336,160 +328,39 @@ class Agent(ABC):
         """获取历史记录"""
         return self.history_manager.get_history()
 
-    def _should_compress(self) -> bool:
-        """判断是否需要压缩历史
+    def _get_context_system_prompt(self) -> Optional[str]:
+        """返回当前上下文使用的系统提示词。"""
+        return self.system_prompt
 
-        优先使用真实 prompt_tokens；若不可用，则回退到历史缓存 Token 数。
-        同时保留轮次上限兜底，避免在短消息场景下历史永远不压缩。
+    def _sync_history_token_count(self) -> None:
+        """同步 HistoryManager 内缓存的真实 usage 与本地估算值。"""
+        self._history_token_count = self.history_manager.get_token_count()
+        self._history_estimated_token_count = self.history_manager.get_estimated_token_count()
 
-        Returns:
-            是否需要压缩
+    def _append_history_message(self, message: Message, *, allow_compact: bool = True) -> None:
+        """统一历史写入入口。
+
+        ReAct 类 agent 可在运行中关闭即时压缩，仅在模型调用前显式触发。
         """
-        if not self.config.compact_enabled:
-            return False
+        self.history_manager.append(message)
+        self._sync_history_token_count()
 
-        prompt_tokens = int(getattr(self, "_last_prompt_tokens", 0) or 0)
-        token_signal = prompt_tokens if prompt_tokens > 0 else int(self._history_token_count)
-        if token_signal >= self.config.get_compact_trigger_limit():
-            return True
+        if allow_compact:
+            self.history_manager.maybe_compact(
+                llm=self.llm,
+                system_prompt=self._get_context_system_prompt(),
+                latest_prompt_tokens=self._last_prompt_tokens,
+            )
+            self._sync_history_token_count()
 
-        round_limit = getattr(self.config, "max_rounds_before_compression", 0)
-        if round_limit and self.history_manager.estimate_rounds() >= round_limit:
-            return True
-
-        return False
-
-    def _compress_history(self):
-        """压缩历史
-
-        默认使用简单摘要策略；启用 ``smart_summary_enabled`` 时使用 LLM 摘要。
-        """
-        history = self.history_manager.get_history()
-
-        if self.config.smart_summary_enabled:
-            summary = self._generate_smart_summary(history)
-        else:
-            summary = self._generate_simple_summary(history)
-
-        self.history_manager.compress(summary)
-
-        # 重新计算 Token 数（压缩后）
-        new_history = self.history_manager.get_history()
-        self._history_token_count = self.token_counter.count_messages(new_history)
-        self._last_prompt_tokens = self._history_token_count
-
-    def _generate_simple_summary(self, history: List[Message]) -> str:
-        """生成简单摘要（统计信息）
-
-        Args:
-            history: 历史消息列表
-
-        Returns:
-            摘要文本
-        """
-        rounds = self.history_manager.estimate_rounds()
-        user_msgs = sum(1 for msg in history if msg.role == "user")
-        assistant_msgs = sum(1 for msg in history if msg.role == "assistant")
-
-        return f"""此会话包含 {rounds} 轮对话：
-- 用户消息：{user_msgs} 条
-- 助手消息：{assistant_msgs} 条
-- 总消息数：{len(history)} 条
-
-（历史已压缩，保留最近 {self.config.min_retain_rounds} 轮完整对话）"""
-
-    def _generate_smart_summary(self, history: List[Message]) -> str:
-        """Generate a structured summary using the LLM.
-
-        Uses the shared SUMMARY_SYSTEM_PROMPT for consistent, English-language
-        summaries that preserve file paths, commands, and technical decisions.
-
-        Args:
-            history: List of history messages
-
-        Returns:
-            Summary text
-        """
-        from ..context.compactor import (
-            SUMMARY_SYSTEM_PROMPT,
-            SUMMARY_USER_TEMPLATE,
-            format_compact_summary,
+        self._estimated_next_prompt_tokens = self.history_manager.estimate_tokens(
+            system_prompt=self._get_context_system_prompt(),
         )
 
-        # 1. Extract the history segment to compress using the shared HistoryManager logic
-        split = self.history_manager.get_compression_split(history)
-        if split is None:
-            return self._generate_simple_summary(history)
-        to_compress, _retained = split
-
-        if not to_compress:
-            return self._generate_simple_summary(history)
-
-        # 2. Build conversation text for the summary prompt
-        history_text = self._format_history_for_summary(to_compress)
-
-        summary_prompt = SUMMARY_USER_TEMPLATE.format(
-            conversation=history_text,
-            focus_instruction="",
-            max_tokens=min(self.config.summary_max_tokens, 2048),
-            transcript_path="[unavailable]",
-        )
-
-        # 3. Call LLM to generate the summary
-        try:
-            messages = [
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": summary_prompt}
-            ]
-
-            summary_response = self.llm.invoke(
-                messages,
-                temperature=self.config.summary_temperature,
-                max_tokens=min(self.config.summary_max_tokens, 2048)
-            )
-
-            summary_text = format_compact_summary(
-                getattr(summary_response, "content", str(summary_response))
-            )
-            if not summary_text:
-                return self._generate_simple_summary(history)
-
-            return f"""{summary_text}
-
----
-(Compressed, retaining the most recent {self.config.min_retain_rounds} complete rounds)"""
-
-        except Exception as e:
-            # Fallback to simple summary
-            print(f"⚠️ Smart summary generation failed: {e}, using simple summary")
-            return self._generate_simple_summary(history)
-
-    def _format_history_for_summary(self, history: List[Message]) -> str:
-        """格式化历史消息用于摘要生成
-
-        Args:
-            history: 历史消息列表
-
-        Returns:
-            格式化后的历史文本
-        """
-        formatted_lines = []
-        for msg in history:
-            # 截断过长消息（避免摘要 Prompt 过大）
-            content = msg.content[:500] if len(msg.content) > 500 else msg.content
-            formatted_lines.append(f"[{msg.role}]: {content}")
-
-        return "\n\n".join(formatted_lines)
-
-    def _get_summary_llm(self):
-        """获取摘要用 LLM
-
-        直接复用主 Agent LLM，避免额外的外部 API 依赖。
-
-        Returns:
-            HelloAgentsLLM 实例
-        """
-        return self.llm
+        if self.config.auto_save_enabled and self.session_store:
+            history_len = len(self.history_manager.get_history())
+            if history_len % self.config.auto_save_interval == 0:
+                self._auto_save()
 
     def __str__(self) -> str:
         return f"Agent(name={self.name}, model={self.llm.model})"
@@ -679,6 +550,43 @@ class Agent(ABC):
 
         return truncation.get("display_preview", truncation.get("preview", source_text))
 
+    def _tool_history_metadata(self, tool_name: str, response) -> Dict[str, Any]:
+        """Build compact, structured metadata for persisted tool history entries."""
+        metadata: Dict[str, Any] = {"tool_name": tool_name}
+        tool_status = getattr(getattr(response, "status", None), "value", None)
+        if isinstance(tool_status, str) and tool_status:
+            metadata["tool_status"] = tool_status
+
+        payload = response.data if isinstance(getattr(response, "data", None), dict) else {}
+        if not payload:
+            return metadata
+
+        filtered_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in self.TOOL_RESPONSE_METADATA_EXCLUDE_KEYS
+        }
+        if filtered_payload:
+            metadata["tool_data"] = filtered_payload
+
+        full_output_path = payload.get("full_output_path")
+        if isinstance(full_output_path, str):
+            full_output_path = full_output_path.strip()
+            if full_output_path:
+                metadata["full_output_path"] = full_output_path
+
+        return metadata
+
+    def _build_tool_execution_result(self, tool_name: str, response) -> Dict[str, Any]:
+        """Format a ToolResponse once and keep its history metadata alongside the text."""
+        from ..tools.response import ToolStatus
+
+        return {
+            "content": self._format_tool_response_text(tool_name, response),
+            "metadata": self._tool_history_metadata(tool_name, response),
+            "status": "error" if response.status == ToolStatus.ERROR else "success",
+        }
+
     def _tool_observation_source_text(self, tool_name: str, response) -> tuple[str, Dict[str, Any]]:
         """Build the fullest available text form of a tool response for LLM consumption."""
         payload = response.data if isinstance(getattr(response, "data", None), dict) else {}
@@ -774,6 +682,11 @@ class Agent(ABC):
         payload = self._prepare_tool_registry_input(tool_name, arguments)
         return await self.tool_registry.aexecute_tool(tool_name, payload)
 
+    async def _aexecute_tool_call_result(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Async tool execution that preserves structured response metadata."""
+        response = await self._aexecute_tool_response(tool_name, arguments)
+        return self._build_tool_execution_result(tool_name, response)
+
     def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具调用并返回字符串结果
 
@@ -788,8 +701,12 @@ class Agent(ABC):
         Returns:
             工具执行结果（字符串格式）
         """
+        return self._execute_tool_call_result(tool_name, arguments)["content"]
+
+    def _execute_tool_call_result(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """执行工具调用并返回格式化文本 + 可持久化 metadata。"""
         response = self._execute_tool_response(tool_name, arguments)
-        return self._format_tool_response_text(tool_name, response)
+        return self._build_tool_execution_result(tool_name, response)
 
     # ==================== 会话持久化能力 ====================
 
@@ -1280,19 +1197,3 @@ class Agent(ABC):
         )
 
         self.tool_registry.register_tool(todo_tool)
-
-    def _create_light_llm(self) -> HelloAgentsLLM:
-        """创建轻量模型 LLM 实例
-
-        Returns:
-            轻量模型 LLM 实例
-        """
-        # 复用主 LLM 的配置，但使用轻量模型
-        light_llm = HelloAgentsLLM(
-            provider=self.config.subagent_light_llm_provider,
-            model=self.config.subagent_light_llm_model,
-            temperature=self.llm.temperature if hasattr(self.llm, 'temperature') else 0.7,
-            max_tokens=self.llm.max_tokens if hasattr(self.llm, 'max_tokens') else None
-        )
-
-        return light_llm

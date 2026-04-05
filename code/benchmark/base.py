@@ -169,6 +169,7 @@ def build_minimal_child_env() -> Dict[str, str]:
     env = {key: os.environ[key] for key in _MINIMAL_CHILD_ENV_KEYS if key in os.environ}
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
     return env
 
 
@@ -330,7 +331,7 @@ class BenchmarkProgressManager:
                 Text(self._timing_line(), style="dim", no_wrap=True, overflow="ellipsis"),
                 Text(self._status_line(), style="bold white", no_wrap=True, overflow="ellipsis"),
             ),
-            title=" Progress ",
+            title=f" {self._progress_panel_title()} ",
             title_align="left",
             border_style="cyan",
             padding=(0, 1),
@@ -339,7 +340,7 @@ class BenchmarkProgressManager:
         return Group(
             Panel(
                 header,
-                title=f"  {self.benchmark_name}  ",
+                title=f" {self._header_panel_title()} ",
                 title_align="left",
                 border_style="bright_blue",
                 padding=(0, 1),
@@ -348,7 +349,7 @@ class BenchmarkProgressManager:
             progress_panel,
             Panel(
                 self._status_table(),
-                title=" Recent Outcomes ",
+                title=f" {self._outcomes_panel_title()} ",
                 title_align="left",
                 border_style="blue",
                 padding=(0, 1),
@@ -401,17 +402,23 @@ class BenchmarkProgressManager:
         return _clip_display(line, inner)
 
     def _counts_line(self) -> str:
-        line = (
-            f"Passed {self.passed}   Failed {self.failed}   "
-            f"Pending {self.unfinished}   Skipped {self.skipped}"
-        )
+        if self._is_compact_layout():
+            line = (
+                f"Pass {self.passed}   Fail {self.failed}   "
+                f"Pend {self.unfinished}   Skip {self.skipped}"
+            )
+        else:
+            line = (
+                f"Passed {self.passed}   Failed {self.failed}   "
+                f"Pending {self.unfinished}   Skipped {self.skipped}"
+            )
         return _clip_display(line, self._content_width())
 
     def _progress_line(self) -> str:
         inner = self._content_width()
         total = max(self.total, 1)
         percent = self.completed / total
-        prefix = "Overall Progress "
+        prefix = "Progress " if self._is_compact_layout() else "Overall Progress "
         suffix = f" {self.completed}/{self.total} {percent * 100:>3.0f}%"
         bar_width = max(10, inner - _display_width(prefix) - _display_width(suffix) - 2)
         filled = min(bar_width, max(0, int(round(bar_width * percent))))
@@ -511,7 +518,8 @@ class BenchmarkProgressManager:
             (
                 f"Completed  {self.completed}/{self.total}    "
                 f"Pass {self.passed}    Fail {self.failed}    "
-                f"Pending {self.unfinished}    Skip {self.skipped}"
+                f"{'Pend' if self._is_compact_layout() else 'Pending'} {self.unfinished}    "
+                f"Skip {self.skipped}"
             ),
         ]
         progress_lines = [
@@ -520,9 +528,9 @@ class BenchmarkProgressManager:
             self._status_line(),
         ]
         return (
-            panel(self.benchmark_name, header_lines)
-            + panel("Progress", progress_lines)
-            + panel("Recent Outcomes", status_lines)
+            panel(self._header_panel_title(), header_lines)
+            + panel(self._progress_panel_title(), progress_lines)
+            + panel(self._outcomes_panel_title(), status_lines)
         )
 
     def _terminal_width(self) -> int:
@@ -535,29 +543,56 @@ class BenchmarkProgressManager:
 
     def _target_width(self, terminal_width: Optional[int] = None) -> int:
         columns = max(60, int(terminal_width or self._terminal_width()))
+        # Leave extra gutter so titled box-drawing borders don't sit exactly on the
+        # terminal edge. This avoids wrap artifacts on narrower terminals.
+        gutter = 4 if columns <= 100 else 6
+        usable = max(58, columns - gutter)
         if columns <= 90:
-            return max(58, columns - 2)
-        return max(72, min(columns - 2, int(columns * 0.8)))
+            return usable
+        return max(72, min(usable, int(columns * 0.82)))
 
     def _content_width(self) -> int:
         return max(24, self._target_width() - 4)
 
     def _recent_text_width(self) -> int:
-        return max(16, self._content_width() - 26)
+        status_width, count_width = self._status_column_widths()
+        reserved = status_width + count_width + 4
+        return max(12, self._content_width() - reserved)
+
+    def _is_compact_layout(self) -> bool:
+        return self._terminal_width() <= 88
+
+    def _header_panel_title(self) -> str:
+        return self.benchmark_name
+
+    def _progress_panel_title(self) -> str:
+        return "Progress"
+
+    def _outcomes_panel_title(self) -> str:
+        return "Outcomes" if self._is_compact_layout() else "Recent Outcomes"
+
+    def _status_column_widths(self) -> tuple[int, int]:
+        if self._is_compact_layout():
+            return 11, 4
+        return 14, 5
 
     def _status_header_line(self) -> str:
+        status_width, count_width = self._status_column_widths()
         recent_width = self._recent_text_width()
         return (
-            f"{'Status':<14} {'Count':>5}  "
+            _ljust_display("Status", status_width)
+            + " "
+            + f"{'Cnt' if self._is_compact_layout() else 'Count':>{count_width}}  "
             + _ljust_display(_clip_display("Recent", recent_width), recent_width)
         )
 
     def _status_row_line(self, label: str, count: int, recent: str) -> str:
+        status_width, count_width = self._status_column_widths()
         recent_width = self._recent_text_width()
-        clipped_label = _clip_display(label, 14)
+        clipped_label = _clip_display(label, status_width)
         return (
-            _ljust_display(clipped_label, 14)
-            + f" {count:>5}  "
+            _ljust_display(clipped_label, status_width)
+            + f" {count:>{count_width}}  "
             + _ljust_display(_clip_display(recent, recent_width), recent_width)
         )
 
@@ -862,11 +897,10 @@ class BenchmarkRunner(ABC):
         if self.api_key:
             llm_kwargs["api_key"] = self.api_key
 
-        llm = HelloAgentsLLM(**llm_kwargs)
-        registry = ToolRegistry(verbose=False)
-
         config = Config.from_env()
         config.trace_enabled = False
+        llm = HelloAgentsLLM(**llm_kwargs)
+        registry = ToolRegistry(config=config, verbose=False)
 
         task_id = self._current_task_id or workspace.name
         agent = BenchmarkCodeAgent(
@@ -1367,9 +1401,50 @@ class BenchmarkRunner(ABC):
             if task_id is None:
                 anonymous_records.append(record)
             else:
-                latest_by_task[str(task_id)] = record
+                task_key = str(task_id)
+                latest_by_task.pop(task_key, None)
+                latest_by_task[task_key] = record
 
         return list(latest_by_task.values()) + anonymous_records
+
+    @staticmethod
+    def _write_result_records(results_file: Path, records: List[Dict[str, Any]]) -> None:
+        """Atomically rewrite a results JSONL file from *records*."""
+        results_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=results_file.parent,
+            prefix=f".{results_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            for record in records:
+                tmp.write(json.dumps(record, ensure_ascii=False) + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        tmp_path.replace(results_file)
+
+    @staticmethod
+    def _upsert_result_record(
+        records: List[Dict[str, Any]],
+        record_index: Dict[str, int],
+        result: Dict[str, Any],
+    ) -> None:
+        """Insert or replace a result record by ``task_id`` in-place."""
+        task_id = result.get("task_id")
+        if task_id is None:
+            records.append(result)
+            return
+
+        task_key = str(task_id)
+        existing_idx = record_index.get(task_key)
+        if existing_idx is None:
+            record_index[task_key] = len(records)
+            records.append(result)
+            return
+        records[existing_idx] = result
 
     @staticmethod
     def _summarize_result_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1412,8 +1487,8 @@ class BenchmarkRunner(ABC):
             task_ids: Only run tasks whose ``task_id`` is in this list.
             dry_run: Print tasks without executing.
             resume: Path to a previous results ``.jsonl`` file.  Already-
-                completed task IDs are skipped and new results are **appended**
-                to the same file.
+                completed task IDs are skipped and rerun task IDs replace their
+                existing records in the same file.
         """
         tasks = self._load_tasks()
         if task_ids:
@@ -1425,11 +1500,19 @@ class BenchmarkRunner(ABC):
         # --- Resume handling ---
         completed_ids: set = set()
         resume_path: Optional[Path] = Path(resume) if resume else None
+        persisted_records: List[Dict[str, Any]] = []
+        record_index: Dict[str, int] = {}
         if resume:
             if not resume_path.exists():
                 print(f"  ▶ Resume target does not exist yet: {resume}")
                 print("    A new results file will be created at this path.\n")
             else:
+                raw_records = self._load_result_records(resume_path)
+                persisted_records = self._latest_result_records(raw_records)
+                if len(persisted_records) != len(raw_records):
+                    duplicate_count = len(raw_records) - len(persisted_records)
+                    self._write_result_records(resume_path, persisted_records)
+                    print(f"  ▶ Cleaned {duplicate_count} duplicate result record(s) before resuming")
                 completed_ids = self._load_completed_ids(resume_path)
                 print(f"  ▶ Resuming from: {resume}")
                 print(f"    Already completed: {len(completed_ids)} tasks")
@@ -1442,6 +1525,13 @@ class BenchmarkRunner(ABC):
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
+
+        if not persisted_records and results_file.exists():
+            persisted_records = self._latest_result_records(self._load_result_records(results_file))
+        for idx, record in enumerate(persisted_records):
+            task_id = record.get("task_id")
+            if task_id is not None:
+                record_index[str(task_id)] = idx
 
         print(f"\n{'=' * 60}")
         print(f"  Benchmark: {self.benchmark_name}")
@@ -1472,37 +1562,36 @@ class BenchmarkRunner(ABC):
         progress.start()
 
         try:
-            with open(results_file, "a", encoding="utf-8") as result_stream:
-                for i, task in enumerate(tasks):
-                    task_id = str(task.get("task_id", f"task_{i}"))
-                    self._current_task_id = task_id
+            for i, task in enumerate(tasks):
+                task_id = str(task.get("task_id", f"task_{i}"))
+                self._current_task_id = task_id
 
-                    if task_id in completed_ids:
-                        skipped += 1
-                        progress.skip_task(i + 1, task_id)
-                        continue
+                if task_id in completed_ids:
+                    skipped += 1
+                    progress.skip_task(i + 1, task_id)
+                    continue
 
-                    progress.begin_task(i + 1, task_id)
+                progress.begin_task(i + 1, task_id)
 
-                    try:
-                        result = self._evaluate_task_with_timeout(task, task_id)
-                    except Exception as exc:
-                        result = {
-                            "task_id": task_id,
-                            "passed": False,
-                            "error": f"Runner exception: {exc}",
-                            "elapsed_s": 0.0,
-                        }
+                try:
+                    result = self._evaluate_task_with_timeout(task, task_id)
+                except Exception as exc:
+                    result = {
+                        "task_id": task_id,
+                        "passed": False,
+                        "error": f"Runner exception: {exc}",
+                        "elapsed_s": 0.0,
+                    }
 
-                    self._drain_progress_queue(self._progress_queue)
-                    results.append(result)
-                    if result.get("passed") is True:
-                        passed_count += 1
-                    total_time += result.get("elapsed_s", 0)
-                    progress.finish_task(result)
+                self._drain_progress_queue(self._progress_queue)
+                results.append(result)
+                if result.get("passed") is True:
+                    passed_count += 1
+                total_time += result.get("elapsed_s", 0)
+                progress.finish_task(result)
 
-                    result_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    result_stream.flush()
+                self._upsert_result_record(persisted_records, record_index, result)
+                self._write_result_records(results_file, persisted_records)
         finally:
             progress.close()
             self._progress_manager = None
@@ -1512,8 +1601,7 @@ class BenchmarkRunner(ABC):
         # Summary
         evaluated = len(results)
         new_pass_rate = (passed_count / evaluated * 100) if evaluated > 0 else 0
-        combined_records = self._load_result_records(results_file)
-        combined = self._summarize_result_records(combined_records)
+        combined = self._summarize_result_records(persisted_records)
         summary = {
             "benchmark": self.benchmark_name,
             "model": self.model or "(from env)",

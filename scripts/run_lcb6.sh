@@ -6,7 +6,7 @@
 #   bash scripts/run_lcb6.sh --dry-run          # Dry run
 #   bash scripts/run_lcb6.sh --model gpt-4o     # Override model
 #   bash scripts/run_lcb6.sh --resume data/_results/lcb6_xxx.jsonl
-#                                             # Resume into / append to a specific results file
+#                                             # Resume into a specific results file; rerun results replace same-task records
 
 set -euo pipefail
 
@@ -19,8 +19,13 @@ if [ -f "$PROJECT_ROOT/.env" ]; then
     set +a
 fi
 
+# Keep the benchmark inside the active Python environment only.
+# This prevents ~/.local site-packages from shadowing conda packages such as rich.
+export PYTHONNOUSERSITE=1
+
 echo "=== LiveCodeBench v6 Benchmark ==="
 echo "Project root: $PROJECT_ROOT"
+echo "Python user site: disabled (PYTHONNOUSERSITE=1)"
 echo ""
 
 cd "$PROJECT_ROOT"

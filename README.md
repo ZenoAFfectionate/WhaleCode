@@ -54,8 +54,8 @@ CUDA_VISIBLE_DEVICES=1,2 vllm serve google/gemma-4-31B-it \
     --max-model-len=256000 \
     --gpu-memory-utilization 0.90 \
     --enable-prefix-caching \
-    --enable-auto-tool-choice \
     --reasoning-parser gemma4 \
+    --enable-auto-tool-choice \
     --tool-call-parser gemma4 \
     --async-scheduling
 
@@ -63,22 +63,18 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
     --enable-prefix-caching \
-    --enable-auto-tool-choice \
     --language-model-only \
     --reasoning-parser qwen3 \
-    --tool-call-parser qwen3_xml
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder
+
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --port 8000 \
+    --mem-fraction-static 0.9 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
-
-#### Tool Call Parser: `qwen3_xml` vs `qwen3_coder`
-
-When serving Qwen models with vLLM, you must choose the correct `--tool-call-parser` to match the model's native tool call output format:
-
-| Parser | Output Format | Designed For |
-|---|---|---|
-| `qwen3_xml` | `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` (JSON-in-XML) | Qwen3 base models (e.g. Qwen3-235B-A22B) |
-| `qwen3_coder` | `<function=name><parameter=...>` (pythonic string), multiple calls wrapped in `<function_calls>` | Qwen3-Coder / Qwen3.5 series |
-
-**Known issue with `qwen3_xml`**: When `tool_choice="auto"` and the model outputs mixed content (explanation text followed by a `<tool_call>` tag), the parser may fail to extract tool calls — they remain as raw text in the `content` field while `tool_calls` returns an empty array. Setting `tool_choice="required"` forces the model to emit a tool call immediately, which the parser handles correctly.
 
 ```bash
 python run_cli.py --workspace /working/space

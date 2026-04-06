@@ -61,61 +61,25 @@ class AIMEBenchmark(BenchmarkRunner):
 
     Workflow per task:
     1. Create a temp workspace.
-    2. Present the math problem and ask the agent to write a Python
-       program in ``solution.py`` that prints the final integer answer.
-    3. Execute ``solution.py`` in a sandbox.
-    4. Extract the last integer from stdout and compare with the
-       expected answer.
-    5. Record pass / fail.
+    2. Present the math problem and let the agent reason directly.
+    3. Optionally allow scratch exploration in the workspace.
+    4. Extract the final integer answer from the returned ``Finish`` answer.
+    5. Compare with the expected answer and record pass / fail.
     """
 
     benchmark_name = "aime"
 
     _AIME_ADDENDUM = """\
-You are a mathematical problem-solving agent. You solve competition-level math \
-problems (AIME) by combining careful mathematical reasoning with Python computation.
+You are solving AIME competition math problems.
 
-AIME answers are always integers from 000 to 999.
-
-# Core Principle: Think First, Code Second
-
-Before writing any code, you MUST reason carefully about the problem \
-mathematically. Identify the domain, key constraints, and a clear solution \
-strategy. Only then write code to execute your plan.
-
-# Workflow
-
-1. **Analyze** — Identify the mathematical domain (number theory, \
-combinatorics, geometry, algebra, probability) and outline your approach before using any tools. This is \
-the most important step.
-2. **Explore** (optional) — Use `Bash` with `python3 -c "..."` for quick \
-computations to test conjectures or verify small cases. Keep explorations focused \
-(at most 2-3 attempts).
-3. **Solve** — Write your solution in `solution.py`. The script must print exactly \
-one integer (the answer) as its only output. No debug prints.
-4. **Verify** — Run `python3 solution.py` via Bash. The output must be a single \
-integer in 0-999. If it is not, your approach is wrong — go back to step 1.
-5. **Respond** — After `solution.py` prints the correct integer, respond with the final answer in plain text. You MUST run `solution.py` before responding.
-
-# Strategy Guidelines
-
-- **Think before brute-forcing.** If values explode or computation is slow, switch \
-to a smarter approach (modular arithmetic, closed-form, generating functions).
-- **Verify on small cases first.** Before scaling up, check your formula works on \
-cases you can compute by hand.
-- **Sequences & Recurrences**: Look for periodicity or closed-form solutions. Use \
-modular arithmetic if values grow large.
-- **Counting**: Use inclusion-exclusion or generating functions for large cases. \
-Verify formula on small n first.
-- **Geometry**: Use coordinate geometry or sympy for exact symbolic computation.
-- **Number Theory**: Work modulo the target. Use CRT, Fermat's little theorem, or \
-sympy.ntheory.
-- **Sanity check**: AIME answers are 0-999. If your answer is outside this range, \
-your approach is fundamentally wrong. Do not force it — rethink.
-
-# Available Libraries
-
-sympy, math, fractions, itertools, functools, collections, numpy, decimal, cmath.
+AIME-specific rules:
+- The final answer is an integer from 000 to 999.
+- Solve by mathematical reasoning first.
+- For easier problems, it is fine to reason directly and call `Finish` without using any other tools.
+- If computation helps, prefer short `python3 -c "..."` commands through `Bash`.
+- You may use the workspace for scratch files if useful, but you do not need to create or edit `solution.py` or any other submission file.
+- When you are ready to submit, call `Finish` with the final answer only.
+- The `answer` value passed to `Finish` must contain just the final integer, with no explanation or extra text.
 """
 
     _MATH_SYSTEM_PROMPT = (
@@ -124,25 +88,9 @@ sympy, math, fractions, itertools, functools, collections, numpy, decimal, cmath
         + _AIME_ADDENDUM
     )
 
-    _SOLUTION_TEMPLATE = """\
-# AIME Solution — answer must be an integer from 0 to 999.
-# Write your solution below. Assign the final answer to `answer`.
-# The sanity check at the bottom will print it.
-
-answer = None  # Replace with your computed answer
-
-
-# --- Sanity check (do not remove) ---
-if answer is None:
-    raise ValueError("No answer computed — set the `answer` variable.")
-answer = int(answer)
-if not (0 <= answer <= 999):
-    raise ValueError(f"Answer {answer} is outside AIME range 0-999. Rethink your approach.")
-print(answer)
-"""
-
-    def __init__(self, *args, year: Optional[str] = None, **kwargs):
+    def __init__(self, *args, year: Optional[str] = None, max_submission_rounds: int = 3, **kwargs):
         self.year = _normalize_year(year)
+        self.max_submission_rounds = max(1, int(max_submission_rounds))
         super().__init__(*args, **kwargs)
         if self.year is None:
             self.year = _infer_year_from_path(self.data_path)
@@ -151,6 +99,27 @@ print(answer)
 
     def _get_system_prompt(self):
         return self._MATH_SYSTEM_PROMPT
+
+    @staticmethod
+    def _benchmark_agent_run_kwargs(run_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """AIME benefits from allowing direct answers without forcing tool calls every step."""
+        effective_kwargs = dict(run_kwargs or {})
+        effective_kwargs.setdefault("tool_choice", "auto")
+        return effective_kwargs
+
+    def _configure_agent_config(self, config: Any) -> Any:
+        config = super()._configure_agent_config(config)
+        config.skills_enabled = False
+        config.skills_auto_register = False
+        config.todowrite_enabled = False
+        return config
+
+    def _register_agent_tools(self, *, registry: Any, workspace: Path, agent: Any) -> None:
+        """AIME keeps the tool surface minimal to reduce workflow noise."""
+        from hello_agents.tools.builtin.bash import BashTool
+
+        ws = str(workspace)
+        registry.register_tool(BashTool(project_root=ws, working_dir=ws))
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
         prefix = f"AIME_{self.year}" if self.year else "AIME"
@@ -163,13 +132,29 @@ print(answer)
 
     @staticmethod
     def _extract_answer(output: str) -> Optional[int]:
-        """Extract the last integer printed by the solution."""
-        integers = re.findall(r"-?\d+", output)
-        if integers:
-            try:
-                return int(integers[-1])
-            except ValueError:
-                return None
+        """Extract the final AIME integer from the returned Finish answer."""
+        text = str(output or "").strip()
+        if not text:
+            return None
+
+        boxed_match = re.search(r"\\boxed\{(\d{1,3})\}", text)
+        if boxed_match:
+            return int(boxed_match.group(1))
+
+        strict_patterns = (
+            r"(?:final\s+answer\s*:\s*)?(\d{1,3})",
+            r"(?:the\s+answer\s+is\s+)?(\d{1,3})\.?",
+            r"answer\s*=\s*(\d{1,3})",
+        )
+        for pattern in strict_patterns:
+            match = re.fullmatch(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+
+        integers = re.findall(r"(?<!\d)(\d{1,3})(?!\d)", text)
+        unique_integers = list(dict.fromkeys(integers))
+        if len(unique_integers) == 1:
+            return int(unique_integers[0])
         return None
 
     def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -180,67 +165,66 @@ print(answer)
         workspace = self._make_workspace(f"aime_{task_id}_")
         agent = None
         agent_response = ""
-        agent_prompt = ""
+        prompt_history: List[str] = []
         result: Optional[Dict[str, Any]] = None
         try:
-            solution_file = workspace / "solution.py"
-            solution_file.write_text(self._SOLUTION_TEMPLATE, encoding="utf-8")
-
             agent = self._create_agent(workspace)
-            agent_prompt = (
+            initial_prompt = (
                 f"Solve this AIME problem. The answer is an integer from 0 to 999.\n\n"
                 f"**Problem:**\n{problem}\n\n"
                 f"**Instructions:**\n"
-                f"1. First, analyze the problem mathematically before using any tools. "
-                f"Identify the domain and plan your approach before writing any code.\n"
-                f"2. Optionally use `python3 -c \"...\"` via Bash to explore ideas "
-                f"(sympy, itertools, numpy are available). Keep this to 2-3 attempts.\n"
-                f"3. Edit `solution.py` — set the `answer` variable to your computed "
-                f"result. The template already handles printing and sanity checking.\n"
-                f"4. Run `python3 solution.py` via Bash. If it raises a ValueError, "
-                f"your answer is wrong — rethink your approach.\n"
-                f"5. Respond with your final answer in plain text.\n"
+                f"1. First solve it mathematically. For easier problems, you may answer directly.\n"
+                f"2. If computation helps, use short `python3 -c \"...\"` commands via Bash. "
+                f"You may use scratch files, but you do not need to create `solution.py`.\n"
+                f"3. When you are confident, call `Finish` with the final answer only.\n"
+                f"4. The `answer` passed to `Finish` must be a single integer from 0 to 999, with no explanation.\n"
             )
+            prompt_history.append(initial_prompt)
 
             start = time.time()
             agent_response, error_result = self._run_agent_prompt(
                 agent=agent,
                 task_id=task_id,
-                prompt_text=agent_prompt,
+                prompt_text=initial_prompt,
                 start_time=start,
-                error_extra={"expected": expected_answer, "actual": None},
+                error_extra={
+                    "expected": expected_answer,
+                    "actual": None,
+                    "validation_source": "finish_answer",
+                },
             )
             if error_result is not None:
                 result = error_result
                 return result
+
+            actual_answer = self._extract_answer(agent_response)
             elapsed = round(time.time() - start, 2)
 
-            if not solution_file.exists():
-                result = self._missing_output_result(
+            if actual_answer is None:
+                result = self._build_result(
                     task_id,
-                    path_label="solution.py",
-                    elapsed_s=elapsed,
+                    passed=False,
+                    error="Could not extract a final AIME integer from the Finish answer",
                     agent_response=agent_response,
-                    extra={"expected": expected_answer, "actual": None},
+                    elapsed_s=elapsed,
+                    extra={
+                        "expected": expected_answer,
+                        "actual": None,
+                        "validation_source": "finish_answer",
+                    },
                 )
                 return result
 
-            success, output = self._run_script_in_sandbox(
-                solution_file, cwd=workspace, timeout=self.timeout
-            )
-
-            actual_answer = self._extract_answer(output) if success else None
-            passed = actual_answer == expected_answer
-
             result = self._build_result(
                 task_id,
-                passed=passed,
-                error=output if not passed else None,
+                passed=actual_answer == expected_answer,
+                error=None if actual_answer == expected_answer else f"Wrong answer: expected {expected_answer}, got {actual_answer}",
                 agent_response=agent_response,
                 elapsed_s=elapsed,
                 extra={
                     "expected": expected_answer,
                     "actual": actual_answer,
+                    "validation_source": "finish_answer",
                 },
             )
             return result
@@ -249,10 +233,13 @@ print(answer)
                 task=task,
                 workspace=workspace,
                 agent=agent,
-                prompt_texts=[agent_prompt] if agent_prompt else [],
+                prompt_texts=prompt_history,
                 result=result,
-                artifact_paths=["solution.py"],
-                extra={"expected_answer": expected_answer},
+                artifact_paths=None,
+                extra={
+                    "expected_answer": expected_answer,
+                    "submission_mode": "finish_answer_only",
+                },
             )
             shutil.rmtree(workspace, ignore_errors=True)
 
@@ -277,6 +264,7 @@ def main():
         default_max_steps=128,
         default_timeout=120,
         timeout_help="Longer timeout for math computations",
+        include_task_timeout=True,
     )
     args = parser.parse_args()
 
@@ -295,6 +283,7 @@ def main():
         temperature=args.temperature,
         max_steps=args.max_steps,
         timeout=args.timeout,
+        task_timeout=args.task_timeout,
         trajectory_dir=args.trajectory_dir,
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)

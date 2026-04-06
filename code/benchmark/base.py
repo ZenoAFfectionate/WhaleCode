@@ -9,16 +9,15 @@ import multiprocessing as mp
 import os
 import queue
 import re
-import subprocess
 import sys
 import tempfile
 import time
 import traceback
-import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -43,558 +42,67 @@ def _bootstrap_package() -> None:
 
 _bootstrap_package()
 CodeAgent = importlib.import_module("hello_agents.agents.code_agent").CodeAgent
+Message = importlib.import_module("hello_agents.core.message").Message
 
 try:
-    from rich.align import Align
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
-
-    _RICH_AVAILABLE = True
-except Exception:
-    Align = None
-    Console = None
-    Group = None
-    Live = None
-    Panel = None
-    Text = None
-    _RICH_AVAILABLE = False
+    from ._utils import (
+        BenchmarkProgressManager,
+        _clip_text,
+        _display_width,
+        _json_safe,
+        _json_safe_full,
+        build_benchmark_system_prompt as _build_benchmark_system_prompt,
+        build_minimal_child_env,
+        build_progress_update as _build_progress_update,
+        build_trajectory_payload as _build_trajectory_payload,
+        build_trajectory_readme as _build_trajectory_readme,
+        describe_progress_update as _describe_progress_update,
+        load_completed_ids as _load_completed_ids,
+        load_result_records as _load_result_records,
+        latest_result_records as _latest_result_records,
+        progress_updates_to_events as _progress_updates_to_events,
+        summarize_result_records as _summarize_result_records,
+        trajectory_dir_for_task as _trajectory_dir_for_task,
+        truncate_feedback,
+        upsert_result_record as _upsert_result_record,
+        write_result_records as _write_result_records,
+    )
+except ImportError:
+    from _utils import (
+        BenchmarkProgressManager,
+        _clip_text,
+        _display_width,
+        _json_safe,
+        _json_safe_full,
+        build_benchmark_system_prompt as _build_benchmark_system_prompt,
+        build_minimal_child_env,
+        build_progress_update as _build_progress_update,
+        build_trajectory_payload as _build_trajectory_payload,
+        build_trajectory_readme as _build_trajectory_readme,
+        describe_progress_update as _describe_progress_update,
+        load_completed_ids as _load_completed_ids,
+        load_result_records as _load_result_records,
+        latest_result_records as _latest_result_records,
+        progress_updates_to_events as _progress_updates_to_events,
+        summarize_result_records as _summarize_result_records,
+        trajectory_dir_for_task as _trajectory_dir_for_task,
+        truncate_feedback,
+        upsert_result_record as _upsert_result_record,
+        write_result_records as _write_result_records,
+    )
 
 
 _DEFAULT_RESULTS_DIR = _PROJECT_ROOT / "data" / "_results"
 _DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "data" / "_trajectory"
-_MINIMAL_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
-
-
-def _safe_name(value: Any) -> str:
-    text = str(value or "").strip()
-    text = re.sub(r"[^\w.\-]+", "_", text)
-    return text.strip("._") or "task"
-
-
-def _clip_text(value: Any, limit: int = 240) -> str:
-    text = str(value or "")
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)].rstrip() + "..."
-
-
-def _char_width(ch: str) -> int:
-    """Return the display width of a single character (1 or 2)."""
-    eaw = unicodedata.east_asian_width(ch)
-    return 2 if eaw in ("W", "F") else 1
-
-
-def _display_width(text: str) -> int:
-    """Return the total display width of *text* accounting for wide characters."""
-    return sum(_char_width(ch) for ch in text)
-
-
-def _clip_display(text: str, width: int) -> str:
-    """Clip *text* so that its display width does not exceed *width*.
-
-    If clipping is needed, the last 3 display columns are replaced with ``...``.
-    """
-    if _display_width(text) <= width:
-        return text
-    out: list[str] = []
-    used = 0
-    for ch in text:
-        cw = _char_width(ch)
-        if used + cw > width - 3:
-            break
-        out.append(ch)
-        used += cw
-    return "".join(out).rstrip() + "..."
-
-
-def _ljust_display(text: str, width: int, fillchar: str = " ") -> str:
-    """Left-justify *text* to *width* display columns using *fillchar*."""
-    pad = max(0, width - _display_width(text))
-    return text + fillchar * pad
-
-
-def _json_safe(value: Any, *, max_depth: int = 4, max_items: int = 40, max_string: int = 12000) -> Any:
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, str):
-        return _clip_text(value, max_string)
-    if max_depth <= 0:
-        return _clip_text(repr(value), max_string)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        items = list(value.items())[:max_items]
-        data = {
-            str(key): _json_safe(val, max_depth=max_depth - 1, max_items=max_items, max_string=max_string)
-            for key, val in items
-        }
-        if len(value) > max_items:
-            data["__truncated__"] = f"{len(value) - max_items} additional item(s)"
-        return data
-    if isinstance(value, (list, tuple, set)):
-        seq = list(value)
-        data = [
-            _json_safe(item, max_depth=max_depth - 1, max_items=max_items, max_string=max_string)
-            for item in seq[:max_items]
-        ]
-        if len(seq) > max_items:
-            data.append(f"... {len(seq) - max_items} additional item(s)")
-        return data
-    return _clip_text(repr(value), max_string)
-
-
-def _read_text_if_exists(path: Path, limit: int = 80000) -> Optional[str]:
-    if not path.exists() or not path.is_file():
-        return None
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-    return _clip_text(content, limit)
-
-
-def _human_elapsed(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes}:{seconds:02d}"
-
-
-def build_minimal_child_env() -> Dict[str, str]:
-    """Return a small, stable child-process environment for benchmark evaluators."""
-    env = {key: os.environ[key] for key in _MINIMAL_CHILD_ENV_KEYS if key in os.environ}
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONNOUSERSITE"] = "1"
-    return env
-
-
-def truncate_feedback(
-    text: str,
-    *,
-    max_lines: int,
-    max_chars: int,
-    marker: str = "[feedback truncated]",
-) -> str:
-    """Bound feedback size while preserving the leading diagnostic context."""
-    if not text:
-        return text
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + [marker]
-    clipped = "\n".join(lines)
-    if len(clipped) > max_chars:
-        clipped = clipped[:max_chars].rstrip() + f"\n{marker}"
-    return clipped
-
-
-class BenchmarkProgressManager:
-    """Render batch-level progress without streaming full trajectories."""
-
-    def __init__(self, benchmark_name: str, total: int):
-        self.benchmark_name = benchmark_name
-        self.total = max(int(total), 0)
-        self.started_at = time.time()
-        self.current_started_at = time.time()
-        self.completed = 0
-        self.skipped = 0
-        self.passed = 0
-        self.failed = 0
-        self.unfinished = 0
-        self.current_index = 0
-        self.current_task_id = ""
-        self.current_step = 0
-        self.current_status = "Idle"
-        self.current_detail = ""
-        self._last_render = 0.0
-        self._fallback_lines = 0
-        self._live = None
-        self._use_rich = bool(_RICH_AVAILABLE)
-        self._console = Console(stderr=True) if self._use_rich else None
-        self._ansi = bool(sys.stdout.isatty())
-        self._mode = str(os.getenv("WHALE_BENCH_PROGRESS_MODE", "live") or "live").strip().lower()
-        self._append_mode = self._mode in {"append", "static", "copyable"}
-        self._status_counts: Dict[str, int] = {}
-        self._recent_instances: Dict[str, List[str]] = {}
-
-    def start(self) -> None:
-        if self._use_rich and not self._append_mode:
-            self._live = Live(
-                self._renderable(),
-                refresh_per_second=6,
-                transient=False,
-                console=self._console,
-            )
-            self._live.start()
-            self._refresh(force=True)
-            return
-        self._render_fallback(force=True)
-
-    def begin_task(self, index: int, task_id: str) -> None:
-        self.current_index = index
-        self.current_task_id = str(task_id)
-        self.current_step = 0
-        self.current_status = "Running"
-        self.current_detail = "starting"
-        self.current_started_at = time.time()
-        self._refresh(force=True)
-
-    def update(self, *, step: Optional[int] = None, status: Optional[str] = None, detail: Optional[str] = None) -> None:
-        if step is not None:
-            self.current_step = max(self.current_step, int(step))
-        if status:
-            self.current_status = status
-        if detail is not None:
-            self.current_detail = detail
-        self._refresh()
-
-    def skip_task(self, index: int, task_id: str) -> None:
-        self.current_index = index
-        self.current_task_id = str(task_id)
-        self.current_step = 0
-        self.current_status = "Skip"
-        self.current_detail = "already completed"
-        self.skipped += 1
-        self.completed += 1
-        self._refresh(force=True)
-
-    def finish_task(self, result: Dict[str, Any]) -> None:
-        self.completed += 1
-        passed = result.get("passed")
-        if passed is True:
-            self.passed += 1
-            self.current_status = "Pass"
-        elif passed is False:
-            self.failed += 1
-            self.current_status = "Fail"
-        else:
-            self.unfinished += 1
-            self.current_status = "Pending"
-        self.current_detail = _clip_display(result.get("error") or result.get("exit_status") or "done", 80)
-        self._record_status(result.get("task_id", self.current_task_id), self._result_label(result))
-        self._refresh(force=True)
-
-    def close(self) -> None:
-        if self._live is not None:
-            self._refresh(force=True)
-            self._live.stop()
-            self._live = None
-        elif self._ansi and self._fallback_lines:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self._fallback_lines = 0
-
-    def _refresh(self, force: bool = False) -> None:
-        now = time.time()
-        min_interval = 2.0 if self._append_mode else 0.12
-        if not force and now - self._last_render < min_interval:
-            return
-        self._last_render = now
-        if self._live is not None:
-            self._live.update(self._renderable(), refresh=True)
-        elif self._use_rich and self._append_mode:
-            self._console.print(self._renderable())
-        else:
-            self._render_fallback(force=force)
-
-    def _renderable(self):
-        width = self._target_width()
-        content_w = self._content_width()
-        header = Group(
-            Text(
-                _clip_display(f"Benchmark  {self.benchmark_name}", content_w),
-                style="bold white",
-                no_wrap=True,
-                overflow="ellipsis",
-            ),
-            Text(
-                _clip_display(
-                    (
-                        f"Completed  {self.completed}/{self.total}    "
-                        f"Elapsed  {_human_elapsed(time.time() - self.started_at)}"
-                    ),
-                    content_w,
-                ),
-                style="bold bright_blue",
-                no_wrap=True,
-                overflow="ellipsis",
-            ),
-            Text(self._counts_line(), style="dim", no_wrap=True, overflow="ellipsis"),
-        )
-        progress_panel = Panel(
-            Group(
-                Text(self._progress_line(), style="bold bright_blue", no_wrap=True, overflow="ellipsis"),
-                Text(self._timing_line(), style="dim", no_wrap=True, overflow="ellipsis"),
-                Text(self._status_line(), style="bold white", no_wrap=True, overflow="ellipsis"),
-            ),
-            title=f" {self._progress_panel_title()} ",
-            title_align="left",
-            border_style="cyan",
-            padding=(0, 1),
-            width=width,
-        )
-        return Group(
-            Panel(
-                header,
-                title=f" {self._header_panel_title()} ",
-                title_align="left",
-                border_style="bright_blue",
-                padding=(0, 1),
-                width=width,
-            ),
-            progress_panel,
-            Panel(
-                self._status_table(),
-                title=f" {self._outcomes_panel_title()} ",
-                title_align="left",
-                border_style="blue",
-                padding=(0, 1),
-                width=width,
-            ),
-        )
-
-    def _render_fallback(self, force: bool = False) -> None:
-        lines = self._fallback_panels()
-        if self._ansi and not self._append_mode:
-            # Calculate actual visible lines accounting for potential wrapping
-            try:
-                term_cols = os.get_terminal_size().columns
-            except OSError:
-                term_cols = 120
-            if self._fallback_lines:
-                sys.stdout.write("\r")
-                for idx in range(self._fallback_lines):
-                    sys.stdout.write("\x1b[2K")
-                    if idx < self._fallback_lines - 1:
-                        sys.stdout.write("\x1b[1A")
-                sys.stdout.write("\r")
-            # Count visible lines: each line may wrap if wider than terminal
-            visible_count = 0
-            for line in lines:
-                dw = _display_width(line)
-                visible_count += max(1, -(-dw // term_cols))  # ceiling division
-            sys.stdout.write("\n".join(lines))
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self._fallback_lines = visible_count
-            return
-        if force:
-            print("\n".join(lines))
-
-    def _status_line(self) -> str:
-        inner = self._content_width()
-        step_label = f"Step {self.current_step}" if self.current_step else "Init"
-        task_elapsed = _human_elapsed(time.time() - self.current_started_at)
-        prefix = f"[{self.current_index}/{self.total}] "
-        middle = f" | {step_label} | "
-        suffix = f" ({task_elapsed})"
-        fixed_len = _display_width(prefix) + _display_width(middle) + _display_width(suffix)
-        remaining = max(0, inner - fixed_len)
-        task_budget = min(30, max(0, remaining // 2))
-        detail_budget = max(0, remaining - task_budget)
-        task_label = _clip_display(self.current_task_id or "-", task_budget) if task_budget > 0 else ""
-        detail = _clip_display(self.current_detail or self.current_status, detail_budget) if detail_budget > 0 else ""
-        line = f"{prefix}{task_label}{middle}{detail}{suffix}"
-        return _clip_display(line, inner)
-
-    def _counts_line(self) -> str:
-        if self._is_compact_layout():
-            line = (
-                f"Pass {self.passed}   Fail {self.failed}   "
-                f"Pend {self.unfinished}   Skip {self.skipped}"
-            )
-        else:
-            line = (
-                f"Passed {self.passed}   Failed {self.failed}   "
-                f"Pending {self.unfinished}   Skipped {self.skipped}"
-            )
-        return _clip_display(line, self._content_width())
-
-    def _progress_line(self) -> str:
-        inner = self._content_width()
-        total = max(self.total, 1)
-        percent = self.completed / total
-        prefix = "Progress " if self._is_compact_layout() else "Overall Progress "
-        suffix = f" {self.completed}/{self.total} {percent * 100:>3.0f}%"
-        bar_width = max(10, inner - _display_width(prefix) - _display_width(suffix) - 2)
-        filled = min(bar_width, max(0, int(round(bar_width * percent))))
-        bar = ("█" * filled) + ("░" * (bar_width - filled))
-        return _clip_display(f"{prefix}[{bar}]{suffix}", inner)
-
-    def _timing_line(self) -> str:
-        elapsed_s = max(0.0, time.time() - self.started_at)
-        if self.completed <= 0:
-            eta = "--:--"
-        else:
-            remaining = max(0, self.total - self.completed)
-            avg = elapsed_s / max(self.completed, 1)
-            eta = _human_elapsed(avg * remaining)
-        return _clip_display(
-            f"Elapsed {_human_elapsed(elapsed_s)}   ETA {eta}",
-            self._content_width(),
-        )
-
-    def _result_label(self, result: Dict[str, Any]) -> str:
-        exit_status = str(result.get("exit_status") or "").strip().lower()
-        if result.get("timeout") or "timeout" in exit_status:
-            return "Timeout"
-
-        if result.get("passed") is True:
-            return "Passed"
-
-        if result.get("has_diff"):
-            return "Passed"
-
-        if exit_status in {"completed", "submitted"}:
-            return "Passed"
-
-        error_text = str(result.get("error") or "").strip().lower()
-        if error_text:
-            if "timeout" in error_text:
-                return "Timeout"
-        return "Error"
-
-    def _record_status(self, task_id: Any, status: str) -> None:
-        label = str(status or "Unknown")
-        tid = str(task_id or self.current_task_id or "-")
-        self._status_counts[label] = self._status_counts.get(label, 0) + 1
-        recent = self._recent_instances.setdefault(label, [])
-        if tid in recent:
-            recent.remove(tid)
-        recent.insert(0, tid)
-        del recent[3:]
-
-    def _status_table(self):
-        if not self._status_counts:
-            return Text("No completed items yet.", style="dim", no_wrap=True)
-
-        lines = [Text(self._status_header_line(), style="bold cyan", no_wrap=True, overflow="ellipsis")]
-        for label, count, recent in self._status_rows():
-            lines.append(Text(self._status_row_line(label, count, recent), style="white", no_wrap=True, overflow="ellipsis"))
-        return Group(*lines)
-
-    def _status_rows(self) -> List[tuple[str, int, str]]:
-        rows: List[tuple[str, int, str]] = []
-        items = sorted(self._status_counts.items(), key=lambda item: (-item[1], item[0]))
-        for label, count in items[:6]:
-            recent = ", ".join(self._recent_instances.get(label, []))
-            rows.append((label, count, _clip_display(recent, self._recent_text_width())))
-        return rows
-
-    def _fallback_panels(self) -> List[str]:
-        width = self._target_width()
-        left_pad = ""
-
-        def panel(title: str, body_lines: List[str]) -> List[str]:
-            inner_width = max(20, width - 4)
-            title_text = f" {title} "
-            # Build top border: ┌ title ──...──┐  total display width = width
-            top_content = f"┌{title_text}"
-            top_fill = max(0, width - _display_width(top_content) - 1)
-            title_segment = top_content + ("─" * top_fill) + "┐"
-            lines = [left_pad + title_segment]
-            for line in body_lines:
-                clipped = _clip_display(line, inner_width)
-                padded = _ljust_display(clipped, inner_width)
-                lines.append(left_pad + f"│ {padded} │")
-            lines.append(left_pad + "└" + ("─" * (width - 2)) + "┘")
-            return lines
-
-        rows = self._status_rows()
-        if rows:
-            status_lines = [self._status_header_line()] + [
-                self._status_row_line(label, count, recent)
-                for label, count, recent in rows
-            ]
-        else:
-            status_lines = ["No completed items yet."]
-
-        header_lines = [
-            f"Benchmark  {self.benchmark_name}",
-            (
-                f"Completed  {self.completed}/{self.total}    "
-                f"Pass {self.passed}    Fail {self.failed}    "
-                f"{'Pend' if self._is_compact_layout() else 'Pending'} {self.unfinished}    "
-                f"Skip {self.skipped}"
-            ),
-        ]
-        progress_lines = [
-            self._progress_line(),
-            self._timing_line(),
-            self._status_line(),
-        ]
-        return (
-            panel(self._header_panel_title(), header_lines)
-            + panel(self._progress_panel_title(), progress_lines)
-            + panel(self._outcomes_panel_title(), status_lines)
-        )
-
-    def _terminal_width(self) -> int:
-        try:
-            if self._console is not None:
-                return int(self._console.size.width)
-            return os.get_terminal_size().columns
-        except OSError:
-            return 120
-
-    def _target_width(self, terminal_width: Optional[int] = None) -> int:
-        columns = max(60, int(terminal_width or self._terminal_width()))
-        # Leave extra gutter so titled box-drawing borders don't sit exactly on the
-        # terminal edge. This avoids wrap artifacts on narrower terminals.
-        gutter = 4 if columns <= 100 else 6
-        usable = max(58, columns - gutter)
-        if columns <= 90:
-            return usable
-        return max(72, min(usable, int(columns * 0.82)))
-
-    def _content_width(self) -> int:
-        return max(24, self._target_width() - 4)
-
-    def _recent_text_width(self) -> int:
-        status_width, count_width = self._status_column_widths()
-        reserved = status_width + count_width + 4
-        return max(12, self._content_width() - reserved)
-
-    def _is_compact_layout(self) -> bool:
-        return self._terminal_width() <= 88
-
-    def _header_panel_title(self) -> str:
-        return self.benchmark_name
-
-    def _progress_panel_title(self) -> str:
-        return "Progress"
-
-    def _outcomes_panel_title(self) -> str:
-        return "Outcomes" if self._is_compact_layout() else "Recent Outcomes"
-
-    def _status_column_widths(self) -> tuple[int, int]:
-        if self._is_compact_layout():
-            return 11, 4
-        return 14, 5
-
-    def _status_header_line(self) -> str:
-        status_width, count_width = self._status_column_widths()
-        recent_width = self._recent_text_width()
-        return (
-            _ljust_display("Status", status_width)
-            + " "
-            + f"{'Cnt' if self._is_compact_layout() else 'Count':>{count_width}}  "
-            + _ljust_display(_clip_display("Recent", recent_width), recent_width)
-        )
-
-    def _status_row_line(self, label: str, count: int, recent: str) -> str:
-        status_width, count_width = self._status_column_widths()
-        recent_width = self._recent_text_width()
-        clipped_label = _clip_display(label, status_width)
-        return (
-            _ljust_display(clipped_label, status_width)
-            + f" {count:>{count_width}}  "
-            + _ljust_display(_clip_display(recent, recent_width), recent_width)
-        )
+__all__ = [
+    "BENCHMARK_BASE_SYSTEM_PROMPT",
+    "BenchmarkCodeAgent",
+    "BenchmarkProgressManager",
+    "BenchmarkRunner",
+    "_display_width",
+    "build_minimal_child_env",
+    "truncate_feedback",
+]
 
 
 class BenchmarkCodeAgent(CodeAgent):
@@ -610,17 +118,26 @@ class BenchmarkCodeAgent(CodeAgent):
         self.task_id = task_id
         self._event_sink = event_sink
         self.benchmark_events: List[Dict[str, Any]] = []
+        self._benchmark_required_tool_choice = False
+        self._benchmark_protocol_errors = 0
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _contains_embedded_tool_markup(text: Optional[str]) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r"<tool_call>|<function=[^>]+>|<parameter=", text))
 
     def _console(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
         return
 
     def _render_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        full_payload = _json_safe_full(payload)
         safe_payload = _json_safe(payload, max_string=2000)
         event_record = {
             "timestamp": datetime.now().isoformat(),
             "event_type": event_type,
-            "payload": safe_payload,
+            "payload": full_payload,
         }
         self.benchmark_events.append(event_record)
         if self._event_sink is not None:
@@ -628,6 +145,77 @@ class BenchmarkCodeAgent(CodeAgent):
                 self._event_sink(event_type, safe_payload)
             except Exception:
                 pass
+
+    def run(self, input_text: str, **kwargs) -> str:
+        tool_choice = kwargs.get("tool_choice")
+        self._benchmark_required_tool_choice = tool_choice == "required"
+        self._benchmark_protocol_errors = 0
+        try:
+            return super().run(input_text, **kwargs)
+        finally:
+            self._benchmark_required_tool_choice = False
+
+    def _resolve_no_tool_call_response(
+        self,
+        response_message: Any,
+        text_content: str,
+        *,
+        structured_output: Optional[Any] = None,
+        fallback_text: str = "",
+        reasoning_content: Optional[str] = None,
+        reasoning_source: Optional[str] = None,
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        if self._benchmark_required_tool_choice and structured_output is None:
+            self._benchmark_protocol_errors += 1
+            reasoning_has_tool_markup = self._contains_embedded_tool_markup(reasoning_content)
+            response_unfinished = self._response_unfinished_flag(response_message)
+
+            self._render_event(
+                "protocol_error",
+                {
+                    "task_id": self.task_id,
+                    "retry_count": self._benchmark_protocol_errors,
+                    "error": "tool_choice='required' but assistant returned no structured tool_calls",
+                    "text_content_length": len(text_content or ""),
+                    "reasoning_content_length": len(reasoning_content or ""),
+                    "reasoning_contains_tool_markup": reasoning_has_tool_markup,
+                    "response_unfinished": response_unfinished,
+                    "reasoning_source": reasoning_source,
+                    "text_content": _clip_text(text_content, 400),
+                    "reasoning_excerpt": _clip_text(reasoning_content, 600),
+                },
+            )
+
+            feedback_lines = [
+                "Protocol error: the previous assistant response did not contain any structured tool_calls.",
+                "The benchmark is running with tool_choice='required'.",
+            ]
+            if reasoning_has_tool_markup:
+                feedback_lines.append(
+                    "Do not place tool-call markup inside the reasoning field. Emit a real tool_calls response instead."
+                )
+            elif text_content.strip():
+                feedback_lines.append(
+                    "Do not answer in plain text at this step. Emit a real tool_calls response instead."
+                )
+            feedback_lines.append(
+                "Retry now and return exactly one valid structured tool call."
+            )
+
+            self._append_history_message(
+                Message("\n".join(feedback_lines), "user"),
+                allow_compact=False,
+            )
+            return True, None, "protocol_error"
+
+        return super()._resolve_no_tool_call_response(
+            response_message,
+            text_content,
+            structured_output=structured_output,
+            fallback_text=fallback_text,
+            reasoning_content=reasoning_content,
+            reasoning_source=reasoning_source,
+        )
 
 
 def _evaluate_task_in_subprocess(
@@ -652,54 +240,8 @@ def _evaluate_task_in_subprocess(
     finally:
         runner._bind_progress_queue(None, None)
 
-def _remove_markdown_section(text: str, heading: str) -> str:
-    """Remove a markdown section (heading + body) from *text*.
 
-    Matches ``## <heading>`` through to the next same-level heading or EOF.
-    """
-    pattern = rf"(^|\n)(##\s+\d+\.\s+)?{re.escape(heading)}.*?(?=\n## |\Z)"
-    return re.sub(pattern, "", text, flags=re.DOTALL).strip()
-
-
-def _build_benchmark_system_prompt() -> str:
-    """Derive benchmark system prompt from the canonical *system_prompt.md*.
-
-    Removes:
-    - AskUser tool definition (### User Interaction block)
-    - Web tool definitions (### Web block)
-    - Any mention of AskUser / WebSearch / WebFetch in surrounding text
-    """
-    prompt_file = _PROJECT_ROOT / "prompts" / "system_prompt.md"
-    text = prompt_file.read_text(encoding="utf-8")
-
-    # Remove "### User Interaction" section (heading + body until next ###/## or EOF)
-    text = re.sub(
-        r"\n### User Interaction\n.*?(?=\n###|\n##|\Z)",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-
-    # Remove "### Web" section
-    text = re.sub(
-        r"\n### Web\n.*?(?=\n###|\n##|\Z)",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-
-    # Remove stray references to AskUser / WebSearch / WebFetch
-    text = re.sub(r"- \*\*AskUser\*\*.*\n", "", text)
-    text = re.sub(r"- \*\*WebSearch\*\*.*\n", "", text)
-    text = re.sub(r"- \*\*WebFetch\*\*.*\n", "", text)
-
-    # Clean up multiple blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip() + "\n"
-
-
-BENCHMARK_BASE_SYSTEM_PROMPT: str = _build_benchmark_system_prompt()
+BENCHMARK_BASE_SYSTEM_PROMPT: str = _build_benchmark_system_prompt(_PROJECT_ROOT)
 
 
 class BenchmarkRunner(ABC):
@@ -818,6 +360,19 @@ class BenchmarkRunner(ABC):
             result.update(extra)
         return result
 
+    @staticmethod
+    def _benchmark_agent_run_kwargs(run_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Default benchmark agent settings.
+
+        Benchmarks now rely on explicit tool calls plus ``Finish`` to terminate.
+        Using ``tool_choice="required"`` prevents the model from "thinking about"
+        a tool call in plain text or reasoning metadata and then being treated as
+        a completed no-tool response by the ReAct loop.
+        """
+        effective_kwargs = dict(run_kwargs or {})
+        effective_kwargs.setdefault("tool_choice", "required")
+        return effective_kwargs
+
     def _run_agent_prompt(
         self,
         *,
@@ -829,7 +384,7 @@ class BenchmarkRunner(ABC):
         error_extra: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         try:
-            effective_kwargs = dict(run_kwargs or {})
+            effective_kwargs = self._benchmark_agent_run_kwargs(run_kwargs)
             if effective_kwargs:
                 run_signature = inspect.signature(agent.run)
                 accepts_var_kwargs = any(
@@ -842,7 +397,12 @@ class BenchmarkRunner(ABC):
                         for key, value in effective_kwargs.items()
                         if key in run_signature.parameters
                     }
-            return agent.run(prompt_text, **effective_kwargs), None
+            agent_response = agent.run(prompt_text, **effective_kwargs)
+            if agent_response is None:
+                normalized_response = ""
+            else:
+                normalized_response = str(agent_response).strip()
+            return normalized_response, None
         except Exception as exc:
             return "", self._build_result(
                 task_id,
@@ -872,10 +432,39 @@ class BenchmarkRunner(ABC):
             extra=extra,
         )
 
-    def _create_agent(self, workspace: Path) -> CodeAgent:
-        """Create a fresh CodeAgent with coding tools only (no web tools)."""
-        from hello_agents.core.config import Config
-        from hello_agents.core.llm import HelloAgentsLLM
+    def _build_llm_kwargs(self) -> Dict[str, Any]:
+        llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
+        if self.model:
+            llm_kwargs["model"] = self.model
+        if self.base_url:
+            llm_kwargs["base_url"] = self.base_url
+        if self.api_key:
+            llm_kwargs["api_key"] = self.api_key
+        return llm_kwargs
+
+    def _configure_agent_config(self, config: Any) -> Any:
+        config.trace_enabled = False
+        return config
+
+    def _build_agent(self, *, workspace: Path, registry: Any, config: Any, llm: Any) -> BenchmarkCodeAgent:
+        task_id = self._current_task_id or workspace.name
+        return BenchmarkCodeAgent(
+            name="bench-agent",
+            llm=llm,
+            tool_registry=registry,
+            project_root=str(workspace),
+            working_dir=str(workspace),
+            config=config,
+            max_steps=self.max_steps,
+            register_default_tools=False,
+            enable_task_tool=False,
+            interactive=False,
+            system_prompt=self._get_system_prompt() or BENCHMARK_BASE_SYSTEM_PROMPT,
+            task_id=task_id,
+            event_sink=lambda event_type, payload: self._emit_progress_event(task_id, event_type, payload),
+        )
+
+    def _register_agent_tools(self, *, registry: Any, workspace: Path, agent: BenchmarkCodeAgent) -> None:
         from hello_agents.tools.builtin.bash import BashTool
         from hello_agents.tools.builtin.file_tools import (
             DeleteTool,
@@ -887,37 +476,6 @@ class BenchmarkRunner(ABC):
         from hello_agents.tools.builtin.glob_tool import GlobTool
         from hello_agents.tools.builtin.grep_tool import GrepTool
         from hello_agents.tools.builtin.todowrite_tool import TodoWriteTool
-        from hello_agents.tools.registry import ToolRegistry
-
-        llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
-        if self.model:
-            llm_kwargs["model"] = self.model
-        if self.base_url:
-            llm_kwargs["base_url"] = self.base_url
-        if self.api_key:
-            llm_kwargs["api_key"] = self.api_key
-
-        config = Config.from_env()
-        config.trace_enabled = False
-        llm = HelloAgentsLLM(**llm_kwargs)
-        registry = ToolRegistry(config=config, verbose=False)
-
-        task_id = self._current_task_id or workspace.name
-        agent = BenchmarkCodeAgent(
-            name="bench-agent",
-            llm=llm,
-            tool_registry=registry,
-            project_root=str(workspace),
-            working_dir=str(workspace),
-            config=config,
-            max_steps=self.max_steps,
-            register_default_tools=False,  # We register manually below
-            enable_task_tool=False,
-            interactive=False,
-            system_prompt=self._get_system_prompt() or BENCHMARK_BASE_SYSTEM_PROMPT,
-            task_id=task_id,
-            event_sink=lambda event_type, payload: self._emit_progress_event(task_id, event_type, payload),
-        )
 
         ws = str(workspace)
         registry.register_tool(ListFilesTool(project_root=ws, working_dir=ws, registry=registry))
@@ -928,17 +486,29 @@ class BenchmarkRunner(ABC):
         registry.register_tool(DeleteTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(EditTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(BashTool(project_root=ws, working_dir=ws))
+
         # Persist session todo state outside the repo to avoid diff pollution.
-        _bench_task_dir = Path(tempfile.gettempdir()) / "whale_bench_tasks" / uuid.uuid4().hex[:8]
-        _bench_task_dir.mkdir(parents=True, exist_ok=True)
+        todo_dir = Path(tempfile.gettempdir()) / "whale_bench_tasks" / uuid.uuid4().hex[:8]
+        todo_dir.mkdir(parents=True, exist_ok=True)
         registry.register_tool(
             TodoWriteTool(
                 project_root=ws,
-                persistence_dir=str(_bench_task_dir),
+                persistence_dir=str(todo_dir),
                 session_id=agent.session_id,
             )
         )
 
+    def _create_agent(self, workspace: Path) -> CodeAgent:
+        """Create a fresh CodeAgent with coding tools only (no web tools)."""
+        from hello_agents.core.config import Config
+        from hello_agents.core.llm import HelloAgentsLLM
+        from hello_agents.tools.registry import ToolRegistry
+
+        config = self._configure_agent_config(Config.from_env())
+        llm = HelloAgentsLLM(**self._build_llm_kwargs())
+        registry = ToolRegistry(config=config, verbose=False)
+        agent = self._build_agent(workspace=workspace, registry=registry, config=config, llm=llm)
+        self._register_agent_tools(registry=registry, workspace=workspace, agent=agent)
         return agent
 
     def _bind_progress_queue(self, task_id: Optional[str], progress_queue: Any) -> None:
@@ -946,11 +516,7 @@ class BenchmarkRunner(ABC):
         self._progress_queue = progress_queue
 
     def _emit_progress_event(self, task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
-        update = {
-            "task_id": str(task_id),
-            "event_type": event_type,
-            "payload": _json_safe(payload, max_string=1000),
-        }
+        update = _build_progress_update(task_id, event_type, payload)
         if self._progress_queue is not None:
             try:
                 self._progress_queue.put_nowait(update)
@@ -962,53 +528,7 @@ class BenchmarkRunner(ABC):
     def _handle_progress_update(self, update: Dict[str, Any]) -> None:
         if self._progress_manager is None:
             return
-        payload = update.get("payload") or {}
-        step = payload.get("step")
-        event_type = str(update.get("event_type") or "")
-
-        detail = None
-        status = None
-        if event_type == "agent_start":
-            status = "Running"
-            detail = "Agent init"
-        elif event_type == "step_start":
-            status = "Running"
-            detail = "Thinking"
-        elif event_type in {"tool_call", "control_tool", "builtin_tool"}:
-            tool_name = payload.get("tool_name") or event_type
-            status = "Running"
-            detail = tool_name
-            if tool_name == "Bash":
-                command = ((payload.get("arguments") or {}).get("command") or "").strip()
-                if command:
-                    detail = f"Bash: {_clip_display(command, 56)}"
-        elif event_type == "tool_result":
-            tool_name = payload.get("tool_name") or "tool"
-            tool_status = payload.get("status") or "success"
-            status = "Running" if tool_status == "success" else "Error"
-            detail = tool_name if tool_status == "success" else f"{tool_name}: error"
-        elif event_type == "final_answer":
-            status = "Completing"
-            detail = "Final answer"
-        elif event_type == "timeout":
-            status = "Timeout"
-            detail = "Step limit reached"
-        elif event_type == "stagnation_detected":
-            status = "Stalled"
-            detail = payload.get("reason") or "Stagnation detected"
-        elif event_type == "llm_error":
-            status = "Error"
-            detail = payload.get("error") or "LLM error"
-        elif event_type == "agent_error":
-            status = "Error"
-            detail = payload.get("message") or "Agent error"
-        elif event_type == "background_update":
-            status = "Running"
-            detail = "Background update"
-        elif event_type == "compaction_notice":
-            status = "Running"
-            detail = "compacting context"
-
+        step, status, detail = _describe_progress_update(update)
         if detail is not None or status is not None or step is not None:
             self._progress_manager.update(step=step, status=status, detail=detail)
 
@@ -1022,189 +542,32 @@ class BenchmarkRunner(ABC):
                 break
             self._handle_progress_update(update)
 
-    # ------------------------------------------------------------------
-    # Sandboxed code execution
-    # ------------------------------------------------------------------
+    _progress_updates_to_events = staticmethod(_progress_updates_to_events)
 
-    def _run_code_in_sandbox(
+    def _save_timeout_stub_trajectory(
         self,
-        code: str,
         *,
-        cwd: Optional[Path] = None,
-        timeout: Optional[int] = None,
-    ) -> tuple[bool, str]:
-        """Execute *code* in a subprocess and return ``(passed, output)``."""
-        timeout = timeout or self.timeout
+        task: Dict[str, Any],
+        result: Dict[str, Any],
+        progress_updates: List[Dict[str, Any]],
+    ) -> None:
+        agent_stub = SimpleNamespace(
+            benchmark_events=self._progress_updates_to_events(progress_updates),
+            tool_registry=SimpleNamespace(read_metadata_cache={}),
+            get_history=lambda: [],
+        )
         try:
-            result = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(cwd) if cwd else None,
+            self._save_task_trajectory(
+                task=task,
+                workspace=None,
+                agent=agent_stub,
+                prompt_texts=[],
+                result=result,
+                artifact_paths=None,
+                extra={"timeout_stub": True},
             )
-            passed = result.returncode == 0
-            output = (result.stdout + result.stderr).strip()
-            return passed, output
-        except subprocess.TimeoutExpired:
-            return False, f"Timeout after {timeout}s"
-        except Exception as exc:
-            return False, f"Execution error: {exc}"
-
-    def _run_script_in_sandbox(
-        self,
-        script_path: Path,
-        *,
-        cwd: Optional[Path] = None,
-        timeout: Optional[int] = None,
-    ) -> tuple[bool, str]:
-        """Execute a Python script file in a subprocess."""
-        timeout = timeout or self.timeout
-        try:
-            result = subprocess.run(
-                [sys.executable, str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(cwd) if cwd else None,
-            )
-            passed = result.returncode == 0
-            output = (result.stdout + result.stderr).strip()
-            return passed, output
-        except subprocess.TimeoutExpired:
-            return False, f"Timeout after {timeout}s"
-        except Exception as exc:
-            return False, f"Execution error: {exc}"
-
-    # ------------------------------------------------------------------
-    # Trajectory persistence
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _collect_terminal_outputs(workspace: Optional[Path]) -> List[Dict[str, Any]]:
-        if workspace is None:
-            return []
-        terminals_dir = workspace / "memory" / "terminals"
-        if not terminals_dir.exists():
-            return []
-        outputs: List[Dict[str, Any]] = []
-        for file_path in sorted(terminals_dir.glob("*")):
-            if not file_path.is_file():
-                continue
-            content = _read_text_if_exists(file_path, limit=50000) or ""
-            outputs.append(
-                {
-                    "path": str(file_path.relative_to(workspace)),
-                    "content": content,
-                    "truncated": len(content) >= 49997,
-                }
-            )
-        return outputs
-
-    @staticmethod
-    def _collect_workspace_artifacts(workspace: Optional[Path], artifact_paths: Optional[List[str]]) -> Dict[str, str]:
-        if workspace is None or not artifact_paths:
-            return {}
-        workspace_root = workspace.resolve()
-        artifacts: Dict[str, str] = {}
-        for rel_path in artifact_paths:
-            try:
-                target = (workspace_root / rel_path).resolve()
-                target.relative_to(workspace_root)
-            except Exception:
-                continue
-            content = _read_text_if_exists(target)
-            if content is None:
-                continue
-            artifacts[str(rel_path)] = content
-        return artifacts
-
-    def _trajectory_dir_for_task(self, task_id: str) -> Path:
-        task_dir = self.trajectory_dir / self.benchmark_name / _safe_name(task_id)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        return task_dir
-
-    def _build_trajectory_readme(self, payload: Dict[str, Any]) -> str:
-        result = payload.get("result") or {}
-        events = payload.get("agent", {}).get("events") or []
-        prompts = payload.get("prompts") or []
-        artifacts = payload.get("workspace", {}).get("artifacts") or {}
-        terminals = payload.get("workspace", {}).get("terminals") or []
-
-        def format_event(event: Dict[str, Any]) -> str:
-            event_type = event.get("event_type") or "event"
-            event_payload = event.get("payload") or {}
-            step = event_payload.get("step")
-            prefix = f"step {step} " if step is not None else ""
-            if event_type in {"tool_call", "control_tool", "builtin_tool"}:
-                detail = event_payload.get("tool_name") or event_type
-            elif event_type == "tool_result":
-                detail = event_payload.get("tool_name") or event_type
-            elif event_type == "llm_error":
-                detail = event_payload.get("error") or event_type
-            elif event_type == "agent_error":
-                detail = event_payload.get("message") or event_type
-            else:
-                detail = event_type
-            return f"- {prefix}{_clip_text(detail, 120)}"
-
-        lines = [
-            f"# {payload.get('benchmark')} / {payload.get('task_id')}",
-            "",
-            f"- Saved at: {payload.get('saved_at')}",
-            f"- Passed: {result.get('passed')}",
-            f"- Elapsed: {result.get('elapsed_s')}",
-            "",
-            "## Result",
-            "```json",
-            json.dumps(result, indent=2, ensure_ascii=False),
-            "```",
-        ]
-
-        if prompts:
-            lines.extend(["", "## Prompts"])
-            for idx, prompt_text in enumerate(prompts, start=1):
-                lines.extend(
-                    [
-                        "",
-                        f"### Prompt {idx}",
-                        "```text",
-                        _clip_text(prompt_text, 16000),
-                        "```",
-                    ]
-                )
-
-        if events:
-            lines.extend(["", "## Event Summary"])
-            lines.extend(format_event(event) for event in events[-40:])
-
-        if artifacts:
-            lines.extend(["", "## Workspace Artifacts"])
-            for rel_path, content in artifacts.items():
-                lines.extend(
-                    [
-                        "",
-                        f"### {rel_path}",
-                        "```text",
-                        content,
-                        "```",
-                    ]
-                )
-
-        if terminals:
-            lines.extend(["", "## Terminal Outputs"])
-            for terminal in terminals[:10]:
-                lines.extend(
-                    [
-                        "",
-                        f"### {terminal.get('path')}",
-                        "```text",
-                        terminal.get("content", ""),
-                        "```",
-                    ]
-                )
-
-        return "\n".join(lines).rstrip() + "\n"
+        except Exception:
+            pass
 
     def _save_task_trajectory(
         self,
@@ -1218,44 +581,21 @@ class BenchmarkRunner(ABC):
         extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         task_id = str(task.get("task_id") or uuid.uuid4().hex)
-        task_dir = self._trajectory_dir_for_task(task_id)
+        task_dir = _trajectory_dir_for_task(self.trajectory_dir, self.benchmark_name, task_id)
         trajectory_path = task_dir / "trajectory.json"
-        read_cache = {}
-        history: List[Dict[str, Any]] = []
-        events: List[Dict[str, Any]] = []
-        if agent is not None:
-            get_history = getattr(agent, "get_history", None)
-            if callable(get_history):
-                history = [
-                    msg.to_dict() if hasattr(msg, "to_dict") else _json_safe(msg)
-                    for msg in get_history()
-                ]
-            events = list(getattr(agent, "benchmark_events", []))
-            if getattr(agent, "tool_registry", None) is not None:
-                read_cache = dict(getattr(agent.tool_registry, "read_metadata_cache", {}))
-
-        payload = {
-            "trajectory_format": "whale-code-benchmark-1.0",
-            "benchmark": self.benchmark_name,
-            "task_id": task_id,
-            "saved_at": datetime.now().isoformat(),
-            "task": _json_safe(task, max_string=16000),
-            "prompts": [_clip_text(text, 16000) for text in (prompt_texts or []) if text],
-            "result": _json_safe(result or {}),
-            "agent": {
-                "history": history,
-                "events": events,
-                "read_cache": _json_safe(read_cache, max_string=4000),
-            },
-            "workspace": {
-                "root": str(workspace) if workspace else None,
-                "artifacts": self._collect_workspace_artifacts(workspace, artifact_paths),
-                "terminals": self._collect_terminal_outputs(workspace),
-            },
-            "extra": _json_safe(extra or {}, max_string=16000),
-        }
+        payload = _build_trajectory_payload(
+            benchmark_name=self.benchmark_name,
+            task_id=task_id,
+            task=task,
+            workspace=workspace,
+            agent=agent,
+            prompt_texts=prompt_texts,
+            result=result,
+            artifact_paths=artifact_paths,
+            extra=extra,
+        )
         trajectory_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        (task_dir / "README.md").write_text(self._build_trajectory_readme(payload), encoding="utf-8")
+        (task_dir / "README.md").write_text(_build_trajectory_readme(payload), encoding="utf-8")
         return str(trajectory_path)
 
     # ------------------------------------------------------------------
@@ -1301,6 +641,7 @@ class BenchmarkRunner(ABC):
 
         deadline = time.time() + self.task_timeout
         timed_out = False
+        progress_updates: List[Dict[str, Any]] = []
         while process.is_alive():
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -1313,6 +654,7 @@ class BenchmarkRunner(ABC):
             except Exception:
                 update = None
             if update is not None:
+                progress_updates.append(update)
                 self._handle_progress_update(update)
 
         self._drain_progress_queue(progress_queue)
@@ -1323,13 +665,19 @@ class BenchmarkRunner(ABC):
             if process.is_alive() and hasattr(process, "kill"):
                 process.kill()
                 process.join(timeout=5)
-            return {
+            timeout_result = {
                 "task_id": task_id,
                 "passed": False,
                 "error": f"Timeout: problem solving exceeded {self.task_timeout}s",
                 "elapsed_s": float(self.task_timeout),
                 "timeout": True,
             }
+            self._save_timeout_stub_trajectory(
+                task=task,
+                result=timeout_result,
+                progress_updates=progress_updates,
+            )
+            return timeout_result
 
         process.join(timeout=1)
         try:
@@ -1354,120 +702,12 @@ class BenchmarkRunner(ABC):
     # Resume support
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _load_completed_ids(resume_file: Path) -> set:
-        """Return task_ids whose latest recorded result is a successful completion."""
-        completed: set = set()
-        if not resume_file.exists():
-            return completed
-
-        records = BenchmarkRunner._load_result_records(resume_file)
-        for record in BenchmarkRunner._latest_result_records(records):
-            if record.get("passed") is not True:
-                continue
-            tid = record.get("task_id")
-            if tid is not None:
-                completed.add(str(tid))
-        return completed
-
-    @staticmethod
-    def _load_result_records(results_file: Path) -> List[Dict[str, Any]]:
-        """Read a results JSONL file and return all valid parsed records."""
-        records: List[Dict[str, Any]] = []
-        if not results_file.exists():
-            return records
-
-        with open(results_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict):
-                    records.append(record)
-        return records
-
-    @staticmethod
-    def _latest_result_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Deduplicate records by task_id, keeping the latest entry for each task."""
-        latest_by_task: Dict[str, Dict[str, Any]] = {}
-        anonymous_records: List[Dict[str, Any]] = []
-
-        for record in records:
-            task_id = record.get("task_id")
-            if task_id is None:
-                anonymous_records.append(record)
-            else:
-                task_key = str(task_id)
-                latest_by_task.pop(task_key, None)
-                latest_by_task[task_key] = record
-
-        return list(latest_by_task.values()) + anonymous_records
-
-    @staticmethod
-    def _write_result_records(results_file: Path, records: List[Dict[str, Any]]) -> None:
-        """Atomically rewrite a results JSONL file from *records*."""
-        results_file.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=results_file.parent,
-            prefix=f".{results_file.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-            for record in records:
-                tmp.write(json.dumps(record, ensure_ascii=False) + "\n")
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        tmp_path.replace(results_file)
-
-    @staticmethod
-    def _upsert_result_record(
-        records: List[Dict[str, Any]],
-        record_index: Dict[str, int],
-        result: Dict[str, Any],
-    ) -> None:
-        """Insert or replace a result record by ``task_id`` in-place."""
-        task_id = result.get("task_id")
-        if task_id is None:
-            records.append(result)
-            return
-
-        task_key = str(task_id)
-        existing_idx = record_index.get(task_key)
-        if existing_idx is None:
-            record_index[task_key] = len(records)
-            records.append(result)
-            return
-        records[existing_idx] = result
-
-    @staticmethod
-    def _summarize_result_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Build aggregate stats from result records, deduplicated by latest task_id."""
-        final_records = BenchmarkRunner._latest_result_records(records)
-
-        passed = sum(1 for r in final_records if r.get("passed") is True)
-        failed = sum(1 for r in final_records if r.get("passed") is False)
-        unfinished = sum(1 for r in final_records if r.get("passed") is None)
-        total_time = round(sum(float(r.get("elapsed_s", 0.0) or 0.0) for r in final_records), 2)
-        total = len(final_records)
-        pass_rate = round((passed / total * 100), 2) if total > 0 else 0.0
-
-        return {
-            "records_in_file": len(records),
-            "tasks": total,
-            "passed": passed,
-            "failed": failed,
-            "unfinished": unfinished,
-            "pass_rate": pass_rate,
-            "total_time_s": total_time,
-            "avg_time_s": round(total_time / total, 2) if total > 0 else 0.0,
-        }
+    _load_completed_ids = staticmethod(_load_completed_ids)
+    _load_result_records = staticmethod(_load_result_records)
+    _latest_result_records = staticmethod(_latest_result_records)
+    _write_result_records = staticmethod(_write_result_records)
+    _upsert_result_record = staticmethod(_upsert_result_record)
+    _summarize_result_records = staticmethod(_summarize_result_records)
 
     # ------------------------------------------------------------------
     # Main run loop

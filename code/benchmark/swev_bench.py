@@ -59,7 +59,7 @@ There is no human in the loop.
 3. Diagnose the root cause and decide the fix.
 4. Edit the minimal set of files required for a correct fix.
 5. Verify lightly if it is fast and low-risk; otherwise skip local testing.
-6. Respond with a brief summary of what changed and why.
+6. Call `Finish` alone with a brief summary of what changed and why.
 
 ### Critical Rules
 
@@ -75,6 +75,8 @@ There is no human in the loop.
 - Once you identify the fix location, edit promptly.
 - If a search returns too many results, narrow the query.
 - Avoid shell commands for searching when Grep/Glob/Read are available.
+- Use TodoWrite only if the issue truly needs multi-step planning.
+- `Finish` must be the last tool you call for the task.
 """
 
 _SWEV_SYSTEM_PROMPT = BENCHMARK_BASE_SYSTEM_PROMPT + _SWEV_ADDENDUM
@@ -817,7 +819,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 f"4. **Edit**: Make the minimal fix needed for correctness.\n"
                 f"5. **Verify**: Re-read the edited lines. If there is an obvious "
                 f"fast reproducer or targeted test, run it; otherwise skip local testing.\n"
-                f"6. **Respond**: End with a concise summary of what changed and why.\n"
+                f"6. **Respond**: Call `Finish` alone with a concise summary of what changed and why.\n"
             )
 
             try:
@@ -908,8 +910,10 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
 
     def _run_agent_with_timeout(self, agent, prompt: str) -> str:
         """Run ``agent.run()`` with a wall-clock timeout and recover partial diffs."""
+        run_kwargs = self._benchmark_agent_run_kwargs()
         if self.task_timeout <= 0:
-            return agent.run(prompt)
+            result = agent.run(prompt, **run_kwargs)
+            return "" if result is None else str(result).strip()
 
         # Use a threading-based timeout on all platforms
         import threading
@@ -919,7 +923,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
 
         def target():
             try:
-                result_holder["value"] = agent.run(prompt)
+                result_holder["value"] = agent.run(prompt, **run_kwargs)
             except Exception as exc:
                 exception_holder.append(exc)
 
@@ -936,7 +940,8 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         if exception_holder:
             raise exception_holder[0]
 
-        return result_holder.get("value", "")
+        result = result_holder.get("value", "")
+        return "" if result is None else str(result).strip()
 
     # ------------------------------------------------------------------
     # Override run() to add resume support and predictions export

@@ -35,9 +35,9 @@ You are implementing MBPP+ Python programming tasks.
 
 Workflow:
 1. Read the task description carefully and identify the required function behavior.
-2. Implement the function in `solution.py`.
+2. Read `solution.py`, then implement the function there. Prefer `Edit` for focused changes and `Write` only if a full rewrite is simpler.
 3. Use only your own lightweight checks if you want to validate ideas locally.
-4. When ready for a controlled submission, stop and provide a short plain-text summary.
+4. When ready for a controlled submission, call `Finish` alone with a short summary of the implementation.
 5. The benchmark runner will execute the benchmark tests outside the workspace and return bounded feedback if another revision is needed.
 
 Rules:
@@ -210,12 +210,12 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 f"- This benchmark uses controlled submissions.\n"
                 f"- Benchmark test files are not present in the workspace.\n"
                 f"- Do not run your own benchmark test loop.\n"
-                f"- After each completed response, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
+                f"- After each completed submission, typically when you call `Finish`, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
                 f"Follow these steps:\n"
                 f"1. Carefully analyze the task description and identify edge cases.\n"
-                f"2. Implement the function in `solution.py` using the Edit or Write tool.\n"
+                f"2. Read `solution.py`, then implement the function there. Prefer `Edit` for focused changes and `Write` only if a full rewrite is simpler.\n"
                 f"3. You may run lightweight self-checks of your own design, but do not rely on benchmark tests.\n"
-                f"4. When ready for a controlled submission, stop and provide a brief summary in plain text.\n\n"
+                f"4. When ready for a controlled submission, call `Finish` alone with a brief summary of what you implemented.\n\n"
                 f"Important:\n"
                 f"- The function must satisfy the task requirements and examples.\n"
                 f"- Include any necessary imports at the top of the file.\n"
@@ -239,7 +239,7 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                     f"- The failing check summaries are reliable.\n"
                     f"- Actual/expected values are intentionally bounded.\n"
                     f"- Use the feedback above plus the task description, not hidden benchmark files.\n"
-                    f"When ready for the next controlled submission, stop and provide a brief plain-text summary."
+                    f"When ready for the next controlled submission, call `Finish` alone with a brief summary of the revision."
                 )
                 prompt_history.append(prompt)
 

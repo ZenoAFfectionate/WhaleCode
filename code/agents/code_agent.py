@@ -154,10 +154,6 @@ class CodeAgent(ReActAgent):
             if hasattr(tool, "working_dir"):
                 tool.working_dir = new_working_dir
 
-    def _parallel_user_tool_execution_enabled(self) -> bool:
-        """CodeAgent uses the shared concurrent tool executor in sync run()."""
-        return True
-
     # ------------------------------------------------------------------
     # Context compaction (public API)
     # ------------------------------------------------------------------

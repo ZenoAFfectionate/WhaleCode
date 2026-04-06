@@ -54,19 +54,20 @@ time and memory complexity. Only then implement the solution.
 Workflow:
 1. Read `problem.txt` carefully.
 2. Extract the interface, constraints, edge cases, and any mathematical structure before touching the code.
-3. Inspect `solution.py`. If it already contains starter code, preserve the required function/class signature.
+3. Inspect `solution.py`. If it already contains starter code, preserve the required function/class signature. Prefer `Edit` for targeted changes and `Write` only for deliberate full rewrites.
 4. Implement the solution in `solution.py` only after you have a clear algorithmic plan.
-5. When you are ready for a controlled benchmark submission, stop and provide a short plain-text summary.
+5. When you are ready for a controlled benchmark submission, call `Finish` alone with a short summary of the implementation.
 6. The benchmark runner will execute both public and hidden tests, then send structured feedback if another revision is needed.
 
 Rules:
 - For stdin/stdout tasks, `solution.py` must be a complete Python program reading from stdin and writing to stdout.
 - For call-based tasks, preserve the provided function/class structure exactly.
 - Benchmark test data is not stored in the workspace. Do not ask for raw test cases.
-- Do not create your own uncontrolled submission loop. Wait for benchmark feedback after each completed response.
+- Do not create your own uncontrolled submission loop. Wait for benchmark feedback after each completed submission, typically when you call `Finish`.
 - Do not try to access hidden tests, hidden directories, environment variables, or files outside the workspace.
 - Do not attempt to print environment variables or discover hidden paths.
 - Prefer clean, correct code over clever shortcuts.
+- `Finish` must be the last tool you call for that submission.
 - Do not treat sample outputs, a few hand-picked checks, or numerical experiments as proof of correctness.
 - Use local experiments only to validate an already-reasoned hypothesis, not to invent the final algorithm.
 - If a result depends on math, derive the formula or invariant first; do not extrapolate from small cases and hope it generalizes.
@@ -737,14 +738,14 @@ class LCB6Benchmark(BenchmarkRunner):
                 f"- This benchmark uses controlled submissions.\n"
                 f"- Do not run your own benchmark test loop.\n"
                 f"- Benchmark test data is not present in the workspace.\n"
-                f"- After each completed response, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
+                f"- After each completed submission, typically when you call `Finish`, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
                 f"Instructions:\n"
                 f"1. Read `problem.txt`.\n"
                 f"2. Before editing `solution.py`, analyze the task constraints, derive the algorithm, and identify the edge cases that could break a naive approach.\n"
                 f"3. If the task is math-heavy, first derive the key formula, invariant, recurrence, or correctness argument before using numerical checks.\n"
                 f"4. Implement the solution in `solution.py` only after you have a clear plan and complexity target.\n"
                 f"5. You may run lightweight self-checks or syntax checks of your own design, but use them to validate your reasoning rather than replace it.\n"
-                f"6. When ready for submission, stop and provide a brief plain-text summary.\n\n"
+                f"6. When ready for submission, call `Finish` alone with a brief summary of the implementation and reasoning.\n\n"
                 f"Important:\n"
                 f"- Hidden benchmark checks will run outside the workspace and are not directly accessible.\n"
                 f"- The runner may return bounded diagnostics such as failing case visibility, input snippets, and error traces.\n"
@@ -785,7 +786,7 @@ class LCB6Benchmark(BenchmarkRunner):
                     f"- Do not search for hidden tests; use the feedback above plus the problem statement.\n"
                     f"- Re-check the underlying reasoning, invariants, and complexity before patching the code.\n"
                     f"- Do not overfit to the observed failing cases; fix the general logic, proof, or interface.\n"
-                    f"When you are ready for the next controlled submission, stop and provide a brief plain-text summary."
+                    f"When you are ready for the next controlled submission, call `Finish` alone with a brief summary of the revision."
                 )
                 prompt_history.append(prompt)
 

@@ -333,9 +333,9 @@ class HistoryManager:
         system_prompt: Optional[str] = None,
         latest_user_input: Optional[str] = None,
         history: Optional[Sequence[Message]] = None,
-    ) -> List[Dict[str, str]]:
+    ) -> List[Dict[str, Any]]:
         """将历史投影为 LLM 可直接使用的 chat messages。"""
-        messages: List[Dict[str, str]] = []
+        messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
@@ -606,12 +606,35 @@ class HistoryManager:
             return f"{self.TOOL_RESULT_PREFIX} [{tool_name}]:"
         return f"{self.TOOL_RESULT_PREFIX}:"
 
-    def _project_message_for_llm(self, message: Message) -> Optional[Dict[str, str]]:
+    @staticmethod
+    def _tool_call_arguments_for_llm(arguments: Any) -> str:
+        if isinstance(arguments, str):
+            return arguments
+        return json.dumps(arguments if arguments is not None else {}, ensure_ascii=False, separators=(",", ":"))
+
+    def _project_message_for_llm(self, message: Message) -> Optional[Dict[str, Any]]:
         """将持久化历史映射为下一次模型调用的合法 chat messages。"""
         content = message.content or ""
         if message.role == "user":
             return {"role": "user", "content": content}
         if message.role == "assistant":
+            tool_calls = self._assistant_tool_calls(message)
+            if tool_calls:
+                return {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": str(tool_call.get("id", "") or ""),
+                            "type": "function",
+                            "function": {
+                                "name": str(tool_call.get("name", "unknown") or "unknown"),
+                                "arguments": self._tool_call_arguments_for_llm(tool_call.get("arguments")),
+                            },
+                        }
+                        for tool_call in tool_calls
+                    ],
+                }
             if not content.strip():
                 return None
             return {"role": "assistant", "content": content}
@@ -622,6 +645,13 @@ class HistoryManager:
                 return {"role": "user", "content": content}
             return {"role": "user", "content": f"{self.SYSTEM_NOTE_PREFIX}\n{content}"}
         if message.role == "tool":
+            tool_call_id = self._message_metadata(message).get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id.strip():
+                return {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id.strip(),
+                    "content": content,
+                }
             return {
                 "role": "assistant",
                 "content": f"{self._tool_result_prompt_prefix(message)}\n{content}",

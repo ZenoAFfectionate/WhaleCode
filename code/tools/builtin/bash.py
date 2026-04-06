@@ -555,9 +555,9 @@ class BashTool(Tool):
         r"\bgit\s+clean\b",
     ]
     PREFER_SPECIALIZED_TOOLS: Set[str] = {
-        "ls", "find",
+        "ls",
         "grep", "rg",
-        "cat", "head", "tail",
+        "cat",
         "sed", "awk",
     }
     NETWORK_COMMANDS: Set[str] = {
@@ -572,12 +572,9 @@ class BashTool(Tool):
     ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
     PREFERRED_TOOL_MESSAGES: Dict[str, str] = {
         "ls": "Use the LS tool instead of `ls` in Bash for directory listing.",
-        "find": "Use the Glob tool instead of `find` in Bash for file discovery.",
         "grep": "Use the Grep tool instead of `grep` in Bash for code and text search.",
         "rg": "Use the Grep tool instead of `rg` in Bash for code and text search.",
         "cat": "Use the Read tool instead of `cat` in Bash for file reading.",
-        "head": "Use the Read tool instead of `head` in Bash for file reading.",
-        "tail": "Use the Read tool instead of `tail` in Bash for file reading.",
         "sed": "Use the Edit tool instead of `sed` in Bash for file editing.",
         "awk": "Use the Edit or Grep tools instead of `awk` in Bash for repository inspection.",
     }
@@ -594,8 +591,7 @@ class BashTool(Tool):
                 "Run a non-interactive shell command inside the workspace. "
                 "Use this for builds, tests, formatters, linters, package scripts, git, and other "
                 "developer commands. Prefer dedicated tools instead of Bash for directory listing "
-                "(LS), file discovery (Glob), code search (Grep), file reading (Read), and file "
-                "editing (Edit/Write/Delete). "
+                "(LS), code search (Grep), and file editing (Edit/Write/Delete) when they fit the task. "
                 "Commands that exceed block_until_ms are moved to background and tracked by terminal files."
             ),
         )
@@ -621,8 +617,8 @@ class BashTool(Tool):
                 type="string",
                 description=(
                     "Shell command to execute. Use Bash for terminal workflows like builds, tests, "
-                    "git, and package scripts. Do not use it for `ls`, `find`, `grep`, `cat`, "
-                    "`head`, `tail`, `sed`, or `awk` when the dedicated tools fit the task."
+                    "git, and package scripts. Prefer dedicated tools over Bash for `ls`, `grep`, "
+                    "`cat`, `sed`, or `awk` when they fit the task."
                 ),
                 required=True,
             ),

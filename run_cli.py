@@ -642,7 +642,8 @@ class CLICodeAgentMixin:
 
             if tool_name == "TodoWrite" and isinstance(arguments, dict):
                 action = str(arguments.get("action", "")).strip().lower()
-                if action in TODO_MUTATING_ACTIONS:
+                has_todos_payload = isinstance(arguments.get("todos"), list)
+                if action in TODO_MUTATING_ACTIONS or has_todos_payload:
                     if tool_call_id:
                         if not hasattr(self, "_todo_mutating_call_ids"):
                             self._todo_mutating_call_ids = set()

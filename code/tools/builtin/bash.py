@@ -12,7 +12,12 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
+
+try:  # resource is POSIX-only; degrade gracefully on Windows.
+    import resource as _resource
+except ImportError:  # pragma: no cover - platform dependent
+    _resource = None
 
 from ...context.truncator import ObservationTruncator
 from ..base import Tool, ToolParameter
@@ -24,6 +29,101 @@ from ._code_utils import (
     relative_display,
     resolve_path,
 )
+
+
+# --- Sandbox hardening helpers (see IMPROVEMENT.md 严重-1 / 严重-2) ---------
+
+# Environment variables whose *name* matches any of these fragments are treated
+# as secrets and stripped from the child process environment so a shell command
+# (or a prompt-injected one) cannot read/exfiltrate credentials such as
+# LLM_API_KEY, HF_TOKEN, QDRANT_API_KEY, NEO4J_PASSWORD, ...
+_SENSITIVE_ENV_FRAGMENTS: tuple[str, ...] = (
+    "API_KEY",
+    "APIKEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+    "ACCESS_KEY",
+    "SESSION_KEY",
+    "AUTH",
+    "PASSPHRASE",
+)
+
+# Names that should be kept even if they happen to contain a sensitive fragment
+# (none currently, but kept for future allow-listing).
+_ENV_KEEP_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _is_sensitive_env_key(name: str) -> bool:
+    if name in _ENV_KEEP_ALLOWLIST:
+        return False
+    upper = name.upper()
+    return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
+
+
+def build_sandbox_env(project_root: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Return a child-process environment with secret-looking variables removed."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not _is_sensitive_env_key(key)
+    }
+    env["PROJECT_ROOT"] = str(project_root)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def make_rlimit_preexec(
+    cpu_seconds: int,
+    address_space_bytes: int,
+    max_processes: int,
+    file_size_bytes: int,
+) -> Optional[Callable[[], None]]:
+    """Build a ``preexec_fn`` that applies resource limits in the child process.
+
+    Any limit <= 0 is treated as "unlimited / skip". Returns ``None`` when the
+    ``resource`` module is unavailable (e.g. Windows) so callers can omit it.
+    """
+    if _resource is None:
+        return None
+
+    limits: List[tuple[int, int]] = []
+    if cpu_seconds > 0 and hasattr(_resource, "RLIMIT_CPU"):
+        limits.append((_resource.RLIMIT_CPU, cpu_seconds))
+    if address_space_bytes > 0 and hasattr(_resource, "RLIMIT_AS"):
+        limits.append((_resource.RLIMIT_AS, address_space_bytes))
+    if max_processes > 0 and hasattr(_resource, "RLIMIT_NPROC"):
+        limits.append((_resource.RLIMIT_NPROC, max_processes))
+    if file_size_bytes > 0 and hasattr(_resource, "RLIMIT_FSIZE"):
+        limits.append((_resource.RLIMIT_FSIZE, file_size_bytes))
+
+    if not limits:
+        return None
+
+    def _apply() -> None:  # pragma: no cover - runs in the forked child
+        for res, soft in limits:
+            try:
+                _resource.setrlimit(res, (soft, soft))
+            except (ValueError, OSError):
+                # A soft limit above the inherited hard limit will raise; skip
+                # rather than abort the whole command.
+                continue
+
+    return _apply
 
 
 class _CommandEventStream:
@@ -147,6 +247,7 @@ class _TerminalBackgroundManager:
         description: str,
         block_until_ms: int,
         event_stream: _CommandEventStream,
+        max_execution_ms: int = 0,
     ) -> Dict[str, Any]:
         started_at = datetime.now().isoformat()
         started_ts = time.time()
@@ -165,6 +266,7 @@ class _TerminalBackgroundManager:
                 "working_directory": working_directory,
                 "description": description,
                 "block_until_ms": block_until_ms,
+                "max_execution_ms": max_execution_ms,
                 "started_at": started_at,
                 "started_ts": started_ts,
                 "finished_at": "",
@@ -204,11 +306,28 @@ class _TerminalBackgroundManager:
     ) -> None:
         last_event_count = -1
         last_snapshot_ts = 0.0
+        with self._lock:
+            record0 = self._records.get(terminal_id) or {}
+            started_ts = float(record0.get("started_ts") or time.time())
+            max_execution_ms = int(record0.get("max_execution_ms") or 0)
+        kill_deadline = started_ts + max_execution_ms / 1000.0 if max_execution_ms > 0 else None
+        killed_for_timeout = False
         while True:
             exit_code = process.poll()
             snapshot = event_stream.snapshot()
             if exit_code is None:
                 now = time.time()
+                if kill_deadline is not None and not killed_for_timeout and now >= kill_deadline:
+                    self._terminate_process_group(process)
+                    event_stream.add_system_event(
+                        f"Process killed after exceeding max_execution_ms={max_execution_ms}.",
+                        source="watchdog",
+                    )
+                    killed_for_timeout = True
+                    with self._lock:
+                        record = self._records.get(terminal_id)
+                        if record:
+                            record["status_reason"] = "killed_execution_timeout"
                 if len(snapshot) != last_event_count or now - last_snapshot_ts >= self.SNAPSHOT_INTERVAL_SECONDS:
                     with self._lock:
                         record = self._records.get(terminal_id)
@@ -496,6 +615,26 @@ class _TerminalBackgroundManager:
             return False
         return True
 
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen) -> None:
+        """Best-effort SIGKILL of the child's whole process group.
+
+        Relies on ``start_new_session=True`` at spawn so the child leads its own
+        process group and children spawned by the command are killed too.
+        """
+        import signal as _signal
+
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        try:
+            os.killpg(os.getpgid(pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill()
+            except Exception:
+                pass
+
 
 _TERMINAL_MANAGERS: Dict[str, _TerminalBackgroundManager] = {}
 _TERMINAL_MANAGERS_LOCK = threading.Lock()
@@ -519,6 +658,18 @@ class BashTool(Tool):
     OUTPUT_PREVIEW_MAX_LINES = 900
     OUTPUT_PREVIEW_MAX_BYTES = 24_000
     MAX_POLICY_PARSE_DEPTH = 3
+    # Marker used when shell nesting is too deep to parse; forces a policy block
+    # instead of silently allowing the unvalidated inner command.
+    _TOO_DEEP_MARKER = "__bash_nesting_too_deep__"
+
+    # Resource limits applied to child processes (see IMPROVEMENT.md 严重-2).
+    # Defaults are generous enough for normal builds/tests but still stop the
+    # pathological cases (fork bomb, runaway CPU, disk-filling). Any value <= 0
+    # disables that specific limit. Overridable via BASH_MAX_* env vars.
+    DEFAULT_MAX_CPU_SECONDS = 3600          # runaway infinite-loop guard
+    DEFAULT_MAX_MEMORY_BYTES = 0            # off by default (AS caps break JVM/Node)
+    DEFAULT_MAX_PROCESSES = 4096            # fork-bomb guard
+    DEFAULT_MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # disk-fill guard (4 GiB)
 
     INTERACTIVE_COMMANDS: Set[str] = {
         "vim",
@@ -584,6 +735,7 @@ class BashTool(Tool):
         name: str = "Bash",
         project_root: str = ".",
         working_dir: Optional[str] = None,
+        config: Any = None,
     ):
         super().__init__(
             name=name,
@@ -603,12 +755,40 @@ class BashTool(Tool):
             truncate_direction="head",
             output_dir=str(self.project_root / "memory" / "tool-output"),
         )
-        self.allow_network = os.getenv("BASH_ALLOW_NETWORK", "false").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+
+        # 建议-6: prefer Config fields when available; env vars as fallback.
+        def _bool_cfg(field: str, env: str, default: bool) -> bool:
+            if config is not None and hasattr(config, field):
+                return bool(getattr(config, field))
+            return os.getenv(env, str(default)).lower() in {"1", "true", "yes", "on"}
+
+        def _int_cfg(field: str, env: str, default: int) -> int:
+            if config is not None and hasattr(config, field):
+                return int(getattr(config, field))
+            return _env_int(env, default)
+
+        self.allow_network = _bool_cfg("bash_allow_network", "BASH_ALLOW_NETWORK", False)
+
+        # Resource limits for child processes (0 = disabled for that dimension).
+        self.max_cpu_seconds = _int_cfg("bash_max_cpu_seconds", "BASH_MAX_CPU_SECONDS", self.DEFAULT_MAX_CPU_SECONDS)
+        self.max_memory_bytes = _int_cfg("bash_max_memory_bytes", "BASH_MAX_MEMORY_BYTES", self.DEFAULT_MAX_MEMORY_BYTES)
+        self.max_processes = _int_cfg("bash_max_processes", "BASH_MAX_PROCESSES", self.DEFAULT_MAX_PROCESSES)
+        self.max_file_size_bytes = _env_int("BASH_MAX_FILE_SIZE_BYTES", self.DEFAULT_MAX_FILE_SIZE_BYTES)
+        # Absolute wall-clock kill for backgrounded/long commands (ms). 0 = never
+        # force-kill (preserves intentional long-running background servers).
+        self.max_execution_ms = _int_cfg("bash_max_execution_ms", "BASH_MAX_EXECUTION_MS", 0)
+
+    def _build_child_env(self) -> Dict[str, str]:
+        """Environment for the shell command with secrets stripped out."""
+        return build_sandbox_env(self.project_root)
+
+    def _build_preexec(self) -> Optional[Any]:
+        return make_rlimit_preexec(
+            cpu_seconds=self.max_cpu_seconds,
+            address_space_bytes=self.max_memory_bytes,
+            max_processes=self.max_processes,
+            file_size_bytes=self.max_file_size_bytes,
+        )
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -727,7 +907,9 @@ class BashTool(Tool):
                 cwd=target_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env={**os.environ, "PROJECT_ROOT": str(self.project_root)},
+                env=self._build_child_env(),
+                preexec_fn=self._build_preexec(),
+                start_new_session=True,
             )
         except Exception as exc:
             return ToolResponse.error(
@@ -805,6 +987,7 @@ class BashTool(Tool):
             description=description,
             block_until_ms=block_until_ms,
             event_stream=event_stream,
+            max_execution_ms=self.max_execution_ms,
         )
 
         parts: List[str] = []
@@ -850,6 +1033,8 @@ class BashTool(Tool):
             if not tokens:
                 continue
             leader = tokens[0]
+            if leader == self._TOO_DEEP_MARKER:
+                return "Command nesting is too deep to validate safely; refusing to run."
             if self._is_rm_root(tokens):
                 return "Refusing to run a destructive command."
             if leader in self.PRIVILEGED_COMMANDS:
@@ -888,7 +1073,9 @@ class BashTool(Tool):
     @classmethod
     def _extract_command_invocations(cls, command: str, depth: int = 0) -> List[List[str]]:
         if depth >= cls.MAX_POLICY_PARSE_DEPTH:
-            return []
+            # Do not silently allow un-parsed deeply-nested commands: surface a
+            # marker so _validate_command refuses to run them.
+            return [[cls._TOO_DEEP_MARKER, command]]
 
         try:
             tokens = cls._tokenize_command(command)

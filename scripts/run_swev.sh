@@ -7,8 +7,12 @@
 #   bash scripts/run_swev.sh                            # Full run (500 instances)
 #   bash scripts/run_swev.sh --limit 5                  # First 5 instances
 #   bash scripts/run_swev.sh --dry-run                  # Dry run
+#   bash scripts/run_swev.sh --workers 4                # Parallel inference
+#   bash scripts/run_swev.sh --filter 'django__.*'      # Regex filter by instance_id
+#   bash scripts/run_swev.sh --slice 0:50               # Slice after filtering/shuffle
 #   bash scripts/run_swev.sh --repo-cache-dir /tmp/repos  # Cache cloned repos
 #   bash scripts/run_swev.sh --resume data/_results/prev.jsonl  # Resume from crash
+#   bash scripts/run_swev.sh --preds-path data/_results/preds.json  # Skip IDs already predicted
 #   bash scripts/run_swev.sh --task-timeout 1800           # 30min per task
 
 set -euo pipefail
@@ -43,5 +47,6 @@ main()
     --data-path "$PROJECT_ROOT/data/SWEV/test.jsonl" \
     --output-dir "$PROJECT_ROOT/data/_results" \
     --repo-cache-dir "$PROJECT_ROOT/data/_repo_cache" \
+    --workers "${SWEV_WORKERS:-1}" \
     --max-steps 128 \
     "$@"

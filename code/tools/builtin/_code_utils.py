@@ -687,6 +687,7 @@ class DiagnosticsResult:
 
 @dataclass(frozen=True)
 class FormatterSpec:
+    """Specification for an auto-formatter (e.g. ruff, black, prettier)."""
     name: str
     executable: str
     extensions: set[str]
@@ -695,6 +696,7 @@ class FormatterSpec:
 
 @dataclass(frozen=True)
 class DiagnosticsSpec:
+    """Specification for a diagnostics runner (e.g. ruff check, pyright, eslint)."""
     name: str
     executable: str
     extensions: set[str]

@@ -6,10 +6,10 @@ import argparse
 import ast
 import base64
 import decimal
+import io
 import json
 import pickle
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -44,34 +44,30 @@ The workspace contains:
 - `problem.txt`: full problem statement and metadata
 - `solution.py`: your answer file
 
-# Core Principle: Analyze First, Code Second
+# Core Principle: Analyze first, then code
 
-Before writing or revising code, you MUST reason through the problem itself.
-For algorithmic or math-heavy tasks, first identify the exact input/output model,
-the governing constraints, the key invariant/lemma/recurrence, and the target
-time and memory complexity. Only then implement the solution.
+Before editing code, identify the exact I/O contract, constraints, edge cases,
+and target complexity. For math-heavy tasks, derive the key invariant/formula
+before implementation.
 
 Workflow:
 1. Read `problem.txt` carefully.
-2. Extract the interface, constraints, edge cases, and any mathematical structure before touching the code.
-3. Inspect `solution.py`. If it already contains starter code, preserve the required function/class signature. Prefer `Edit` for targeted changes and `Write` only for deliberate full rewrites.
-4. Implement the solution in `solution.py` only after you have a clear algorithmic plan.
-5. When you are ready for a controlled benchmark submission, call `Finish` alone with a short summary of the implementation.
-6. The benchmark runner will execute both public and hidden tests, then send structured feedback if another revision is needed.
+2. Extract interface, constraints, and tricky cases before touching code.
+3. Read `solution.py`; preserve required starter interfaces.
+4. Implement after you have a clear algorithmic plan.
+5. Submit with `Finish`; runner executes public+hidden tests and returns bounded feedback.
 
 Rules:
 - For stdin/stdout tasks, `solution.py` must be a complete Python program reading from stdin and writing to stdout.
 - For call-based tasks, preserve the provided function/class structure exactly.
-- Benchmark test data is not stored in the workspace. Do not ask for raw test cases.
-- Do not create your own uncontrolled submission loop. Wait for benchmark feedback after each completed submission, typically when you call `Finish`.
-- Do not try to access hidden tests, hidden directories, environment variables, or files outside the workspace.
-- Do not attempt to print environment variables or discover hidden paths.
+- Benchmark test data is not stored in the workspace.
+- Do not create uncontrolled submission loops; submit via `Finish`.
+- Do not try to access hidden tests, hidden directories, env vars, or files outside workspace.
 - Prefer clean, correct code over clever shortcuts.
 - `Finish` must be the last tool you call for that submission.
 - Do not treat sample outputs, a few hand-picked checks, or numerical experiments as proof of correctness.
-- Use local experiments only to validate an already-reasoned hypothesis, not to invent the final algorithm.
-- If a result depends on math, derive the formula or invariant first; do not extrapolate from small cases and hope it generalizes.
-- If feedback contradicts your code, revisit the underlying reasoning before making patches.
+- Use local experiments only to validate an existing hypothesis.
+- If feedback contradicts your code, revisit reasoning before patching.
 
 Functional-task rules:
 - Keep the starter-code interface exactly.
@@ -279,12 +275,41 @@ def _parse_public_cases(raw: Any) -> List[Dict[str, Any]]:
     return []
 
 
+# 严重-4: LiveCodeBench ships private test cases as base64+zlib+pickle. Plain
+# ``pickle.loads`` on such payloads is arbitrary code execution if the dataset
+# is tampered with. Restrict unpickling to inert data types so a malicious
+# ``__reduce__`` gadget (os.system / eval / ...) cannot execute.
+_SAFE_PICKLE_GLOBALS = {
+    "builtins": {
+        "list", "dict", "tuple", "set", "frozenset", "str", "bytes", "bytearray",
+        "int", "float", "bool", "complex", "NoneType",
+    },
+    "collections": {"OrderedDict", "defaultdict"},
+    "decimal": {"Decimal"},
+}
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):  # noqa: D401
+        allowed = _SAFE_PICKLE_GLOBALS.get(module)
+        if allowed and name in allowed:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"Refusing to unpickle {module}.{name}: only plain data types are "
+            "allowed (严重-4 guard against untrusted-dataset code execution)."
+        )
+
+
+def _safe_pickle_loads(data: bytes) -> Any:
+    return _RestrictedUnpickler(io.BytesIO(data)).load()
+
+
 def _decode_private_cases(raw: str) -> List[Dict[str, Any]]:
     if not raw:
         return []
     decoded = base64.b64decode(raw)
     inflated = zlib.decompress(decoded)
-    obj = pickle.loads(inflated)
+    obj = _safe_pickle_loads(inflated)
     if isinstance(obj, bytes):
         obj = obj.decode("utf-8")
     if isinstance(obj, str):
@@ -485,6 +510,7 @@ def _evaluate_stdin_solution(
     public_count: int,
 ) -> Dict[str, Any]:
     failed = 0
+    private_failed = 0
     timed_out = False
     public_passed = 0
     private_passed = 0
@@ -515,9 +541,11 @@ def _evaluate_stdin_solution(
         except subprocess.TimeoutExpired:
             failed += 1
             timed_out = True
-            lines.append(f"[TIMEOUT] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[TIMEOUT] public case {idx}")
                 lines.append(_format_public_context("stdin", case))
+            else:
+                private_failed += 1
             continue
         finally:
             try:
@@ -527,22 +555,28 @@ def _evaluate_stdin_solution(
 
         if proc.returncode != 0:
             failed += 1
-            lines.append(f"[ERROR] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[ERROR] public case {idx}")
                 lines.append(_format_public_context("stdin", case))
                 stderr_text = proc.stderr.strip()
                 if stderr_text:
                     lines.append(stderr_text)
+            else:
+                private_failed += 1
+                lines.append(f"[ERROR] private case {idx}")
             continue
 
         actual = proc.stdout.strip()
         if not _stdio_outputs_match(actual, expected):
             failed += 1
-            lines.append(f"[FAIL] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[FAIL] public case {idx}")
                 lines.append(_format_public_context("stdin", case))
                 lines.append(f"  actual:   {actual!r}")
                 lines.append(f"  expected: {expected!r}")
+            else:
+                private_failed += 1
+                lines.append(f"[FAIL] private case {idx}")
             continue
 
         if visibility == "public":
@@ -564,6 +598,8 @@ def _evaluate_stdin_solution(
     private_count = max(total - public_count, 0)
     if private_count:
         lines.append(f"{private_passed}/{private_count} private cases passed")
+        if private_failed:
+            lines.append("Private-case failures detected (details withheld).")
     if failed == 0:
         lines.append("All benchmark cases passed!")
 
@@ -583,6 +619,7 @@ def _evaluate_functional_solution(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     failed = 0
+    private_failed = 0
     timed_out = False
     public_passed = 0
     private_passed = 0
@@ -607,9 +644,11 @@ def _evaluate_functional_solution(
         except subprocess.TimeoutExpired:
             failed += 1
             timed_out = True
-            lines.append(f"[TIMEOUT] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[TIMEOUT] public case {idx}")
                 lines.append(_format_public_context("functional", case))
+            else:
+                private_failed += 1
             continue
 
         helper_stdout = proc.stdout.strip()
@@ -620,22 +659,28 @@ def _evaluate_functional_solution(
 
         if proc.returncode != 0 or helper_result.get("status") != "ok":
             failed += 1
-            lines.append(f"[ERROR] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[ERROR] public case {idx}")
                 lines.append(_format_public_context("functional", case))
                 err_type = helper_result.get("type") or "RuntimeError"
                 err_message = helper_result.get("message") or proc.stderr.strip() or "helper execution failed"
                 lines.append(f"  {err_type}: {err_message}")
+            else:
+                private_failed += 1
+                lines.append(f"[ERROR] private case {idx}")
             continue
 
         actual = _parse_scalar_repr(str(helper_result.get("value_repr", "")))
         if actual != expected:
             failed += 1
-            lines.append(f"[FAIL] {visibility} case {idx}")
             if visibility == "public":
+                lines.append(f"[FAIL] public case {idx}")
                 lines.append(_format_public_context("functional", case))
                 lines.append(f"  actual:   {actual!r}")
                 lines.append(f"  expected: {expected!r}")
+            else:
+                private_failed += 1
+                lines.append(f"[FAIL] private case {idx}")
             continue
 
         if visibility == "public":
@@ -657,6 +702,8 @@ def _evaluate_functional_solution(
     private_count = max(total - public_count, 0)
     if private_count:
         lines.append(f"{private_passed}/{private_count} private cases passed")
+        if private_failed:
+            lines.append("Private-case failures detected (details withheld).")
     if failed == 0:
         lines.append("All benchmark cases passed!")
 
@@ -692,7 +739,7 @@ class LCB6Benchmark(BenchmarkRunner):
 
         return self._load_jsonl_tasks(task_transform=transform)
 
-    def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
         title = task.get("question_title", "")
         question = task.get("question_content", "")
@@ -734,25 +781,14 @@ class LCB6Benchmark(BenchmarkRunner):
                 f"Platform: {platform}\n"
                 f"Difficulty: {difficulty}\n"
                 f"Mode: {mode}\n\n"
-                f"Submission policy:\n"
-                f"- This benchmark uses controlled submissions.\n"
-                f"- Do not run your own benchmark test loop.\n"
+                f"Requirements:\n"
+                f"- Controlled submissions only: call `Finish` alone when ready; runner returns bounded feedback.\n"
                 f"- Benchmark test data is not present in the workspace.\n"
-                f"- After each completed submission, typically when you call `Finish`, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
-                f"Instructions:\n"
-                f"1. Read `problem.txt`.\n"
-                f"2. Before editing `solution.py`, analyze the task constraints, derive the algorithm, and identify the edge cases that could break a naive approach.\n"
-                f"3. If the task is math-heavy, first derive the key formula, invariant, recurrence, or correctness argument before using numerical checks.\n"
-                f"4. Implement the solution in `solution.py` only after you have a clear plan and complexity target.\n"
-                f"5. You may run lightweight self-checks or syntax checks of your own design, but use them to validate your reasoning rather than replace it.\n"
-                f"6. When ready for submission, call `Finish` alone with a brief summary of the implementation and reasoning.\n\n"
-                f"Important:\n"
-                f"- Hidden benchmark checks will run outside the workspace and are not directly accessible.\n"
-                f"- The runner may return bounded diagnostics such as failing case visibility, input snippets, and error traces.\n"
-                f"- Do not change the required interface in starter code when it exists.\n"
+                f"- Do not run your own benchmark test loop.\n"
+                f"- Read `problem.txt` first, derive algorithm + complexity target, then edit `solution.py`.\n"
+                f"- Keep starter-code interface unchanged when provided.\n"
                 f"- For stdin tasks, write a complete executable program.\n"
-                f"- Do not jump from samples or a few numerical results directly to final code.\n"
-                f"- Only submit once you have a general argument for why the algorithm handles all valid inputs.\n"
+                f"- Use local checks only to validate reasoning, not as proof of correctness.\n"
             )
 
             agent = self._create_agent(workspace)
@@ -812,9 +848,10 @@ class LCB6Benchmark(BenchmarkRunner):
                     return result
 
                 if not solution_file.exists():
-                    result = self._missing_output_result(
+                    result = self._build_result(
                         task_id,
-                        path_label="solution.py",
+                        passed=False,
+                        error="solution.py not found after agent run",
                         start_time=start,
                         agent_response=agent_response,
                         extra={
@@ -892,7 +929,7 @@ class LCB6Benchmark(BenchmarkRunner):
             )
             return result
         finally:
-            self._save_task_trajectory(
+            self._finalize_workspace_task(
                 task=task,
                 workspace=workspace,
                 agent=agent,
@@ -901,7 +938,6 @@ class LCB6Benchmark(BenchmarkRunner):
                 artifact_paths=["problem.txt", "solution.py"],
                 extra={"mode": mode},
             )
-            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> None:
@@ -926,13 +962,8 @@ def main() -> None:
 
     bench = LCB6Benchmark(
         data_path=args.data_path,
-        output_dir=args.output_dir,
-        temperature=args.temperature,
-        max_steps=args.max_steps,
         max_submission_rounds=args.max_submission_rounds,
-        timeout=args.timeout,
-        task_timeout=args.task_timeout,
-        trajectory_dir=args.trajectory_dir,
+        **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

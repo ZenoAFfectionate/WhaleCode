@@ -102,6 +102,7 @@ class _FinishTool(Tool):
 
 @dataclass
 class _ExecutionState:
+    """Mutable per-turn counters and stagnation flags for the ReAct loop."""
     current_step: int
     total_tokens: int = 0
     total_prompt_tokens: int = 0
@@ -116,6 +117,7 @@ class _ExecutionState:
 
 @dataclass(frozen=True)
 class _StructuredOutputSpec:
+    """Describes a forced structured-output tool the model must call to finish."""
     name: str
     description: str
     schema: Dict[str, Any]
@@ -1673,19 +1675,17 @@ class ReActAgent(Agent):
                 self._render_step_start(state.current_step)
                 await self._abefore_model_call(messages, state.current_step)
 
+                # 重要-2: one tool-aware call per step. The old code streamed the
+                # text with astream_invoke AND then re-requested the same turn via
+                # invoke_with_tools, doubling token cost and latency every step.
                 full_response = ""
                 try:
-                    async for chunk in self.llm.astream_invoke(messages, **kwargs):
-                        full_response += chunk
-                        yield StreamEvent.create(
-                            StreamEventType.LLM_CHUNK,
-                            self.name,
-                            chunk=chunk,
-                            step=state.current_step,
-                        )
-                        self._render_stream_chunk(chunk)
-
-                    self._render_stream_newline()
+                    response = self.llm.invoke_with_tools(
+                        messages=messages,
+                        tools=tool_schemas,
+                        tool_choice=tool_choice,
+                        **kwargs,
+                    )
                 except Exception as exc:
                     error_msg = f"LLM call failed: {exc}"
                     self._render_agent_error(error_msg)
@@ -1699,17 +1699,22 @@ class ReActAgent(Agent):
                     break
 
                 try:
-                    response = self.llm.invoke_with_tools(
-                        messages=messages,
-                        tools=tool_schemas,
-                        tool_choice=tool_choice,
-                        **kwargs,
-                    )
                     response_message = self._record_model_response(
                         response,
                         state.current_step,
                         state,
                     )
+                    content_text = response_message.content or ""
+                    if content_text:
+                        full_response = content_text
+                        yield StreamEvent.create(
+                            StreamEventType.LLM_CHUNK,
+                            self.name,
+                            chunk=content_text,
+                            step=state.current_step,
+                        )
+                        self._render_stream_chunk(content_text)
+                        self._render_stream_newline()
                     tool_calls = response_message.tool_calls
 
                     if not tool_calls:

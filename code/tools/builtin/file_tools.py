@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,6 +48,8 @@ MAX_READ_LINE_LENGTH = 2000
 
 _FILE_LOCKS: dict[str, threading.RLock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
+_FILE_LOCKS_MAX_ENTRIES = 512  # 建议-12: LRU eviction ceiling
+_FILE_LOCKS_LAST_USED: dict[str, float] = {}
 
 
 @dataclass(frozen=True)
@@ -160,9 +163,21 @@ def _format_range(offset: int, shown: int, total: int, label: str) -> str:
 
 @contextmanager
 def _path_lock(path: Path) -> Iterator[None]:
+    """Yield a per-path RLock; evict rarely-used locks when the table is full (建议-12)."""
     key = str(path)
+    now = time.time()
     with _FILE_LOCKS_GUARD:
+        # Evict old entries if the table exceeds the ceiling.
+        if len(_FILE_LOCKS) >= _FILE_LOCKS_MAX_ENTRIES:
+            stale = [
+                k for k, ts in _FILE_LOCKS_LAST_USED.items()
+                if now - ts > 3600
+            ]
+            for k in stale[: max(1, len(stale) // 2)]:
+                _FILE_LOCKS.pop(k, None)
+                _FILE_LOCKS_LAST_USED.pop(k, None)
         lock = _FILE_LOCKS.setdefault(key, threading.RLock())
+        _FILE_LOCKS_LAST_USED[key] = now
     lock.acquire()
     try:
         yield
@@ -181,11 +196,62 @@ class _WorkspaceFileTool(Tool):
         project_root: str = ".",
         working_dir: Optional[str] = None,
         registry: Optional["ToolRegistry"] = None,
+        config: Any = None,
     ):
         super().__init__(name=name, description=description, expandable=False)
         self.project_root = Path(project_root).expanduser().resolve()
         self.working_dir = ensure_working_dir(self.project_root, working_dir)
         self.registry = registry
+        self._config = config
+
+    # ── 建议-12: centralized backup with retention ─────────────────
+    def _make_backup(self, full_path: Path) -> Optional[Path]:
+        """Save a timestamped backup to the centralized dir and prune old ones.
+
+        When ``_config`` is absent or ``backup_enabled`` is False, returns None
+        (backup is skipped).
+        """
+        cfg = self._config
+        if cfg is None or not getattr(cfg, "backup_enabled", True):
+            return None
+
+        backup_root = Path(
+            getattr(cfg, "backup_dir", "memory/.backups") or "memory/.backups"
+        )
+        if not backup_root.is_absolute():
+            backup_root = self.project_root / backup_root
+
+        rel = relative_display(self.project_root, full_path)
+        target_dir = (backup_root / rel).parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = target_dir / f"{full_path.name}.{timestamp}.bak"
+        shutil.copy2(full_path, backup_path)
+
+        # Prune: keep at most N backups per file, delete older than D days.
+        max_keep = int(getattr(cfg, "backup_max_per_file", 5) or 5)
+        retention_s = int(getattr(cfg, "backup_retention_days", 7) or 7) * 86400
+        cutoff = time.time() - retention_s
+
+        siblings = sorted(
+            target_dir.glob(f"{full_path.name}.*.bak"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for sibling in siblings[max_keep:]:
+            try:
+                sibling.unlink(missing_ok=True)
+            except OSError:
+                continue
+        for sibling in siblings[:max_keep]:
+            try:
+                if sibling.stat().st_mtime < cutoff:
+                    sibling.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+        return backup_path
 
     def _resolve_path(self, path: str) -> Path:
         return resolve_path(self.project_root, self.working_dir, path)
@@ -706,6 +772,7 @@ class WriteTool(_WorkspaceFileTool):
         project_root: str = ".",
         working_dir: Optional[str] = None,
         registry: Optional["ToolRegistry"] = None,
+        config: Any = None,
     ):
         super().__init__(
             name="Write",
@@ -716,6 +783,7 @@ class WriteTool(_WorkspaceFileTool):
             project_root=project_root,
             working_dir=working_dir,
             registry=registry,
+            config=config,
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -864,7 +932,7 @@ class WriteTool(_WorkspaceFileTool):
 
                 if not dry_run:
                     if full_path.exists():
-                        backup_path = self._backup_file(full_path)
+                        backup_path = self._make_backup(full_path)
                     atomic_write(full_path, new_content, encoding=encoding)
                     formatter_result = run_formatter(full_path, self.project_root)
                     diagnostics_result = run_diagnostics(full_path, self.project_root)
@@ -935,14 +1003,7 @@ class WriteTool(_WorkspaceFileTool):
                 message=f"Failed to write file: {exc}",
             )
 
-    @staticmethod
-    def _backup_file(full_path: Path) -> Path:
-        backup_dir = full_path.parent / ".backups"
-        backup_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        backup_path = backup_dir / f"{full_path.name}.{timestamp}.bak"
-        shutil.copy2(full_path, backup_path)
-        return backup_path
+    # ── _backup_file removed (建议-12: use _WorkspaceFileTool._make_backup) ──
 
 
 class DeleteTool(_WorkspaceFileTool):
@@ -1226,6 +1287,7 @@ class EditTool(_WorkspaceFileTool):
         project_root: str = ".",
         working_dir: Optional[str] = None,
         registry: Optional["ToolRegistry"] = None,
+        config: Any = None,
     ):
         super().__init__(
             name="Edit",
@@ -1237,6 +1299,7 @@ class EditTool(_WorkspaceFileTool):
             project_root=project_root,
             working_dir=working_dir,
             registry=registry,
+            config=config,
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -1439,7 +1502,7 @@ class EditTool(_WorkspaceFileTool):
                     skipped_reason="Diagnostics were not run.",
                 )
                 if not dry_run:
-                    backup_path = self._backup_file(full_path)
+                    backup_path = self._make_backup(full_path)
                     atomic_write(full_path, new_content, encoding=encoding)
                     formatter_result = run_formatter(full_path, self.project_root)
                     diagnostics_result = run_diagnostics(full_path, self.project_root)
@@ -1501,11 +1564,4 @@ class EditTool(_WorkspaceFileTool):
                 message=f"Failed to edit file: {exc}",
             )
 
-    @staticmethod
-    def _backup_file(full_path: Path) -> Path:
-        backup_dir = full_path.parent / ".backups"
-        backup_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        backup_path = backup_dir / f"{full_path.name}.{timestamp}.bak"
-        shutil.copy2(full_path, backup_path)
-        return backup_path
+    # ── _backup_file removed (建议-12: use _WorkspaceFileTool._make_backup) ──

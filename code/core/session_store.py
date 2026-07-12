@@ -15,6 +15,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from hashlib import sha256
 
+from .logging import agent_print
+
 
 class SessionStore:
     """会话存储器
@@ -178,7 +180,7 @@ class SessionStore:
                     "metadata": data.get("metadata", {})
                 })
             except Exception as e:
-                print(f"⚠️ 警告：无法读取 {filepath}: {e}")
+                agent_print(f"⚠️ 警告：无法读取 {filepath}: {e}")
 
         # 按保存时间倒序
         sessions.sort(key=lambda x: x.get("saved_at", ""), reverse=True)

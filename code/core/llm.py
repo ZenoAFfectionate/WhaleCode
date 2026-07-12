@@ -7,6 +7,7 @@ from typing import Optional, Iterator, List, Dict, Union, Any, AsyncIterator
 from .exceptions import HelloAgentsException
 from .llm_response import LLMResponse, StreamStats
 from .llm_adapters import create_adapter, BaseLLMAdapter
+from .logging import agent_print, agent_eprint
 
 
 class HelloAgentsLLM:
@@ -92,7 +93,13 @@ class HelloAgentsLLM:
         Note:
             流式调用结束后，可通过 llm.last_call_stats 获取统计信息
         """
-        print(f"🧠 Calling {self.model}...")
+        # 建议-7: keep IO out of the library path by default-configurable console
+        # output. Set HELLOAGENTS_QUIET=1 to suppress the decorative prints while
+        # still yielding chunks (callers that want console echo can print them).
+        verbose = os.getenv("HELLOAGENTS_QUIET", "").strip().lower() not in {"1", "true", "yes", "on"}
+
+        if verbose:
+            agent_print(f"🧠 Calling {self.model}...")
 
         # 准备参数
         kwargs = {
@@ -102,18 +109,22 @@ class HelloAgentsLLM:
             kwargs["max_tokens"] = self.max_tokens
 
         try:
-            print("✅ LLM response:")
+            if verbose:
+                agent_print("✅ LLM response:")
             for chunk in self._adapter.stream_invoke(messages, **kwargs):
-                print(chunk, end="", flush=True)
+                if verbose:
+                    agent_print(chunk, end="", flush=True)
                 yield chunk
-            print()  # 换行
+            if verbose:
+                agent_print()  # 换行
 
             # 保存统计信息
             if hasattr(self._adapter, 'last_stats'):
                 self.last_call_stats = self._adapter.last_stats
 
         except Exception as e:
-            print(f"❌ LLM API call failed: {e}")
+            if verbose:
+                agent_eprint(f"❌ LLM API call failed: {e}")
             raise
 
     def invoke(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
@@ -233,7 +244,7 @@ class HelloAgentsLLM:
             response = await llm.ainvoke([{"role": "user", "content": "你好"}])
             print(response.content)
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.invoke(messages, **kwargs)
@@ -285,7 +296,7 @@ class HelloAgentsLLM:
         Returns:
             原生响应对象，包含 tool_calls 信息
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.invoke_with_tools(messages, tools, tool_choice, **kwargs)

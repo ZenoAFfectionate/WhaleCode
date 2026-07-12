@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import sys
 import tempfile
 import time
@@ -232,6 +233,8 @@ class BenchmarkProgressManager:
         self._fallback_lines = 0
         self._live = None
         self._use_rich = bool(_RICH_AVAILABLE)
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
         self._console = Console(stderr=True) if self._use_rich else None
         self._ansi = bool(sys.stdout.isatty())
         self._mode = str(os.getenv("WHALE_BENCH_PROGRESS_MODE", "live") or "live").strip().lower()
@@ -249,6 +252,10 @@ class BenchmarkProgressManager:
             )
             self._live.start()
             self._refresh(force=True)
+            # Background thread to keep display live even when no progress events arrive
+            self._stop_event.clear()
+            self._refresh_thread = threading.Thread(target=self._periodic_refresh, daemon=True)
+            self._refresh_thread.start()
             return
         self._render_fallback(force=True)
 
@@ -297,6 +304,10 @@ class BenchmarkProgressManager:
         self._refresh(force=True)
 
     def close(self) -> None:
+        self._stop_event.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=2)
+            self._refresh_thread = None
         if self._live is not None:
             self._refresh(force=True)
             self._live.stop()
@@ -305,6 +316,18 @@ class BenchmarkProgressManager:
             sys.stdout.write("\n")
             sys.stdout.flush()
             self._fallback_lines = 0
+
+    def _periodic_refresh(self) -> None:
+        """Keep elapsed/ETA display live even when no progress events arrive."""
+        while not self._stop_event.is_set():
+            self._stop_event.wait(1.0)
+            if self._stop_event.is_set() or self._live is None:
+                continue
+            try:
+                self._live.update(self._renderable(), refresh=True)
+            except Exception:
+                # Live may be shutting down or terminal state may change.
+                pass
 
     def _refresh(self, force: bool = False) -> None:
         now = time.time()

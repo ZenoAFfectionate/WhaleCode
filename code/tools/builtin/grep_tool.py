@@ -217,6 +217,11 @@ class GrepTool(Tool):
 
         matches: List[GrepMatch] = []
         mtime_cache: Dict[str, int] = {}
+        # 建议-10: bound memory on pathological queries with millions of hits.
+        # We only keep the newest MAX_RESULTS after sorting, so reading far past
+        # that is pure waste; stop and terminate ripgrep once we hit the cap.
+        read_cap = max(self.MAX_RESULTS * 50, 5000)
+        hit_cap = False
 
         assert process.stdout is not None
         for raw_line in process.stdout:
@@ -235,12 +240,16 @@ class GrepTool(Tool):
             match = self._parse_match_event(payload.get("data", {}), mtime_cache)
             if match is not None:
                 matches.append(match)
+                if len(matches) >= read_cap:
+                    hit_cap = True
+                    process.terminate()
+                    break
 
         _, stderr_text = process.communicate()
         return_code = process.returncode
         stderr_text = stderr_text.strip()
 
-        if return_code not in (0, 1, 2):
+        if not hit_cap and return_code not in (0, 1, 2):
             raise subprocess.SubprocessError(stderr_text or "ripgrep failed")
 
         if return_code == 2 and not matches:

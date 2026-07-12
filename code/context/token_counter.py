@@ -90,9 +90,19 @@ class TokenCounter:
         try:
             from transformers import AutoTokenizer
 
+            # 建议-13: do NOT execute arbitrary tokenizer code by default. A model
+            # id that happens to match a local path could otherwise run custom
+            # code via trust_remote_code. Opt in explicitly when the source is
+            # trusted (HELLOAGENTS_TRUST_REMOTE_CODE=1).
+            trust_remote = os.getenv("HELLOAGENTS_TRUST_REMOTE_CODE", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
             tokenizer = AutoTokenizer.from_pretrained(
                 str(model_path),
-                trust_remote_code=True,
+                trust_remote_code=trust_remote,
                 local_files_only=True,
             )
         except Exception:

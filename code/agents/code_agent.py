@@ -15,6 +15,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CODE_AGENT_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "system_prompt.md"
 CODE_AGENT_SYSTEM_PROMPT: str = _CODE_AGENT_PROMPT_FILE.read_text(encoding="utf-8")
 
+# 重要-4: give the coding agent a finite default step budget so a model that
+# keeps issuing productive-looking tool calls cannot loop unbounded and rack up
+# unbounded cost. Pass max_steps=0 explicitly to opt into unlimited mode.
+DEFAULT_CODE_AGENT_MAX_STEPS = 100
+
 
 def _copy_config(config: Optional[Config]) -> Config:
     base = config or Config()
@@ -26,6 +31,10 @@ def _copy_config(config: Optional[Config]) -> Config:
 class CodeAgent(ReActAgent):
     """Coding agent with repository-aware prompts and built-in coding tools."""
 
+    #: Finite default step budget (see 重要-4). ``max_steps=0`` stays as an
+    #: explicit opt-in to unlimited stepping for advanced callers.
+    DEFAULT_MAX_STEPS = DEFAULT_CODE_AGENT_MAX_STEPS
+
     def __init__(
         self,
         name: str,
@@ -35,7 +44,7 @@ class CodeAgent(ReActAgent):
         working_dir: Optional[str] = None,
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
-        max_steps: int = 0,
+        max_steps: int = DEFAULT_CODE_AGENT_MAX_STEPS,
         register_default_tools: bool = True,
         enable_task_tool: bool = True,
         interactive: bool = True,
@@ -109,6 +118,7 @@ class CodeAgent(ReActAgent):
                 project_root=str(self.project_root),
                 working_dir=str(self.working_dir),
                 registry=self.tool_registry,
+                config=self.config,
             )
         )
         self.tool_registry.register_tool(
@@ -123,10 +133,11 @@ class CodeAgent(ReActAgent):
                 project_root=str(self.project_root),
                 working_dir=str(self.working_dir),
                 registry=self.tool_registry,
+                config=self.config,
             )
         )
         self.tool_registry.register_tool(
-            BashTool(project_root=str(self.project_root), working_dir=str(self.working_dir))
+            BashTool(project_root=str(self.project_root), working_dir=str(self.working_dir), config=self.config)
         )
         self.tool_registry.register_tool(AskUserTool(interactive=self.interactive))
 
@@ -136,7 +147,7 @@ class CodeAgent(ReActAgent):
             )
         if WebFetchTool.is_enabled_by_default():
             self.tool_registry.register_tool(
-                WebFetchTool(project_root=str(self.project_root))
+                WebFetchTool(project_root=str(self.project_root), config=self.config)
             )
         if enable_task_tool and self.config.todowrite_enabled and self.tool_registry.get_tool("TodoWrite") is None:
             self._register_todowrite_tool()
@@ -196,6 +207,21 @@ class CodeAgent(ReActAgent):
         """兼容旧调用点，实际复用共享的 HistoryManager 投影逻辑。"""
         return self._build_messages(input_text)
 
+    def _finalize_trace_safe(self, status: str, message: str) -> None:
+        """Q-1/Q-5: DRY the trace-cleanup logic used by both interrupt and error paths."""
+        if not self.trace_logger:
+            return
+        try:
+            if not self.trace_logger.jsonl_file.closed:
+                self.trace_logger.log_event(
+                    "session_end", {"status": status, "message": message}
+                )
+                self.trace_logger.finalize()
+        except Exception as exc:
+            # Don't let a trace-write failure mask the original error.
+            from ..core.logging import agent_print
+            agent_print(f"[{self.name}] trace finalize failed ({status}): {exc}")
+
     def run(self, input_text: str, **kwargs) -> str:
         """Run with the shared ReActAgent contract and CodeAgent tracing metadata."""
         self.trace_logger = None
@@ -219,26 +245,10 @@ class CodeAgent(ReActAgent):
         try:
             return super().run(input_text, **kwargs)
         except KeyboardInterrupt:
-            if self.trace_logger and not self.trace_logger.jsonl_file.closed:
-                try:
-                    self.trace_logger.log_event(
-                        "session_end",
-                        {"status": "interrupted", "message": "run aborted by interruption"},
-                    )
-                    self.trace_logger.finalize()
-                except Exception:
-                    pass
+            self._finalize_trace_safe("interrupted", "run aborted by interruption")
             raise
         except Exception:
-            if self.trace_logger and not self.trace_logger.jsonl_file.closed:
-                try:
-                    self.trace_logger.log_event(
-                        "session_end",
-                        {"status": "error", "message": "run aborted by exception"},
-                    )
-                    self.trace_logger.finalize()
-                except Exception:
-                    pass
+            self._finalize_trace_safe("error", "run aborted by exception")
             raise
         finally:
             self.trace_logger = None

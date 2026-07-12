@@ -10,18 +10,23 @@ Two-phase evaluation:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import random
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 
@@ -55,11 +60,10 @@ There is no human in the loop.
 ### Workflow (follow strictly)
 
 1. Locate relevant code with targeted searches.
-2. Read only the functions/classes you need to understand the issue.
-3. Diagnose the root cause and decide the fix.
-4. Edit the minimal set of files required for a correct fix.
-5. Verify lightly if it is fast and low-risk; otherwise skip local testing.
-6. Call `Finish` alone with a brief summary of what changed and why.
+2. Read only the minimal functions/classes needed.
+3. Diagnose root cause, then apply the minimal correct fix.
+4. Run fast, targeted verification only when useful.
+5. Call `Finish` with a concise summary of what changed and why.
 
 ### Critical Rules
 
@@ -110,6 +114,64 @@ _SWEV_ARTIFACT_SUFFIXES = (
 )
 
 _CONTAINER_WORKDIR = PurePosixPath("/testbed")
+_PROCESS_ERROR_CLIP = 1200
+
+
+def _clip_output(text: Optional[str], *, limit: int = _PROCESS_ERROR_CLIP) -> str:
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_subprocess_error(
+    *,
+    step: str,
+    command: List[str],
+    cwd: Optional[Path] = None,
+    returncode: Optional[int] = None,
+    stdout: Optional[str] = None,
+    stderr: Optional[str] = None,
+    timeout_s: Optional[float] = None,
+) -> str:
+    cmd_text = shlex.join(command)
+    lines = [f"{step} failed"]
+    lines.append(f"command: {cmd_text}")
+    if cwd is not None:
+        lines.append(f"cwd: {cwd}")
+    if timeout_s is not None:
+        lines.append(f"timeout_s: {timeout_s}")
+    if returncode is not None:
+        lines.append(f"returncode: {returncode}")
+    if stdout:
+        lines.append(f"stdout: {_clip_output(stdout)}")
+    if stderr:
+        lines.append(f"stderr: {_clip_output(stderr)}")
+    return "\n".join(lines)
+
+
+def _parse_slice_spec(slice_spec: str) -> Optional[slice]:
+    text = (slice_spec or "").strip()
+    if not text:
+        return None
+    if ":" not in text:
+        raise ValueError("Invalid --slice format, expected `start:end[:step]`")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError("Invalid --slice format, expected `start:end[:step]`")
+    values: List[Optional[int]] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            values.append(None)
+            continue
+        try:
+            values.append(int(part))
+        except ValueError as exc:
+            raise ValueError(f"Invalid --slice component: {part!r}") from exc
+    while len(values) < 3:
+        values.append(None)
+    return slice(values[0], values[1], values[2])
 
 
 class DockerizedWorkspace:
@@ -150,14 +212,55 @@ class DockerizedWorkspace:
             "sleep",
             self.container_timeout,
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.pull_timeout,
-            check=True,
-        )
-        self.container_id = result.stdout.strip()
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.pull_timeout,
+                check=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Container executable not found: {self.executable}. "
+                "Install Docker/Podman or pass --docker-executable."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step="docker run (container startup)",
+                    command=cmd,
+                    cwd=self.workspace,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                    timeout_s=self.pull_timeout,
+                )
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step="docker run (container startup)",
+                    command=cmd,
+                    cwd=self.workspace,
+                    returncode=exc.returncode,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                )
+            ) from exc
+
+        container_id = (result.stdout or "").strip()
+        if not container_id:
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step="docker run (container startup)",
+                    command=cmd,
+                    cwd=self.workspace,
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+            )
+        self.container_id = container_id
 
     def popen(
         self,
@@ -177,12 +280,15 @@ class DockerizedWorkspace:
             "-lc",
             command,
         ]
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=os.environ.copy(),
-        )
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Container executable not found: {self.executable}") from exc
 
     def cleanup(self) -> None:
         if not self.container_id:
@@ -404,6 +510,13 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         docker_executable: str = "docker",
         docker_container_timeout: str = "2h",
         docker_pull_timeout: int = 600,
+        filter_spec: str = "",
+        slice_spec: str = "",
+        shuffle: bool = False,
+        seed: int = 42,
+        preds_path: Optional[str] = None,
+        redo_existing: bool = False,
+        workers: int = 1,
         **kwargs,
     ):
         super().__init__(*args, trajectory_dir=trajectory_dir, task_timeout=task_timeout, **kwargs)
@@ -415,18 +528,93 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         self.docker_executable = docker_executable
         self.docker_container_timeout = docker_container_timeout
         self.docker_pull_timeout = docker_pull_timeout
+        self.filter_spec = filter_spec.strip()
+        self.slice_spec = slice_spec.strip()
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.preds_path = Path(preds_path).expanduser() if preds_path else None
+        self.redo_existing = bool(redo_existing)
+        self.workers = max(1, int(workers))
+        if self.filter_spec:
+            try:
+                self._filter_regex = re.compile(self.filter_spec)
+            except re.error as exc:
+                raise ValueError(f"Invalid --filter regex {self.filter_spec!r}: {exc}") from exc
+        else:
+            self._filter_regex = None
+        self._slice = _parse_slice_spec(self.slice_spec) if self.slice_spec else None
+        self._preds_completed_ids: Set[str] = set()
+        if self.preds_path and not self.redo_existing:
+            self._preds_completed_ids = self._load_existing_prediction_ids(self.preds_path)
+        self._repo_lock_guard = threading.Lock()
+        self._repo_locks: Dict[str, threading.Lock] = {}
+        self._thread_state = threading.local()
 
     def _get_system_prompt(self) -> Optional[str]:
         """Use the SWE-bench-specific system prompt."""
         return _SWEV_SYSTEM_PROMPT
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
-        return self._load_jsonl_tasks(
+        tasks = self._load_jsonl_tasks(
             task_transform=lambda task: {
                 **task,
                 "task_id": task.get("instance_id", task.get("task_id")),
             }
         )
+        if self._filter_regex is not None:
+            tasks = [task for task in tasks if self._filter_regex.search(str(task.get("task_id", "")))]
+        if self.shuffle:
+            tasks = sorted(tasks, key=lambda item: str(item.get("task_id", "")))
+            rng = random.Random(self.seed)
+            rng.shuffle(tasks)
+        if self._slice is not None:
+            tasks = tasks[self._slice]
+        if self._preds_completed_ids:
+            tasks = [task for task in tasks if str(task.get("task_id", "")) not in self._preds_completed_ids]
+        return tasks
+
+    @staticmethod
+    def _load_existing_prediction_ids(preds_path: Path) -> Set[str]:
+        if not preds_path.exists():
+            return set()
+
+        completed: Set[str] = set()
+        suffix = preds_path.suffix.lower()
+        if suffix == ".json":
+            try:
+                payload = json.loads(preds_path.read_text(encoding="utf-8"))
+            except Exception:
+                return completed
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    if isinstance(value, dict):
+                        instance_id = value.get("instance_id", key)
+                    else:
+                        instance_id = key
+                    if instance_id:
+                        completed.add(str(instance_id))
+            elif isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict) and item.get("instance_id"):
+                        completed.add(str(item["instance_id"]))
+            return completed
+
+        if suffix == ".jsonl":
+            try:
+                with preds_path.open(encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(item, dict) and item.get("instance_id"):
+                            completed.add(str(item["instance_id"]))
+            except Exception:
+                return completed
+        return completed
 
     @staticmethod
     def _load_completed_ids(resume_file: Path) -> Set[str]:
@@ -453,9 +641,59 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 completed.add(str(task_id))
         return completed
 
+    def _docker_preflight(self) -> None:
+        cmd = [self.docker_executable, "info"]
+        try:
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=min(60, self.docker_pull_timeout),
+                check=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Docker executable not found: {self.docker_executable}. "
+                "Install Docker/Podman or pass --docker-executable."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step="docker preflight (`docker info`)",
+                    command=cmd,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                    timeout_s=float(exc.timeout or 0),
+                )
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step="docker preflight (`docker info`)",
+                    command=cmd,
+                    returncode=exc.returncode,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                )
+            ) from exc
+
     # ------------------------------------------------------------------
     # Repository management
     # ------------------------------------------------------------------
+
+    def _set_clone_error(self, message: Optional[str]) -> None:
+        self._thread_state.clone_error = message
+
+    def _get_clone_error(self) -> Optional[str]:
+        return getattr(self._thread_state, "clone_error", None)
+
+    def _repo_lock_for(self, repo_slug: str) -> threading.Lock:
+        with self._repo_lock_guard:
+            lock = self._repo_locks.get(repo_slug)
+            if lock is None:
+                lock = threading.Lock()
+                self._repo_locks[repo_slug] = lock
+            return lock
 
     @staticmethod
     def _remove_git_lock_files(repo_path: Path) -> None:
@@ -516,6 +754,87 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         except Exception:
             return
 
+    @staticmethod
+    def _normalize_failed_command(raw_cmd: Any, *, fallback: List[str]) -> List[str]:
+        if isinstance(raw_cmd, (list, tuple)):
+            return [str(part) for part in raw_cmd]
+        if isinstance(raw_cmd, str):
+            try:
+                parsed = shlex.split(raw_cmd)
+            except ValueError:
+                parsed = []
+            if parsed:
+                return parsed
+        return list(fallback)
+
+    @staticmethod
+    def _run_checked_command(
+        *,
+        step: str,
+        command: List[str],
+        cwd: Optional[Path] = None,
+        timeout_s: int,
+    ) -> None:
+        try:
+            subprocess.run(
+                command,
+                cwd=str(cwd) if cwd is not None else None,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            failed_cmd = SWEBenchVerifiedBenchmark._normalize_failed_command(exc.cmd, fallback=command)
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step=step,
+                    command=failed_cmd,
+                    cwd=cwd,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                    timeout_s=float(exc.timeout or timeout_s),
+                )
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            failed_cmd = SWEBenchVerifiedBenchmark._normalize_failed_command(exc.cmd, fallback=command)
+            raise RuntimeError(
+                _format_subprocess_error(
+                    step=step,
+                    command=failed_cmd,
+                    cwd=cwd,
+                    returncode=exc.returncode,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                )
+            ) from exc
+
+    def _run_clone_sequence(
+        self,
+        *,
+        step: str,
+        target: Path,
+        commands: List[Tuple[List[str], Optional[Path], int]],
+    ) -> bool:
+        try:
+            for command, cwd, timeout_s in commands:
+                self._run_checked_command(
+                    step=step,
+                    command=command,
+                    cwd=cwd,
+                    timeout_s=timeout_s,
+                )
+            return True
+        except RuntimeError as exc:
+            message = str(exc)
+        except Exception as exc:
+            message = f"{step} failed: {type(exc).__name__}: {exc}"
+
+        self._set_clone_error(message)
+        print(f"\n  [WARN] {message}")
+        shutil.rmtree(target, ignore_errors=True)
+        return False
+
     def _reset_cached_repo(self, cached: Path, base_commit: str) -> bool:
         """Reset a cached repo to a specific commit. Returns True on success."""
         ws = str(cached)
@@ -550,54 +869,34 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
     def _clone_repo_to_target(self, repo: str, base_commit: str, target: Path) -> Optional[Path]:
         """Clone a GitHub repo at a specific commit into *target*."""
         url = f"https://github.com/{repo}.git"
-        try:
-            subprocess.run(
-                ["git", "clone", "--quiet", "--filter=blob:none", url, str(target)],
-                capture_output=True, text=True, timeout=600, check=True,
-            )
-            subprocess.run(
-                ["git", "checkout", "-f", base_commit],
-                cwd=str(target), capture_output=True, text=True, timeout=120, check=True,
-            )
+        clone_cmd = ["git", "clone", "--quiet", "--filter=blob:none", url, str(target)]
+        checkout_cmd = ["git", "checkout", "-f", base_commit]
+        if self._run_clone_sequence(
+            step=f"clone {repo}@{base_commit[:10]}",
+            target=target,
+            commands=[
+                (clone_cmd, None, 600),
+                (checkout_cmd, target, 120),
+            ],
+        ):
             return target
-        except subprocess.TimeoutExpired:
-            print(f"\n  [WARN] Clone timed out for {repo}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
-        except subprocess.CalledProcessError as exc:
-            print(f"\n  [WARN] Clone failed for {repo}: {(exc.stderr or '')[:200]}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
-        except Exception as exc:
-            print(f"\n  [WARN] Clone error for {repo}: {exc}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
+        return None
 
     def _clone_repo_from_cache(self, cached: Path, base_commit: str, repo_slug: str) -> Optional[Path]:
         """Materialize an isolated temp workspace from the cached repo."""
         target = self._make_workspace(f"swev_{repo_slug}_")
-        try:
-            subprocess.run(
-                ["git", "clone", "--quiet", "--shared", "--no-checkout", str(cached), str(target)],
-                capture_output=True, text=True, timeout=180, check=True,
-            )
-            subprocess.run(
-                ["git", "checkout", "-f", base_commit],
-                cwd=str(target), capture_output=True, text=True, timeout=120, check=True,
-            )
+        clone_cmd = ["git", "clone", "--quiet", "--shared", "--no-checkout", str(cached), str(target)]
+        checkout_cmd = ["git", "checkout", "-f", base_commit]
+        if self._run_clone_sequence(
+            step=f"materialize cache {cached.name}@{base_commit[:10]}",
+            target=target,
+            commands=[
+                (clone_cmd, None, 180),
+                (checkout_cmd, target, 120),
+            ],
+        ):
             return target
-        except subprocess.TimeoutExpired:
-            print(f"\n  [WARN] Local cache materialization timed out for {cached.name}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
-        except subprocess.CalledProcessError as exc:
-            print(f"\n  [WARN] Local cache materialization failed for {cached.name}: {(exc.stderr or '')[:200]}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
-        except Exception as exc:
-            print(f"\n  [WARN] Local cache materialization error for {cached.name}: {exc}")
-            shutil.rmtree(target, ignore_errors=True)
-            return None
+        return None
 
     def _clone_repo(self, repo: str, base_commit: str) -> Optional[Path]:
         """Clone a GitHub repo at a specific commit.
@@ -608,47 +907,47 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         source of truth and each task gets an isolated temp workspace derived
         from it. Returns the workspace path, or None on failure.
         """
+        self._set_clone_error(None)
         repo_slug = repo.replace("/", "__")
+        repo_lock = self._repo_lock_for(repo_slug)
 
         # Check cache first
         if self.repo_cache_dir:
-            cached = self.repo_cache_dir / repo_slug
-            if cached.exists():
-                # Try direct checkout
-                if self._reset_cached_repo(cached, base_commit):
-                    isolated = self._clone_repo_from_cache(cached, base_commit, repo_slug)
+            with repo_lock:
+                cached = self.repo_cache_dir / repo_slug
+                if cached.exists():
+                    # Try direct checkout
+                    if self._reset_cached_repo(cached, base_commit):
+                        isolated = self._clone_repo_from_cache(cached, base_commit, repo_slug)
+                        if isolated:
+                            return isolated
+
+                    # First attempt failed — try fetching latest refs then retry
+                    print(f"\n  [WARN] Cache checkout failed for {repo}@{base_commit[:10]}, fetching...")
+                    try:
+                        subprocess.run(
+                            ["git", "fetch", "--all"],
+                            cwd=str(cached), capture_output=True, timeout=300,
+                        )
+                    except Exception:
+                        pass
+
+                    if self._reset_cached_repo(cached, base_commit):
+                        isolated = self._clone_repo_from_cache(cached, base_commit, repo_slug)
+                        if isolated:
+                            return isolated
+
+                    print(f"\n  [WARN] Retry checkout also failed for {repo}@{base_commit[:10]}")
+                    shutil.rmtree(cached, ignore_errors=True)
+
+                # Re-clone into cache path
+                fresh = self._clone_repo_to_target(repo, base_commit, cached)
+                if fresh:
+                    isolated = self._clone_repo_from_cache(fresh, base_commit, repo_slug)
                     if isolated:
                         return isolated
-                    return cached
 
-                # First attempt failed — try fetching latest refs then retry
-                print(f"\n  [WARN] Cache checkout failed for {repo}@{base_commit[:10]}, fetching...")
-                try:
-                    subprocess.run(
-                        ["git", "fetch", "--all"],
-                        cwd=str(cached), capture_output=True, timeout=300,
-                    )
-                except Exception:
-                    pass
-
-                if self._reset_cached_repo(cached, base_commit):
-                    isolated = self._clone_repo_from_cache(cached, base_commit, repo_slug)
-                    if isolated:
-                        return isolated
-                    return cached
-
-                print(f"\n  [WARN] Retry checkout also failed for {repo}@{base_commit[:10]}")
-                shutil.rmtree(cached, ignore_errors=True)
-
-            # Re-clone into cache path
-            fresh = self._clone_repo_to_target(repo, base_commit, cached)
-            if fresh:
-                isolated = self._clone_repo_from_cache(fresh, base_commit, repo_slug)
-                if isolated:
-                    return isolated
-                return fresh
-
-            # Fallback to temp if cache clone failed
+            # Fallback to isolated temp clone if cache path failed
             temp_target = self._make_workspace(f"swev_{repo_slug}_")
             return self._clone_repo_to_target(repo, base_commit, temp_target)
 
@@ -749,7 +1048,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
     # Evaluation
     # ------------------------------------------------------------------
 
-    def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
         repo = task["repo"]
         base_commit = task["base_commit"]
@@ -771,7 +1070,11 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         try:
             workspace = self._clone_repo(repo, base_commit)
             if workspace is None:
-                error = f"Failed to clone {repo}@{base_commit}"
+                detailed_clone_error = self._get_clone_error()
+                if detailed_clone_error:
+                    error = detailed_clone_error
+                else:
+                    error = f"Failed to clone {repo}@{base_commit}"
                 exit_status = "CloneFailed"
                 return {
                     "task_id": task_id,
@@ -809,17 +1112,11 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 f"Shell commands execute inside the official SWE-bench Docker image, "
                 f"while file tools edit the mounted repository workspace.\n\n"
                 f"## Strategy\n\n"
-                f"1. **Identify the bug location**: Grep for key symbols from the "
-                f"issue (class names, method names, error messages). Narrow down "
-                f"to the smallest relevant set of files.\n"
-                f"2. **Read the relevant code**: Read the specific function or "
-                f"method (not the whole file). Understand the logic.\n"
-                f"3. **Diagnose**: Reason from the code before editing: "
-                f"(a) what the current code does wrong, (b) what it should do instead.\n"
-                f"4. **Edit**: Make the minimal fix needed for correctness.\n"
-                f"5. **Verify**: Re-read the edited lines. If there is an obvious "
-                f"fast reproducer or targeted test, run it; otherwise skip local testing.\n"
-                f"6. **Respond**: Call `Finish` alone with a concise summary of what changed and why.\n"
+                f"1. Locate the bug with targeted search (symbols/errors from the issue).\n"
+                f"2. Read only relevant code blocks; diagnose root cause before editing.\n"
+                f"3. Apply the minimal correct fix; avoid unrelated refactors.\n"
+                f"4. Run quick targeted validation when low-cost; otherwise skip.\n"
+                f"5. Call `Finish` with a concise change summary.\n"
             )
 
             try:
@@ -904,9 +1201,9 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             if is_temp and workspace and workspace.exists():
                 shutil.rmtree(workspace, ignore_errors=True)
 
-    def _evaluate_task_with_timeout(self, task: Dict[str, Any], task_id: str) -> Dict[str, Any]:
+    def _use_subprocess_task_timeout(self) -> bool:
         """SWE-bench uses its own agent timeout so partial diffs can be recovered."""
-        return self._evaluate_task(task)
+        return False
 
     def _run_agent_with_timeout(self, agent, prompt: str) -> str:
         """Run ``agent.run()`` with a wall-clock timeout and recover partial diffs."""
@@ -947,6 +1244,221 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
     # Override run() to add resume support and predictions export
     # ------------------------------------------------------------------
 
+    def _export_predictions(
+        self,
+        *,
+        results_file: Path,
+        timestamp: str,
+    ) -> Tuple[Path, Path, int, int]:
+        predictions_file = self.output_dir / f"swev_predictions_{timestamp}.jsonl"
+        preds_json_file = self.output_dir / f"swev_preds_{timestamp}.json"
+        latest_preds_file = self.output_dir / "preds.json"
+
+        diff_count = 0
+        final_results = self._latest_result_records(self._load_result_records(results_file))
+        preds_map: Dict[str, Dict[str, str]] = {}
+        with predictions_file.open("w", encoding="utf-8") as fout:
+            for result in final_results:
+                instance_id = str(result.get("task_id", "") or "")
+                agent_diff = str(result.get("agent_diff", "") or "")
+                if agent_diff:
+                    diff_count += 1
+                prediction = {
+                    "instance_id": instance_id,
+                    "model_name_or_path": self.model_name,
+                    "model_patch": agent_diff,
+                }
+                preds_map[instance_id] = prediction
+                fout.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+
+        preds_json_file.write_text(
+            json.dumps(preds_map, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        latest_preds_file.write_text(
+            json.dumps(preds_map, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return predictions_file, preds_json_file, diff_count, len(final_results)
+
+    def _run_parallel(
+        self,
+        *,
+        limit: Optional[int],
+        task_ids: Optional[List[str]],
+        dry_run: bool,
+        resume: Optional[str],
+    ) -> Dict[str, Any]:
+        tasks = self._load_tasks()
+        if task_ids:
+            id_set = set(task_ids)
+            tasks = [t for t in tasks if t.get("task_id") in id_set]
+        if limit and limit > 0:
+            tasks = tasks[:limit]
+
+        completed_ids: Set[str] = set()
+        resume_path: Optional[Path] = Path(resume) if resume else None
+        persisted_records: List[Dict[str, Any]] = []
+        record_index: Dict[str, int] = {}
+        if resume_path is not None:
+            if not resume_path.exists():
+                print(f"  ▶ Resume target does not exist yet: {resume_path}")
+                print("    A new results file will be created at this path.\n")
+            else:
+                raw_records = self._load_result_records(resume_path)
+                persisted_records = self._latest_result_records(raw_records)
+                if len(persisted_records) != len(raw_records):
+                    duplicate_count = len(raw_records) - len(persisted_records)
+                    self._write_result_records(resume_path, persisted_records)
+                    print(f"  ▶ Cleaned {duplicate_count} duplicate result record(s) before resuming")
+                completed_ids = self._load_completed_ids(resume_path)
+                print(f"  ▶ Resuming from: {resume_path}")
+                print(f"    Already completed: {len(completed_ids)} tasks")
+
+        if resume_path is not None:
+            results_file = resume_path
+            results_file.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
+
+        if not persisted_records and results_file.exists():
+            persisted_records = self._latest_result_records(self._load_result_records(results_file))
+        for idx, record in enumerate(persisted_records):
+            task_id = record.get("task_id")
+            if task_id is not None:
+                record_index[str(task_id)] = idx
+
+        print(f"\n{'=' * 60}")
+        print(f"  Benchmark: {self.benchmark_name}")
+        print(f"  Tasks: {len(tasks)}")
+        print(f"  Workers: {self.workers}")
+        model_label = self.model or os.getenv("LLM_MODEL_ID") or "(from env)"
+        print(f"  Model: {model_label}")
+        print(f"  Max steps: {self.max_steps}")
+        print(f"  Timeout: {self.timeout}s")
+        print(f"  Task timeout: {self.task_timeout}s")
+        if self._preds_completed_ids and not self.redo_existing:
+            print(f"  Skip existing preds: {len(self._preds_completed_ids)} IDs from {self.preds_path}")
+        if completed_ids:
+            remaining = sum(1 for t in tasks if str(t.get("task_id", "")) not in completed_ids)
+            print(f"  Resume: {len(completed_ids)} done, {remaining} remaining")
+        print(f"{'=' * 60}\n")
+
+        if dry_run:
+            for task in tasks:
+                task_id = str(task.get("task_id", ""))
+                tag = " [SKIP]" if task_id in completed_ids else ""
+                print(f"  [dry-run] {task_id}{tag}")
+            return {"benchmark": self.benchmark_name, "total": len(tasks), "dry_run": True}
+
+        pending_tasks = [task for task in tasks if str(task.get("task_id", "")) not in completed_ids]
+        skipped = len(tasks) - len(pending_tasks)
+        if pending_tasks:
+            self._docker_preflight()
+
+        results: List[Dict[str, Any]] = []
+        passed_count = 0
+        total_time = 0.0
+        lock = threading.Lock()
+        completed = 0
+        total_pending = len(pending_tasks)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+            future_to_task = {
+                executor.submit(
+                    self.evaluate,
+                    task,
+                    task_id=str(task.get("task_id", f"task_{idx}")),
+                ): task
+                for idx, task in enumerate(pending_tasks)
+            }
+            for future in concurrent.futures.as_completed(future_to_task):
+                task = future_to_task[future]
+                task_id = str(task.get("task_id", ""))
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "task_id": task_id,
+                        "passed": False,
+                        "error": f"Runner exception: {type(exc).__name__}: {exc}",
+                        "elapsed_s": 0.0,
+                        "agent_diff": "",
+                    }
+
+                with lock:
+                    completed += 1
+                    results.append(result)
+                    if result.get("passed") is True:
+                        passed_count += 1
+                    total_time += float(result.get("elapsed_s", 0.0) or 0.0)
+
+                    self._upsert_result_record(persisted_records, record_index, result)
+                    self._write_result_records(results_file, persisted_records)
+
+                    status = "PASS" if result.get("passed") is True else "FAIL"
+                    if result.get("passed") is None:
+                        status = "UNFIN"
+                    has_diff = bool(result.get("agent_diff"))
+                    print(
+                        f"  [{completed:>4}/{total_pending}] {status:<5} "
+                        f"{task_id} diff={str(has_diff):<5} "
+                        f"time={float(result.get('elapsed_s', 0.0) or 0.0):.1f}s"
+                    )
+
+        evaluated = len(results)
+        new_pass_rate = (passed_count / evaluated * 100) if evaluated > 0 else 0.0
+        combined = self._summarize_result_records(persisted_records)
+        summary = {
+            "benchmark": self.benchmark_name,
+            "model": self.model or "(from env)",
+            "total": len(tasks),
+            "evaluated": combined["tasks"],
+            "new_evaluated": evaluated,
+            "skipped": skipped,
+            "passed": combined["passed"],
+            "failed": combined["failed"],
+            "unfinished": combined["unfinished"],
+            "pass_rate": combined["pass_rate"],
+            "total_time_s": combined["total_time_s"],
+            "avg_time_s": combined["avg_time_s"],
+            "records_in_file": combined["records_in_file"],
+            "new_passed": passed_count,
+            "new_failed": sum(1 for r in results if r.get("passed") is False),
+            "new_unfinished": sum(1 for r in results if r.get("passed") is None),
+            "new_pass_rate": round(new_pass_rate, 2),
+            "new_total_time_s": round(total_time, 2),
+            "new_avg_time_s": round(total_time / evaluated, 2) if evaluated > 0 else 0,
+            "timestamp": timestamp,
+            "results_file": str(results_file),
+            "trajectory_dir": str(self.trajectory_dir),
+            "resumed_from": resume if resume else None,
+            "workers": self.workers,
+        }
+
+        summary_file = self.output_dir / f"{self.benchmark_name}_{timestamp}_summary.json"
+        summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        print(f"\n{'=' * 60}")
+        if skipped:
+            print(f"  Resumed/Skipped: {skipped} tasks")
+        print(
+            f"  Combined results: {combined['passed']}/{combined['tasks']} passed "
+            f"({combined['pass_rate']:.1f}%)"
+        )
+        if combined["unfinished"]:
+            print(f"  Combined unfinished: {combined['unfinished']}")
+        print(
+            f"  New results: {passed_count}/{evaluated} passed "
+            f"({new_pass_rate:.1f}%)"
+        )
+        print(f"  Output: {results_file}")
+        print(f"  Summary: {summary_file}")
+        print(f"{'=' * 60}\n")
+        return summary
+
     def run(
         self,
         limit: Optional[int] = None,
@@ -957,9 +1469,10 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         """Run the benchmark and export predictions for Docker evaluation."""
         # Use the constructor's resume_file (swev has custom clone-failure logic)
         effective_resume = resume or self.resume_file
-
-        summary = super().run(
-            limit=limit, task_ids=task_ids, dry_run=dry_run,
+        summary = self._run_parallel(
+            limit=limit,
+            task_ids=task_ids,
+            dry_run=dry_run,
             resume=effective_resume,
         )
 
@@ -973,32 +1486,21 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             return summary
 
         timestamp = summary.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
-        predictions_file = self.output_dir / f"swev_predictions_{timestamp}.jsonl"
-
-        diff_count = 0
-        final_results = self._latest_result_records(self._load_result_records(results_file))
-        with open(predictions_file, "w", encoding="utf-8") as fout:
-            for result in final_results:
-                instance_id = result.get("task_id", "")
-                agent_diff = result.get("agent_diff", "")
-                if agent_diff:
-                    diff_count += 1
-                prediction = {
-                    "instance_id": instance_id,
-                    "model_name_or_path": self.model_name,
-                    "model_patch": agent_diff,
-                }
-                fout.write(json.dumps(prediction, ensure_ascii=False) + "\n")
-
-        total = len(final_results)
+        predictions_file, preds_json_file, diff_count, total = self._export_predictions(
+            results_file=results_file,
+            timestamp=timestamp,
+        )
         print(f"\n{'=' * 60}")
         print(f"  Predictions: {predictions_file}")
+        print(f"  Predictions (json): {preds_json_file}")
+        print(f"  Predictions (latest): {self.output_dir / 'preds.json'}")
         print(f"  Diffs produced: {diff_count}/{total}")
         print("\n  To evaluate with Docker:")
         print(f"  bash scripts/run_swev_eval.sh {predictions_file}")
         print(f"{'=' * 60}\n")
 
         summary["predictions_file"] = str(predictions_file)
+        summary["predictions_json_file"] = str(preds_json_file)
         summary["diff_count"] = diff_count
         summary["trajectory_dir"] = str(self.trajectory_dir)
         return summary
@@ -1025,9 +1527,49 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--task-ids", nargs="*", default=None)
     parser.add_argument(
+        "--filter",
+        default="",
+        help="Regex filter for instance_id/task_id (applied before --limit)",
+    )
+    parser.add_argument(
+        "--slice",
+        default="",
+        help="Slice expression like `0:50` or `10:200:2` (applied after --filter/shuffle)",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle tasks deterministically before slicing/limit",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used when --shuffle is enabled",
+    )
+    parser.add_argument(
         "--repo-cache-dir",
         default=None,
         help="Directory to cache cloned repos between runs",
+    )
+    parser.add_argument(
+        "--preds-path",
+        default=None,
+        help=(
+            "Optional existing predictions file (.json/.jsonl). "
+            "When provided, completed IDs are skipped unless --redo-existing is set."
+        ),
+    )
+    parser.add_argument(
+        "--redo-existing",
+        action="store_true",
+        help="Do not skip IDs found in --preds-path",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker threads for phase-1 inference (default: 1)",
     )
     parser.add_argument(
         "--model-name",
@@ -1062,24 +1604,35 @@ def main():
         metavar="RESULTS_FILE",
         help="Resume from a previous results JSONL file, skipping completed tasks",
     )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Only run Docker preflight checks and exit",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     bench = SWEBenchVerifiedBenchmark(
         data_path=args.data_path,
-        output_dir=args.output_dir,
-        temperature=args.temperature,
-        max_steps=args.max_steps,
-        timeout=args.timeout,
         repo_cache_dir=args.repo_cache_dir,
         model_name=args.model_name,
-        task_timeout=args.task_timeout,
         resume_file=args.resume,
-        trajectory_dir=args.trajectory_dir,
         docker_executable=args.docker_executable,
         docker_container_timeout=args.docker_container_timeout,
         docker_pull_timeout=args.docker_pull_timeout,
+        filter_spec=args.filter,
+        slice_spec=args.slice,
+        shuffle=args.shuffle,
+        seed=args.seed,
+        preds_path=args.preds_path,
+        redo_existing=args.redo_existing,
+        workers=args.workers,
+        **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
+    if args.preflight_only:
+        bench._docker_preflight()
+        print("SWEV preflight check passed.")
+        return
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 
 

@@ -7,6 +7,7 @@ from typing import Optional, Any, Callable, Dict
 from .base import Tool
 from .response import ToolResponse
 from .errors import ToolErrorCode
+from ..core.logging import agent_print
 from .circuit_breaker import CircuitBreaker
 
 
@@ -49,7 +50,7 @@ class ToolRegistry:
 
     def _emit(self, message: str) -> None:
         if self.verbose:
-            print(message)
+            agent_print(message)
 
     def register_tool(self, tool: Tool, auto_expand: bool = True):
         """
@@ -322,7 +323,7 @@ class ToolRegistry:
         """Clear all tools"""
         self._tools.clear()
         self._functions.clear()
-        print("🧹 All tools have been cleared.")
+        agent_print("🧹 All tools have been cleared.")
 
     # ==================== Optimistic Locking Mechanism Support ====================
 

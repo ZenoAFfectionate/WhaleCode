@@ -1,5 +1,8 @@
 """LLM适配器 - 支持OpenAI、Anthropic、Gemini等不同接口格式"""
 
+import json as _json
+import os
+import random
 import time
 import asyncio
 from abc import ABC, abstractmethod
@@ -8,6 +11,134 @@ from typing import Optional, Iterator, List, Dict, Any, Union, AsyncIterator
 from .llm_response import LLMResponse, StreamStats
 from .exceptions import HelloAgentsException
 from .reasoning import extract_reasoning_payload
+
+
+# --- Cross-provider tool-call normalization (重要-3) --------------------------
+# Agents consume ``response.choices[0].message.tool_calls`` (OpenAI shape).
+# Anthropic/Gemini return native structures without ``.choices`` and would crash
+# the ReAct loop. These light shims wrap those responses into an OpenAI-like
+# object so a single agent code path works across providers.
+
+class _NToolFunction:
+    """Lightweight OpenAI-compatible ``function`` shim for tool-call normalization (重要-3)."""
+    def __init__(self, name: str, arguments: str):
+        self.name = name
+        self.arguments = arguments
+
+
+class _NToolCall:
+    """Lightweight OpenAI-compatible ``tool_call`` shim."""
+    def __init__(self, id: str, name: str, arguments: str):
+        self.id = id
+        self.type = "function"
+        self.function = _NToolFunction(name, arguments)
+
+
+class _NMessage:
+    """Lightweight OpenAI-compatible ``message`` shim."""
+    def __init__(self, content: str, tool_calls: Optional[List["_NToolCall"]] = None):
+        self.content = content or ""
+        self.tool_calls = tool_calls or None
+
+
+class _NChoice:
+    """Lightweight OpenAI-compatible ``choice`` shim."""
+    def __init__(self, message: "_NMessage"):
+        self.message = message
+        self.finish_reason = "tool_calls" if message.tool_calls else "stop"
+
+
+class _NResponse:
+    """OpenAI-compatible response shim (only the attributes agents read)."""
+
+    def __init__(self, message: "_NMessage", *, usage: Any = None, usage_metadata: Any = None):
+        self.choices = [_NChoice(message)]
+        self.usage = usage
+        self.usage_metadata = usage_metadata
+
+
+def normalize_anthropic_tool_response(response: Any) -> _NResponse:
+    """Convert an Anthropic Messages response into the OpenAI-compatible shim."""
+    content_text = ""
+    tool_calls: List[_NToolCall] = []
+    for block in getattr(response, "content", None) or []:
+        block_type = getattr(block, "type", None)
+        if block_type == "tool_use" or (getattr(block, "name", None) and getattr(block, "input", None) is not None):
+            tool_calls.append(
+                _NToolCall(
+                    id=str(getattr(block, "id", "") or ""),
+                    name=str(getattr(block, "name", "") or ""),
+                    arguments=_json.dumps(getattr(block, "input", {}) or {}, ensure_ascii=False),
+                )
+            )
+        elif getattr(block, "text", None) is not None:
+            content_text += getattr(block, "text", "") or ""
+    return _NResponse(_NMessage(content_text, tool_calls), usage=getattr(response, "usage", None))
+
+
+def normalize_gemini_tool_response(response: Any) -> _NResponse:
+    """Convert a Gemini generate_content response into the OpenAI-compatible shim."""
+    content_text = ""
+    tool_calls: List[_NToolCall] = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            function_call = getattr(part, "function_call", None)
+            if function_call is not None and getattr(function_call, "name", None):
+                args = getattr(function_call, "args", {}) or {}
+                try:
+                    args = dict(args)
+                except (TypeError, ValueError):
+                    args = {}
+                tool_calls.append(
+                    _NToolCall(
+                        id=str(getattr(function_call, "name", "")),
+                        name=str(getattr(function_call, "name", "")),
+                        arguments=_json.dumps(args, ensure_ascii=False),
+                    )
+                )
+            elif getattr(part, "text", None):
+                content_text += getattr(part, "text", "") or ""
+    return _NResponse(
+        _NMessage(content_text, tool_calls),
+        usage_metadata=getattr(response, "usage_metadata", None),
+    )
+
+
+# --- Retry with exponential backoff (重要-12) --------------------------------
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_NAME_HINTS = (
+    "timeout",
+    "connection",
+    "apiconnection",
+    "serviceunavailable",
+    "internalserver",
+    "ratelimit",
+    "overloaded",
+    "temporarilyunavailable",
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 class BaseLLMAdapter(ABC):
@@ -20,6 +151,10 @@ class BaseLLMAdapter(ABC):
         self.model = model
         self._client = None
         self._async_client = None
+        # 重要-12: bounded exponential-backoff retry for transient API failures.
+        self.max_retries = _env_int("LLM_MAX_RETRIES", 2)
+        self.retry_base_delay = _env_float("LLM_RETRY_BASE_DELAY", 0.5)
+        self.retry_max_delay = _env_float("LLM_RETRY_MAX_DELAY", 8.0)
 
     @abstractmethod
     def create_client(self) -> Any:
@@ -46,7 +181,10 @@ class BaseLLMAdapter(ABC):
         默认实现：使用队列 + 线程池包装同步流式方法
         """
         queue = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_running_loop()  # 建议-15: prefer running loop
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
 
         def _stream_to_queue():
             try:
@@ -79,6 +217,32 @@ class BaseLLMAdapter(ABC):
         thinking_keywords = ["reasoner", "o1", "o3", "thinking"]
         model_lower = model_name.lower()
         return any(keyword in model_lower for keyword in thinking_keywords)
+
+    def _is_retryable_error(self, exc: Exception) -> bool:
+        """Classify an exception as a transient (retryable) API failure (重要-12)."""
+        name = type(exc).__name__.lower()
+        if any(hint in name for hint in _RETRYABLE_NAME_HINTS):
+            return True
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int) and status in _RETRYABLE_STATUS_CODES:
+            return True
+        return False
+
+    def _retry_call(self, fn, *, op: str = "llm"):
+        """Call ``fn`` with bounded exponential backoff + jitter on transient errors."""
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                if attempt >= self.max_retries or not self._is_retryable_error(exc):
+                    raise
+                delay = min(self.retry_max_delay, self.retry_base_delay * (2 ** attempt))
+                delay *= 0.5 + random.random() * 0.5  # jitter to avoid thundering herds
+                time.sleep(delay)
+                attempt += 1
 
 
 class OpenAIAdapter(BaseLLMAdapter):
@@ -118,12 +282,15 @@ class OpenAIAdapter(BaseLLMAdapter):
         start_time = time.time()
         
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                **kwargs
+            response = self._retry_call(
+                lambda: self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    **kwargs,
+                ),
+                op="openai.invoke",
             )
-            
+
             latency_ms = int((time.time() - start_time) * 1000)
             
             # 提取内容和推理过程
@@ -203,6 +370,19 @@ class OpenAIAdapter(BaseLLMAdapter):
             if reasoning_content is not None:
                 reasoning_content = reasoning_content.strip() or None
 
+            # 建议-9: many OpenAI-compatible servers omit usage on streamed
+            # responses; fall back to a rough local estimate so token accounting
+            # is non-zero instead of silently 0.
+            if not usage:
+                approx_prompt = sum(len(str(m.get("content", ""))) for m in messages) // 4
+                approx_completion = len("".join(collected_content)) // 4
+                usage = {
+                    "prompt_tokens": approx_prompt,
+                    "completion_tokens": approx_completion,
+                    "total_tokens": approx_prompt + approx_completion,
+                    "estimated": True,
+                }
+
             # 返回统计信息（存储到适配器，供外部获取）
             self.last_stats = StreamStats(
                 model=self.model,
@@ -264,6 +444,19 @@ class OpenAIAdapter(BaseLLMAdapter):
             if reasoning_content is not None:
                 reasoning_content = reasoning_content.strip() or None
 
+            # 建议-9: many OpenAI-compatible servers omit usage on streamed
+            # responses; fall back to a rough local estimate so token accounting
+            # is non-zero instead of silently 0.
+            if not usage:
+                approx_prompt = sum(len(str(m.get("content", ""))) for m in messages) // 4
+                approx_completion = len("".join(collected_content)) // 4
+                usage = {
+                    "prompt_tokens": approx_prompt,
+                    "completion_tokens": approx_completion,
+                    "total_tokens": approx_prompt + approx_completion,
+                    "estimated": True,
+                }
+
             # 返回统计信息（存储到适配器，供外部获取）
             self.last_stats = StreamStats(
                 model=self.model,
@@ -282,12 +475,15 @@ class OpenAIAdapter(BaseLLMAdapter):
             self._client = self.create_client()
 
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                **kwargs
+            response = self._retry_call(
+                lambda: self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    **kwargs,
+                ),
+                op="openai.tools",
             )
             return response
 
@@ -443,8 +639,10 @@ class AnthropicAdapter(BaseLLMAdapter):
             if system_content:
                 request_params["system"] = system_content
 
-            response = self._client.messages.create(**request_params)
-            return response
+            response = self._retry_call(
+                lambda: self._client.messages.create(**request_params), op="anthropic.tools"
+            )
+            return normalize_anthropic_tool_response(response)
 
         except Exception as e:
             raise HelloAgentsException(f"Anthropic工具调用失败: {str(e)}")
@@ -616,8 +814,10 @@ class GeminiAdapter(BaseLLMAdapter):
 
             model = self._client.GenerativeModel(**model_params, tools=gemini_tools)
 
-            response = model.generate_content(converted_messages)
-            return response
+            response = self._retry_call(
+                lambda: model.generate_content(converted_messages), op="gemini.tools"
+            )
+            return normalize_gemini_tool_response(response)
 
         except Exception as e:
             raise HelloAgentsException(f"Gemini工具调用失败: {str(e)}")

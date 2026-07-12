@@ -25,6 +25,7 @@ def create_agent(
     Args:
         agent_type: Agent type, supports:
             - "react": ReActAgent (Reasoning-Action loop)
+            - "code": CodeAgent (repository-aware coding agent)
             - "reflection": ReflectionAgent (Reflective type)
             - "plan": PlanAndSolveAgent (Planning-Execution)
             - "simple": SimpleAgent (Simple conversation)
@@ -33,15 +34,15 @@ def create_agent(
         tool_registry: Tool registry (optional)
         config: Configuration object (optional)
         system_prompt: System prompt (optional)
-        
+
     Returns:
         Agent instance
-        
+
     Raises:
         ValueError: Unsupported agent_type
     """
     agent_type = agent_type.lower()
-    
+
     if agent_type == "react":
         from .react_agent import ReActAgent
         return ReActAgent(
@@ -51,7 +52,18 @@ def create_agent(
             config=config,
             system_prompt=system_prompt
         )
-    
+
+    elif agent_type == "code":
+        # 建议-8: expose the flagship CodeAgent through the factory too.
+        from .code_agent import CodeAgent
+        return CodeAgent(
+            name=name,
+            llm=llm,
+            tool_registry=tool_registry,
+            config=config,
+            system_prompt=system_prompt,
+        )
+
     elif agent_type == "reflection":
         from .reflection_agent import ReflectionAgent
         return ReflectionAgent(
@@ -61,7 +73,7 @@ def create_agent(
             config=config,
             system_prompt=system_prompt
         )
-    
+
     elif agent_type == "plan":
         from .plan_solve_agent import PlanSolveAgent
         return PlanSolveAgent(
@@ -71,20 +83,21 @@ def create_agent(
             config=config,
             system_prompt=system_prompt
         )
-    
+
     elif agent_type == "simple":
         from .simple_agent import SimpleAgent
         return SimpleAgent(
             name=name,
             llm=llm,
+            tool_registry=tool_registry,  # 建议-8: don't drop the registry
             config=config,
             system_prompt=system_prompt
         )
-    
+
     else:
         raise ValueError(
             f"Unsupported agent_type: {agent_type}. "
-            f"Supported types: react, reflection, plan, simple"
+            f"Supported types: react, code, reflection, plan, simple"
         )
 
 

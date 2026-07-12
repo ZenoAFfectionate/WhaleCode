@@ -10,7 +10,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SWEBENCH_ROOT="/home/kemove/LLM_Projects/SWE-bench"
+SWEBENCH_ROOT="${SWEBENCH_ROOT:-/home/kemove/LLM_Projects/SWE-bench}"
+SWEV_DATASET_NAME="${SWEV_DATASET_NAME:-princeton-nlp/SWE-bench_Verified}"
+SWEV_SPLIT="${SWEV_SPLIT:-test}"
+SWEV_EVAL_WORKERS="${SWEV_EVAL_WORKERS:-4}"
 
 # --- Check prerequisites ---
 
@@ -55,11 +58,11 @@ echo ""
 export PYTHONPATH="$SWEBENCH_ROOT:${PYTHONPATH:-}"
 
 python -m swebench.harness.run_evaluation \
-    --dataset_name princeton-nlp/SWE-bench_Verified \
-    --split test \
+    --dataset_name "$SWEV_DATASET_NAME" \
+    --split "$SWEV_SPLIT" \
     --predictions_path "$PREDICTIONS_FILE" \
     --run_id "$RUN_ID" \
-    --max_workers 4 \
+    --max_workers "$SWEV_EVAL_WORKERS" \
     --cache_level env \
     --clean True \
     --timeout 1800 \

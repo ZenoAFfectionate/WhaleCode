@@ -79,6 +79,7 @@ def format_compact_summary(summary: str) -> str:
 
 @dataclass
 class _PreservedContextSnapshot:
+    """Key context signals extracted before compaction to preserve continuity."""
     latest_user_request: Optional[str] = None
     todo_lines: List[str] = field(default_factory=list)
     working_files: List[str] = field(default_factory=list)
@@ -365,6 +366,19 @@ class HistoryManager:
         counter = self._get_token_counter()
         for message in messages:
             total += counter.count_text(message.get("content", "")) + 4
+            # 重要-7: assistant 工具调用的真实负载在 tool_calls.arguments 里
+            # （例如 Write 会把整份文件塞进 arguments），不计会严重低估 prompt
+            # 规模，导致压缩不触发 → 下一次请求超窗。
+            tool_calls = message.get("tool_calls") or []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function", {}) or {}
+                total += counter.count_text(str(function.get("name", "")))
+                total += counter.count_text(
+                    self._tool_call_arguments_for_llm(function.get("arguments"))
+                )
+                total += 4
         return total
 
     def get_compact_trigger_limit(self) -> int:

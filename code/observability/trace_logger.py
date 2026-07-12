@@ -4,6 +4,7 @@ Output formats:
 - JSONL: Machine-readable, streaming append, supports jq analysis
 - HTML: Human-readable, visual interface, built-in stats panel
 """
+import html as _html_module
 import re
 import json
 import uuid
@@ -130,33 +131,77 @@ class TraceLogger:
 
         return event
 
-    def _sanitize_value(self, value: Any) -> Any:
+    # Fragments that mark a dict *key* as holding a secret; the whole value is
+    # redacted regardless of its shape (重要-8).
+    _SENSITIVE_KEY_FRAGMENTS = (
+        "api_key",
+        "apikey",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+        "authorization",
+        "private_key",
+        "access_key",
+        "session_key",
+        "passphrase",
+    )
+
+    def _sanitize_value(self, value: Any, _key: Optional[str] = None) -> Any:
         """Recursively sanitize value
 
         Args:
             value: Value to be sanitized (could be string, dict, list, etc.)
+            _key: The dict key this value was stored under (for key-aware redaction)
 
         Returns:
             Sanitized value
         """
         if isinstance(value, str):
-            # Sanitize string
-            # API Key: sk-xxx -> sk-***
-            value = re.sub(r'sk-[a-zA-Z0-9]+', 'sk-***', value)
-            # Bearer Token: Bearer xxx -> Bearer ***
-            value = re.sub(r'Bearer\s+[a-zA-Z0-9_\-]+', 'Bearer ***', value)
-            # Username in paths
-            value = re.sub(r'(/Users/|/home/|C:\\Users\\)[^/\\]+', r'\1***', value)
-            return value
+            return self._redact_secrets_in_text(value, key_hint=_key)
         elif isinstance(value, dict):
-            # Recursively process dictionary
-            return {k: self._sanitize_value(v) for k, v in value.items()}
+            # Pass the key down so values under secret-looking keys are redacted
+            # even when their format is not a recognised token.
+            return {k: self._sanitize_value(v, _key=k) for k, v in value.items()}
         elif isinstance(value, list):
-            # Recursively process list
-            return [self._sanitize_value(item) for item in value]
+            return [self._sanitize_value(item, _key=_key) for item in value]
         else:
-            # Return other types directly
             return value
+
+    def _redact_secrets_in_text(self, text: str, key_hint: Optional[str] = None) -> str:
+        """Redact API keys / tokens / passwords from a string.
+
+        Fixes the previous naive ``sk-[a-zA-Z0-9]+`` rule which left the tail of
+        hyphenated keys (e.g. ``sk-ant-api03-...``) in the clear and missed
+        vendor prefixes such as ``hf_``, ``AKIA``, ``AIza`` (重要-8).
+        """
+        if not text:
+            return text
+
+        if key_hint and any(
+            fragment in str(key_hint).lower() for fragment in self._SENSITIVE_KEY_FRAGMENTS
+        ):
+            return "***REDACTED***"
+
+        redacted = text
+        # OpenAI-style keys incl. hyphenated variants (sk-ant-api03-...).
+        redacted = re.sub(r"\bsk-[A-Za-z0-9_\-]{6,}", "sk-***", redacted)
+        # Common vendor token prefixes (HuggingFace, GitHub, GitLab, Slack, AWS, Google).
+        redacted = re.sub(
+            r"\b(hf_|ghp_|gho_|ghs_|ghu_|ghr_|glpat-|xox[baprs]-|AKIA|ASIA|AIza)[A-Za-z0-9_\-]{6,}",
+            r"\1***",
+            redacted,
+        )
+        # Bearer / Authorization / token headers.
+        redacted = re.sub(
+            r"(?i)\b(bearer|authorization|token)\s+[A-Za-z0-9._\-]{6,}",
+            r"\1 ***",
+            redacted,
+        )
+        # Username in filesystem paths.
+        redacted = re.sub(r"(/Users/|/home/|C:\\Users\\)[^/\\]+", r"\1***", redacted)
+        return redacted
 
     def finalize(self):
         """Generate final HTML and close files
@@ -409,16 +454,20 @@ class TraceLogger:
         # Generate unique ID
         details_id = f"details-{len(self._events)}"
 
-        # Format payload
-        payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
+        # Format payload (HTML-escaped: payloads may contain WebFetch'd page
+        # content or model output with </pre><script> — 重要-8 stored XSS).
+        payload_json = _html_module.escape(json.dumps(payload, indent=2, ensure_ascii=False))
+        safe_event_type = _html_module.escape(str(event_type))
+        safe_timestamp = _html_module.escape(str(timestamp))
+        safe_step = _html_module.escape(str(step if step else "-"))
 
         # Generate event HTML
         event_html = f"""
         <div class="{css_class}">
             <div class="event-header">
-                <span class="step">Step {step if step else '-'}</span>
-                <span class="timestamp">{timestamp}</span>
-                <span class="event-type">{event_type}</span>
+                <span class="step">Step {safe_step}</span>
+                <span class="timestamp">{safe_timestamp}</span>
+                <span class="event-type">{safe_event_type}</span>
                 <span class="expandable" onclick="toggleDetails('{details_id}')">[▼ Details]</span>
             </div>
             <div id="{details_id}" class="details">
@@ -431,19 +480,19 @@ class TraceLogger:
 
     def _write_html_footer(self, stats: Dict[str, Any]):
         """Write HTML footer (stats panel + script)"""
-        # Build tool call stats table
+        # Build tool call stats table (escaped: 重要-8)
         tool_stats_rows = ""
         for tool_name, count in sorted(stats["tool_calls"].items(), key=lambda x: x[1], reverse=True):
-            tool_stats_rows += f"<tr><td>{tool_name}</td><td>{count}</td></tr>\n"
+            tool_stats_rows += f"<tr><td>{_html_module.escape(str(tool_name))}</td><td>{int(count)}</td></tr>\n"
 
         # Build error list
         error_list_html = ""
         if stats["errors"]:
             error_items = ""
             for error in stats["errors"]:
-                step = error.get("step", "?")
-                error_type = error.get("type", "UNKNOWN")
-                message = error.get("message", "")
+                step = _html_module.escape(str(error.get("step", "?")))
+                error_type = _html_module.escape(str(error.get("type", "UNKNOWN")))
+                message = _html_module.escape(str(error.get("message", "")))
                 error_items += f"<li>Step {step}: <strong>{error_type}</strong> - {message}</li>\n"
             error_list_html = f"""
         <h3>❌ Error List ({len(stats["errors"])})</h3>

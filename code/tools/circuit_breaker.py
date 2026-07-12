@@ -1,9 +1,33 @@
 """Circuit Breaker Mechanism - Prevents infinite loops caused by continuous tool failures"""
 
+import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from collections import defaultdict
+from ..core.logging import agent_print
 from .response import ToolResponse, ToolStatus
+
+
+# Only genuine tool *faults* should trip the breaker. Model/user mistakes such
+# as INVALID_PARAM / ACCESS_DENIED / NOT_FOUND / CONFLICT / BINARY_FILE are the
+# tool correctly rejecting bad input and must NOT disable the tool (see 重要-1).
+FAULT_ERROR_CODES = frozenset(
+    {
+        "INTERNAL_ERROR",
+        "EXECUTION_ERROR",
+        "TIMEOUT",
+        "NETWORK_ERROR",
+        "API_ERROR",
+    }
+)
+
+
+def _is_fault_response(response: ToolResponse) -> bool:
+    """True only when a response represents a real tool fault (not a rejection)."""
+    if response.status != ToolStatus.ERROR:
+        return False
+    code = (response.error_info or {}).get("code")
+    return code in FAULT_ERROR_CODES
 
 
 class CircuitBreaker:
@@ -37,6 +61,10 @@ class CircuitBreaker:
         self.recovery_timeout = recovery_timeout
         self.enabled = enabled
 
+        # Guards all mutable state below so concurrent tool executions (async
+        # tools run in a thread pool) cannot corrupt the counters (建议-11).
+        self._lock = threading.RLock()
+
         # Failure counts (per tool)
         self.failure_counts: Dict[str, int] = defaultdict(int)
 
@@ -57,18 +85,19 @@ class CircuitBreaker:
         if not self.enabled:
             return False
 
-        # Check if it is in the tripped list
-        if tool_name not in self.open_timestamps:
-            return False
+        with self._lock:
+            # Check if it is in the tripped list
+            if tool_name not in self.open_timestamps:
+                return False
 
-        # Check if it can be recovered
-        open_time = self.open_timestamps[tool_name]
-        if time.time() - open_time > self.recovery_timeout:
-            # Automatic recovery
-            self.close(tool_name)
-            return False
+            # Check if it can be recovered
+            open_time = self.open_timestamps[tool_name]
+            if time.time() - open_time > self.recovery_timeout:
+                # Automatic recovery
+                self.close(tool_name)
+                return False
 
-        return True
+            return True
 
     def record_result(self, tool_name: str, response: ToolResponse):
         """
@@ -81,13 +110,13 @@ class CircuitBreaker:
         if not self.enabled:
             return
 
-        # Check if it is an error
-        is_error = response.status == ToolStatus.ERROR
-
-        if is_error:
-            self._on_failure(tool_name)
-        else:
-            self._on_success(tool_name)
+        # Only real tool faults count toward tripping; parameter/permission/
+        # conflict rejections are the tool working correctly (重要-1).
+        with self._lock:
+            if _is_fault_response(response):
+                self._on_failure(tool_name)
+            else:
+                self._on_success(tool_name)
 
     def _on_failure(self, tool_name: str):
         """Handle failure"""
@@ -97,7 +126,7 @@ class CircuitBreaker:
         # Check if the threshold is reached
         if self.failure_counts[tool_name] >= self.failure_threshold:
             self.open_timestamps[tool_name] = time.time()
-            print(f"🔴 Circuit Breaker: Tool '{tool_name}' tripped ({self.failure_counts[tool_name]} consecutive failures)")
+            agent_print(f"🔴 Circuit Breaker: Tool '{tool_name}' tripped ({self.failure_counts[tool_name]} consecutive failures)")
 
     def _on_success(self, tool_name: str):
         """Handle success"""
@@ -109,14 +138,16 @@ class CircuitBreaker:
         if not self.enabled:
             return
 
-        self.open_timestamps[tool_name] = time.time()
-        print(f"🔴 Circuit Breaker: Tool '{tool_name}' manually tripped")
+        with self._lock:
+            self.open_timestamps[tool_name] = time.time()
+        agent_print(f"🔴 Circuit Breaker: Tool '{tool_name}' manually tripped")
 
     def close(self, tool_name: str):
         """Close the circuit breaker, recovering the tool"""
-        self.failure_counts[tool_name] = 0
-        self.open_timestamps.pop(tool_name, None)
-        print(f"🟢 Circuit Breaker: Tool '{tool_name}' recovered")
+        with self._lock:
+            self.failure_counts[tool_name] = 0
+            self.open_timestamps.pop(tool_name, None)
+        agent_print(f"🟢 Circuit Breaker: Tool '{tool_name}' recovered")
 
     def get_status(self, tool_name: str) -> Dict[str, Any]:
         """
@@ -132,24 +163,24 @@ class CircuitBreaker:
             - open_since: Time when tripped (only for open state)
             - recover_in_seconds: Countdown to recovery (only for open state)
         """
-        is_open = tool_name in self.open_timestamps
+        with self._lock:
+            is_open = tool_name in self.open_timestamps
+            if is_open:
+                open_time = self.open_timestamps[tool_name]
+                time_since_open = time.time() - open_time
+                time_to_recover = max(0, self.recovery_timeout - time_since_open)
 
-        if is_open:
-            open_time = self.open_timestamps[tool_name]
-            time_since_open = time.time() - open_time
-            time_to_recover = max(0, self.recovery_timeout - time_since_open)
-
-            return {
-                "state": "open",
-                "failure_count": self.failure_counts[tool_name],
-                "open_since": open_time,
-                "recover_in_seconds": int(time_to_recover)
-            }
-        else:
-            return {
-                "state": "closed",
-                "failure_count": self.failure_counts[tool_name]
-            }
+                return {
+                    "state": "open",
+                    "failure_count": self.failure_counts[tool_name],
+                    "open_since": open_time,
+                    "recover_in_seconds": int(time_to_recover)
+                }
+            else:
+                return {
+                    "state": "closed",
+                    "failure_count": self.failure_counts[tool_name]
+                }
 
     def get_all_status(self) -> Dict[str, Dict]:
         """

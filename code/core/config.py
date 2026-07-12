@@ -54,15 +54,65 @@ class Config(BaseModel):
     max_concurrent_tools: int = 3  # 最大并发工具数
     hook_timeout_seconds: float = 5.0  # 生命周期钩子超时时间（秒）
 
+    # 沙箱 / 网络 / 工具安全（建议-6：集中登记；工具/适配器目前从同名环境变量读取，
+    # 这里作为单一事实来源与文档，便于多环境切换与审计）
+    bash_allow_network: bool = False            # BASH_ALLOW_NETWORK
+    bash_max_cpu_seconds: int = 3600            # BASH_MAX_CPU_SECONDS（严重-2）
+    bash_max_processes: int = 4096              # BASH_MAX_PROCESSES（fork bomb 防护）
+    bash_max_execution_ms: int = 0              # BASH_MAX_EXECUTION_MS（硬超时，0=不强杀）
+    web_tools_enabled: bool = True              # WEB_TOOLS_ENABLED
+    web_fetch_allow_private: bool = False       # WEBFETCH_ALLOW_PRIVATE（严重-3 SSRF 放行）
+
+    # LLM 调用重试（重要-12）
+    llm_max_retries: int = 2                    # LLM_MAX_RETRIES
+    llm_retry_base_delay: float = 0.5           # LLM_RETRY_BASE_DELAY
+    llm_retry_max_delay: float = 8.0            # LLM_RETRY_MAX_DELAY
+
+    # ReAct 步数上限（重要-4；0=无限，仅显式高级用法）
+    code_agent_max_steps: int = 100             # 对应 CLI --max-steps
+
+    # 文件工具备份与锁（建议-12）
+    backup_enabled: bool = True                 # 是否在 Write/Edit 前自动备份
+    backup_dir: str = "memory/.backups"         # 统一备份根目录（取代 per-file .backups/）
+    backup_max_per_file: int = 5                # 每个文件最多保留的旧版本数
+    backup_retention_days: int = 7              # 备份保留天数
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置
 
         支持的环境变量（均可选，未设置时使用字段默认值）：
-            DEBUG, CONTEXT_WINDOW, COMPRESSION_THRESHOLD,
-            COMPACT_OUTPUT_BUFFER,
-            CIRCUIT_ENABLED, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT
+            DEBUG, CONTEXT_WINDOW, COMPRESSION_THRESHOLD, COMPACT_OUTPUT_BUFFER,
+            CIRCUIT_ENABLED, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT,
+            BASH_ALLOW_NETWORK, BASH_MAX_CPU_SECONDS, BASH_MAX_PROCESSES,
+            BASH_MAX_EXECUTION_MS, WEB_TOOLS_ENABLED, WEBFETCH_ALLOW_PRIVATE,
+            LLM_MAX_RETRIES, LLM_RETRY_BASE_DELAY, LLM_RETRY_MAX_DELAY,
+            CODE_AGENT_MAX_STEPS
         """
+        def _bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None or not raw.strip():
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        def _int(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None or not str(raw).strip():
+                return default
+            try:
+                return int(str(raw).strip())
+            except (TypeError, ValueError):
+                return default
+
+        def _float(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None or not str(raw).strip():
+                return default
+            try:
+                return float(str(raw).strip())
+            except (TypeError, ValueError):
+                return default
+
         kwargs: Dict[str, Any] = {
             "debug": os.getenv("DEBUG", "false").lower() == "true",
         }
@@ -79,6 +129,18 @@ class Config(BaseModel):
             kwargs["circuit_failure_threshold"] = int(os.getenv("CIRCUIT_FAILURE_THRESHOLD"))
         if os.getenv("CIRCUIT_RECOVERY_TIMEOUT"):
             kwargs["circuit_recovery_timeout"] = int(os.getenv("CIRCUIT_RECOVERY_TIMEOUT"))
+
+        # 建议-6: sandbox / network / retry / step-limit switches.
+        kwargs["bash_allow_network"] = _bool("BASH_ALLOW_NETWORK", cls.model_fields["bash_allow_network"].default)
+        kwargs["bash_max_cpu_seconds"] = _int("BASH_MAX_CPU_SECONDS", cls.model_fields["bash_max_cpu_seconds"].default)
+        kwargs["bash_max_processes"] = _int("BASH_MAX_PROCESSES", cls.model_fields["bash_max_processes"].default)
+        kwargs["bash_max_execution_ms"] = _int("BASH_MAX_EXECUTION_MS", cls.model_fields["bash_max_execution_ms"].default)
+        kwargs["web_tools_enabled"] = _bool("WEB_TOOLS_ENABLED", cls.model_fields["web_tools_enabled"].default)
+        kwargs["web_fetch_allow_private"] = _bool("WEBFETCH_ALLOW_PRIVATE", cls.model_fields["web_fetch_allow_private"].default)
+        kwargs["llm_max_retries"] = _int("LLM_MAX_RETRIES", cls.model_fields["llm_max_retries"].default)
+        kwargs["llm_retry_base_delay"] = _float("LLM_RETRY_BASE_DELAY", cls.model_fields["llm_retry_base_delay"].default)
+        kwargs["llm_retry_max_delay"] = _float("LLM_RETRY_MAX_DELAY", cls.model_fields["llm_retry_max_delay"].default)
+        kwargs["code_agent_max_steps"] = _int("CODE_AGENT_MAX_STEPS", cls.model_fields["code_agent_max_steps"].default)
 
         return cls(**kwargs)
 

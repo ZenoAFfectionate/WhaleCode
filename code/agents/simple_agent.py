@@ -7,6 +7,7 @@ from ..core.config import Config
 from ..core.message import Message
 from ..core.streaming import StreamEvent, StreamEventType
 from ..core.lifecycle import LifecycleHook
+from ._tool_loop import run_tool_calling_loop
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -120,131 +121,36 @@ class SimpleAgent(Agent):
 
             return response_text
 
-        # Enable tool calling mode
+        # Enable tool calling mode (重要-9: shared function-calling loop)
         tool_schemas = self._build_tool_schemas()
+        steps_holder = {"n": 0}
 
-        current_iteration = 0
-        final_response = ""
-
-        while current_iteration < self.max_tool_iterations:
-            current_iteration += 1
-
-            # Call LLM (Function Calling)
-            try:
-                response = self.llm.invoke_with_tools(
-                    messages=messages,
-                    tools=tool_schemas,
-                    tool_choice="auto",
-                    **kwargs
-                )
-            except Exception as e:
-                print(f"❌ LLM call failed: {e}")
-                if trace_logger:
-                    trace_logger.log_event(
-                        "error",
-                        {"error_type": "LLM_ERROR", "message": str(e)},
-                        step=current_iteration
-                    )
-                break
-
-            # Get the response message
-            response_message = response.choices[0].message
-
-            # Log model output
-            if trace_logger:
-                usage = response.usage
+        def _on_event(name, payload):
+            if name == "tool_call":
+                steps_holder["n"] += 1
+            if not trace_logger:
+                return
+            if name == "tool_call":
+                trace_logger.log_event("tool_call", payload)
+            elif name == "tool_result":
+                trace_logger.log_event("tool_result", payload)
+            elif name == "llm_error":
                 trace_logger.log_event(
-                    "model_output",
-                    {
-                        "content": response_message.content,
-                        "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
-                        "usage": {
-                            "prompt_tokens": usage.prompt_tokens if usage else 0,
-                            "completion_tokens": usage.completion_tokens if usage else 0,
-                            "total_tokens": usage.total_tokens if usage else 0
-                        }
-                    },
-                    step=current_iteration
+                    "error",
+                    {"error_type": "LLM_ERROR", "message": payload.get("error", "")},
                 )
 
-            # Process tool calls
-            tool_calls = response_message.tool_calls
-            if not tool_calls:
-                # No tool calls, return the text response directly
-                final_response = response_message.content or "Sorry, I cannot answer this question."
-                break
-
-            # Add the assistant message to history
-            messages.append({
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in tool_calls
-                ]
-            })
-
-            # Execute all tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                tool_call_id = tool_call.id
-
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    print(f"❌ Tool argument parsing failed: {e}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": f"Error: Incorrect argument format - {str(e)}"
-                    })
-                    continue
-
-                # Log tool call
-                if trace_logger:
-                    trace_logger.log_event(
-                        "tool_call",
-                        {
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "args": arguments
-                        },
-                        step=current_iteration
-                    )
-
-                # Execute tool (reuse base class method)
-                result = self._execute_tool_call(tool_name, arguments)
-
-                # Log tool result
-                if trace_logger:
-                    trace_logger.log_event(
-                        "tool_result",
-                        {
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "result": result
-                        },
-                        step=current_iteration
-                    )
-
-                # Add tool result to messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result
-                })
-
-        # If the maximum number of iterations is exceeded, get the last answer
-        if current_iteration >= self.max_tool_iterations and not final_response:
-            llm_response = self.llm.invoke(messages, **kwargs)
-            final_response = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
+        final_response = run_tool_calling_loop(
+            llm=self.llm,
+            tool_schemas=tool_schemas,
+            messages=messages,
+            execute_tool=self._execute_tool_call,
+            max_iterations=self.max_tool_iterations,
+            on_event=_on_event,
+            **kwargs,
+        )
+        if not final_response:
+            final_response = "Sorry, I cannot answer this question."
 
         # Save to history
         self.add_message(Message(input_text, "user"))
@@ -256,7 +162,7 @@ class SimpleAgent(Agent):
                 "session_end",
                 {
                     "duration": duration,
-                    "total_steps": current_iteration,
+                    "total_steps": steps_holder["n"],
                     "final_answer": final_response,
                     "status": "success"
                 }

@@ -7,6 +7,8 @@ from ..core.config import Config
 from ..core.message import Message
 from ..core.streaming import StreamEvent, StreamEventType
 from ..core.lifecycle import LifecycleHook
+from ..core.logging import agent_print
+from ._tool_loop import build_tool_schemas, execute_tool_via_registry, run_tool_calling_loop
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -31,7 +33,7 @@ Please ensure each step in the plan is an independent, executable subtask, and s
         Returns:
             List of steps
         """
-        print("--- Generating plan ---")
+        agent_print("--- Generating plan ---")
 
         # Define plan generation tool
         plan_tool = {
@@ -74,17 +76,17 @@ Please ensure each step in the plan is an independent, executable subtask, and s
                 arguments = json.loads(tool_call.function.arguments)
                 plan = arguments.get("steps", [])
 
-                print(f"✅ Plan generated:")
+                agent_print(f"✅ Plan generated:")
                 for i, step in enumerate(plan, 1):
-                    print(f"  {i}. {step}")
+                    agent_print(f"  {i}. {step}")
 
                 return plan
             else:
-                print("❌ Model did not return a plan tool call")
+                agent_print("❌ Model did not return a plan tool call")
                 return []
 
         except Exception as e:
-            print(f"❌ Error occurred while generating plan: {e}")
+            agent_print(f"❌ Error occurred while generating plan: {e}")
             return []
 
 class Executor:
@@ -104,6 +106,14 @@ Please focus on solving the current step and output the final answer for that st
         self.tool_registry = tool_registry
         self.enable_tool_calling = enable_tool_calling and tool_registry is not None
         self.max_tool_iterations = max_tool_iterations
+        # 重要-10: build tool schemas once instead of instantiating a full
+        # SimpleAgent (TokenCounter + HistoryManager + TraceLogger + SkillLoader
+        # + TodoWrite registration) on every single plan step.
+        self._tool_schemas = build_tool_schemas(tool_registry) if self.enable_tool_calling else []
+        # 重要-10: build tool schemas once instead of instantiating a full
+        # SimpleAgent (with TokenCounter/HistoryManager/TraceLogger/SkillLoader/
+        # SessionStore and a TodoWrite registration) on every single step.
+        self._tool_schemas = build_tool_schemas(tool_registry) if self.enable_tool_calling else []
 
     def execute(self, question: str, plan: List[str], **kwargs) -> str:
         """
@@ -120,9 +130,9 @@ Please focus on solving the current step and output the final answer for that st
         history = []
         final_answer = ""
 
-        print("\n--- Executing plan ---")
+        agent_print("\n--- Executing plan ---")
         for i, step in enumerate(plan, 1):
-            print(f"\n-> Executing step {i}/{len(plan)}: {step}")
+            agent_print(f"\n-> Executing step {i}/{len(plan)}: {step}")
 
             # Build context message
             context = f"""# Original Problem:
@@ -144,7 +154,7 @@ Please execute the current step and provide the result."""
 
             history.append({"step": step, "result": response_text})
             final_answer = response_text
-            print(f"✅ Step {i} completed, result: {final_answer}")
+            agent_print(f"✅ Step {i} completed, result: {final_answer}")
 
         return final_answer
 
@@ -178,89 +188,18 @@ Please execute the current step and provide the result."""
             llm_response = self.llm_client.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-        # Enable tool calling mode
-        from .simple_agent import SimpleAgent
-        # Temporarily create a SimpleAgent instance to reuse tool calling logic
-        temp_agent = SimpleAgent(
-            name="temp_executor",
+        # 重要-9/10: reuse the shared function-calling loop; execute tools
+        # directly against the registry (no per-step SimpleAgent instance).
+        return run_tool_calling_loop(
             llm=self.llm_client,
-            tool_registry=self.tool_registry
+            tool_schemas=self._tool_schemas,
+            messages=messages,
+            execute_tool=lambda name, args: execute_tool_via_registry(
+                self.tool_registry, name, args
+            ),
+            max_iterations=self.max_tool_iterations,
+            **kwargs,
         )
-        tool_schemas = temp_agent._build_tool_schemas()
-
-        current_iteration = 0
-
-        while current_iteration < self.max_tool_iterations:
-            current_iteration += 1
-
-            try:
-                response = self.llm_client.invoke_with_tools(
-                    messages=messages,
-                    tools=tool_schemas,
-                    tool_choice="auto",
-                    **kwargs
-                )
-            except Exception as e:
-                print(f"❌ LLM call failed: {e}")
-                break
-
-            response_message = response.choices[0].message
-
-            # Process tool calls
-            tool_calls = response_message.tool_calls
-            if not tool_calls:
-                # No tool calls, return text response
-                return response_message.content or ""
-
-            # Add assistant message to history
-            messages.append({
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in tool_calls
-                ]
-            })
-
-            # Execute all tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                tool_call_id = tool_call.id
-
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    print(f"❌ Tool argument parsing failed: {e}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": f"Error: Incorrect argument format - {str(e)}"
-                    })
-                    continue
-
-                # Execute tool (reuse base class method)
-                result = temp_agent._execute_tool_call(tool_name, arguments)
-
-                # Add tool result to messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result
-                })
-
-        # If max iterations exceeded, get the last answer
-        if current_iteration >= self.max_tool_iterations:
-            llm_response = self.llm_client.invoke(messages, **kwargs)
-            return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
-
-        return ""
 
 class PlanSolveAgent(Agent):
     """
@@ -331,13 +270,13 @@ class PlanSolveAgent(Agent):
         Returns:
             Final answer
         """
-        print(f"\n🤖 {self.name} started processing the problem: {input_text}")
+        agent_print(f"\n🤖 {self.name} started processing the problem: {input_text}")
         
         # 1. Generate plan
         plan = self.planner.plan(input_text, **kwargs)
         if not plan:
             final_answer = "Unable to generate a valid action plan, task terminated."
-            print(f"\n--- Task Terminated ---\n{final_answer}")
+            agent_print(f"\n--- Task Terminated ---\n{final_answer}")
             
             # Save to history
             self.add_message(Message(input_text, "user"))
@@ -347,7 +286,7 @@ class PlanSolveAgent(Agent):
         
         # 2. Execute plan
         final_answer = self.executor.execute(input_text, plan, **kwargs)
-        print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
+        agent_print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
         
         # Save to history
         self.add_message(Message(input_text, "user"))
@@ -396,7 +335,7 @@ class PlanSolveAgent(Agent):
                 description="Generate execution plan"
             )
 
-            print(f"\n🤖 {self.name} started processing the problem: {input_text}")
+            agent_print(f"\n🤖 {self.name} started processing the problem: {input_text}")
 
             # Generate plan (synchronous method, kept for now)
             plan = self.planner.plan(input_text, **kwargs)
@@ -445,8 +384,8 @@ class PlanSolveAgent(Agent):
                     description=step_description
                 )
 
-                print(f"\n--- Step {step_num}/{len(plan)} ---")
-                print(f"📋 {step_description}")
+                agent_print(f"\n--- Step {step_num}/{len(plan)} ---")
+                agent_print(f"📋 {step_description}")
 
                 # Build execution prompt
                 context = "\n".join([
@@ -481,9 +420,9 @@ Please execute the current step and provide the result."""
                         step=step_num
                     )
 
-                    print(chunk, end="", flush=True)
+                    agent_print(chunk, end="", flush=True)
 
-                print()  # Newline
+                agent_print()  # Newline
 
                 step_results.append(step_result)
 
@@ -532,7 +471,7 @@ Please provide the final answer to the original problem based on the execution r
                 total_steps=len(plan)
             )
 
-            print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
+            agent_print(f"\n--- Task Completed ---\nFinal Answer: {final_answer}")
 
             # Save to history
             self.add_message(Message(input_text, "user"))

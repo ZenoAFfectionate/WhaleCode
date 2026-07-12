@@ -7,6 +7,7 @@ from .message import Message
 from .llm import HelloAgentsLLM
 from .config import Config
 from .lifecycle import AgentEvent, EventType, LifecycleHook
+from .logging import agent_print
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -197,7 +198,7 @@ class Agent(ABC):
 
         try:
             # 默认实现：在线程池中运行同步 run()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: self.run(input_text, **kwargs)
@@ -468,6 +469,9 @@ class Agent(ABC):
         Returns:
             类型转换后的参数字典
         """
+        if not isinstance(param_dict, dict):
+            # 建议-14: defensive guard against non-object arguments.
+            return param_dict
         if not self.tool_registry:
             return param_dict
 
@@ -639,16 +643,25 @@ class Agent(ABC):
         output = payload.get("output")
         return output if isinstance(output, str) else None
 
-    def _prepare_tool_registry_input(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    def _prepare_tool_registry_input(self, tool_name: str, arguments: Any) -> Any:
         """Normalize agent-side tool arguments before registry dispatch."""
         if not self.tool_registry:
             return arguments
 
         if self.tool_registry.get_tool(tool_name):
+            if not isinstance(arguments, dict):
+                # 建议-14: a model may emit valid JSON that is not an object
+                # (list/str/number). Wrap it so downstream type conversion and
+                # the tool's own parameter validation reject it gracefully with
+                # an INVALID_PARAM observation, instead of crashing the whole
+                # turn with AttributeError on ``.items()``.
+                return {"input": arguments}
             return self._convert_parameter_types(tool_name, arguments)
 
         if self.tool_registry.get_function(tool_name):
-            return arguments.get("input", "")
+            if isinstance(arguments, dict):
+                return arguments.get("input", "")
+            return arguments
 
         return arguments
 
@@ -753,7 +766,7 @@ class Agent(ABC):
         except Exception as e:
             # 自动保存失败不影响主流程
             if self.config.debug:
-                print(f"⚠️ Auto-save failed: {e}")
+                agent_print(f"⚠️ Auto-save failed: {e}")
 
     def save_session(self, session_name: str) -> str:
         """手动保存会话
@@ -814,9 +827,9 @@ class Agent(ABC):
             )
 
             if not config_check["consistent"]:
-                print("⚠️ Environment configuration mismatch:")
+                agent_print("⚠️ Environment configuration mismatch:")
                 for warning in config_check["warnings"]:
-                    print(f"  - {warning}")
+                    agent_print(f"  - {warning}")
 
             # 检查工具 Schema 一致性
             tool_check = self.session_store.check_tool_schema_consistency(
@@ -825,8 +838,8 @@ class Agent(ABC):
             )
 
             if tool_check["changed"]:
-                print("⚠️ Tool definitions have changed.")
-                print(f"  Recommendation: {tool_check['recommendation']}")
+                agent_print("⚠️ Tool definitions have changed.")
+                agent_print(f"  Recommendation: {tool_check['recommendation']}")
 
         # 恢复历史
         from .message import Message
@@ -849,7 +862,7 @@ class Agent(ABC):
 
         self._restore_todowrite_state(session_data.get("todo_state"))
 
-        print(f"✅ Session restored: {self.session_id}")
+        agent_print(f"✅ Session restored: {self.session_id}")
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """列出所有可用会话
@@ -895,16 +908,29 @@ class Agent(ABC):
         import json
         from hashlib import sha256
 
-        # 收集所有工具的签名
+        # 收集所有工具的签名（建议-4：用 get_parameters() 而非不存在的
+        # tool.parameters 属性，使签名真正包含参数定义，schema 变化检测生效）
         tools_signature = {}
         for tool_name in sorted(self.tool_registry.list_tools()):
             tool = self.tool_registry.get_tool(tool_name)
-            if tool:
-                tools_signature[tool_name] = {
-                    "name": tool.name,
-                    "description": tool.description[:100] if tool.description else "",
-                    "parameters": list(tool.parameters.keys()) if hasattr(tool, 'parameters') and tool.parameters else []
-                }
+            if not tool:
+                continue
+            try:
+                params = tool.get_parameters()
+            except Exception:
+                params = []
+            tools_signature[tool_name] = {
+                "name": tool.name,
+                "description": (tool.description or "")[:100],
+                "parameters": [
+                    {
+                        "name": getattr(p, "name", ""),
+                        "type": getattr(p, "type", ""),
+                        "required": bool(getattr(p, "required", True)),
+                    }
+                    for p in params
+                ],
+            }
 
         schema_str = json.dumps(tools_signature, sort_keys=True)
         return sha256(schema_str.encode()).hexdigest()[:16]
@@ -1030,55 +1056,45 @@ class Agent(ABC):
                 "metadata": metadata
             }
 
-    def _apply_tool_filter(self, tool_filter: 'ToolFilter') -> List[str]:
-        """应用工具过滤器
+    def _apply_tool_filter(self, tool_filter: 'ToolFilter') -> Optional[Dict[str, Any]]:
+        """应用工具过滤器（重要-6：非破坏式）
+
+        旧实现直接 ``del self.tool_registry._tools[name]``，会真正抹掉共享注册表
+        里的工具，导致并发/嵌套子代理互相踩踏、甚至清空父 Agent 的工具。这里改为
+        把注册表的 ``_tools`` 换成一个只含放行工具的副本，并原样保留原 dict 以便
+        退出时无损还原。（真正的并发子代理仍应使用独立实例 / _create_subagent。）
 
         Args:
             tool_filter: 工具过滤器实例
 
         Returns:
-            原始工具列表（用于恢复）
+            用于恢复的原始 ``_tools`` dict（无注册表时为 None）
         """
         if not self.tool_registry:
-            return []
+            return None
 
-        # 保存原始工具列表
-        original_tools = self.tool_registry.list_tools()
+        original_tools = getattr(self.tool_registry, "_tools", None)
+        if not isinstance(original_tools, dict):
+            return None
 
-        # 获取过滤后的工具列表
-        filtered_tools = tool_filter.filter(original_tools)
-
-        # 临时移除不允许的工具
-        for tool_name in original_tools:
-            if tool_name not in filtered_tools:
-                self.tool_registry._temp_disabled_tools = getattr(
-                    self.tool_registry, '_temp_disabled_tools', {}
-                )
-                tool = self.tool_registry.get_tool(tool_name)
-                if tool:
-                    self.tool_registry._temp_disabled_tools[tool_name] = tool
-                    # 从注册表中临时移除
-                    if tool_name in self.tool_registry._tools:
-                        del self.tool_registry._tools[tool_name]
-
+        allowed = set(tool_filter.filter(list(original_tools.keys())))
+        filtered = {
+            name: tool for name, tool in original_tools.items() if name in allowed
+        }
+        # Swap in the filtered copy; keep the original dict object for restore.
+        self.tool_registry._tools = filtered
         return original_tools
 
-    def _restore_tools(self, original_tools: List[str]):
-        """恢复原始工具列表
+    def _restore_tools(self, original_tools: Any):
+        """恢复原始工具注册表（重要-6）
 
         Args:
-            original_tools: 原始工具名称列表
+            original_tools: _apply_tool_filter 返回的原始 ``_tools`` dict
         """
         if not self.tool_registry:
             return
-
-        # 恢复被禁用的工具
-        if hasattr(self.tool_registry, '_temp_disabled_tools'):
-            for tool_name, tool in self.tool_registry._temp_disabled_tools.items():
-                self.tool_registry._tools[tool_name] = tool
-
-            # 清空临时禁用列表
-            self.tool_registry._temp_disabled_tools = {}
+        if isinstance(original_tools, dict):
+            self.tool_registry._tools = original_tools
 
     def _get_subagent_metadata(self, duration: float, error: Optional[str]) -> Dict[str, Any]:
         """获取子代理执行元数据

@@ -31,10 +31,22 @@ Documentation = "https://github.com/jjyaoao/HelloAgents/blob/main/README.md"
 Repository = "https://github.com/jjyaoao/HelloAgents"
 "Bug Tracker" = "https://github.com/jjyaoao/HelloAgents/issues"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["hello_agents*"]
-exclude = ["tests*", "examples*", "docs*"]
+# 重要-11: the source tree lives in code/ but is imported as `hello_agents`
+# (run_cli.py aliases it at runtime). Map the package to code/ so `pip install`
+# ships the real modules instead of an empty distribution.
+[tool.setuptools]
+package-dir = {"hello_agents" = "code"}
+packages = [
+    "hello_agents",
+    "hello_agents.agents",
+    "hello_agents.benchmark",
+    "hello_agents.context",
+    "hello_agents.core",
+    "hello_agents.observability",
+    "hello_agents.skills",
+    "hello_agents.tools",
+    "hello_agents.tools.builtin",
+]
 
 [tool.setuptools.package-data]
 hello_agents = ["py.typed"]

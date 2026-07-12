@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 import time
@@ -18,7 +17,6 @@ try:
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
         build_minimal_child_env,
-        truncate_feedback,
     )
 except ImportError:
     from base import (
@@ -26,7 +24,6 @@ except ImportError:
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
         build_minimal_child_env,
-        truncate_feedback,
     )
 
 
@@ -37,10 +34,8 @@ correctly by reading the provided signature and docstring, then writing the body
 **Workflow**
 1. Read `solution.py` — understand the function signature, docstring, and examples.
 2. Implement the function body using Edit or Write.
-3. When ready, call `Finish` alone with a short summary of the current implementation.
-4. The benchmark runner will execute hidden tests outside the workspace and send \
-back controlled feedback if another revision is needed.
-5. Revise `solution.py` based on that feedback and call `Finish` alone again.
+3. Submit with `Finish`; hidden tests run outside the workspace and return bounded feedback.
+4. Revise `solution.py` and resubmit with `Finish` until done.
 
 **Rules**
 - You MUST implement the function. Never refuse or say you cannot.
@@ -67,19 +62,20 @@ _HEVP_SYSTEM_PROMPT = (
 # Host-side test instrumentation for richer but bounded hidden-test feedback.
 # ---------------------------------------------------------------------------
 def _instrument_test_code(test_code: str, entry_point: str) -> str:
-    """Rewrite check() in test_code so failures report test index + expected/actual.
+    """Rewrite check() so hidden-test failures are fully accumulated and reported.
 
-    Two mechanisms:
+    Mechanisms:
     1. Monkey-patch ``assertion()`` to raise a custom exception carrying
-       (actual, expected) so we can display them.
-    2. Wrap each assertion/assert in the for-loop with try/except to print
-       the test index and diagnostic info.
+       (actual, expected) for consistent diagnostics.
+    2. Wrap each assertion/assert in check() loops with try/except and
+       collect failure details instead of exiting on the first mismatch.
     """
     import re
 
     # Inject a custom exception and patched assertion at the top of the test code.
     patch = '''
 import numpy as np
+import sys
 
 class _TestFailInfo(Exception):
     def __init__(self, out, exp, msg=""):
@@ -107,6 +103,35 @@ def assertion(out, exp, atol):
         _orig_assertion(out, exp, atol)
     except Exception:
         raise _TestFailInfo(out, exp)
+
+_HEVP_FAILURES = []
+
+def _record_failure(test_idx, inp, *, expected=None, actual=None, error=None):
+    _HEVP_FAILURES.append(
+        {
+            "test_idx": test_idx,
+            "input": repr(inp),
+            "expected": repr(expected) if expected is not None else None,
+            "actual": repr(actual) if actual is not None else None,
+            "error": str(error) if error is not None else None,
+        }
+    )
+
+def _report_failures():
+    if not _HEVP_FAILURES:
+        return 0
+    for item in _HEVP_FAILURES:
+        print(f"FAILED test #{item['test_idx']}", file=sys.stderr)
+        print(f"  Input: {item['input']}", file=sys.stderr)
+        if item["error"] is not None:
+            print(f"  Error: {item['error']}", file=sys.stderr)
+            if item["actual"] is not None:
+                print(f"  Your function returned: {item['actual']}", file=sys.stderr)
+        else:
+            print(f"  Expected: {item['expected']}", file=sys.stderr)
+            print(f"  Actual:   {item['actual']}", file=sys.stderr)
+    print(f"{len(_HEVP_FAILURES)} failing test(s)", file=sys.stderr)
+    return len(_HEVP_FAILURES)
 '''
 
     lines = test_code.split("\n")
@@ -178,29 +203,15 @@ def assertion(out, exp, atol):
                 out.append(f"{inner}{stripped}")
                 if is_assertion:
                     out.append(f"{body_indent}except _TestFailInfo as _e:")
-                    out.append(f"{inner}import sys as _s")
-                    out.append(f"{inner}_inp_r = repr(inp)[:200]")
-                    out.append(f"{inner}_out_r = repr(_e.out)[:200]")
-                    out.append(f"{inner}_exp_r = repr(_e.exp)[:200]")
-                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Input: {{_inp_r}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Expected: {{_exp_r}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Actual:   {{_out_r}}", file=_s.stderr)')
-                    out.append(f"{inner}_s.exit(1)")
+                    out.append(f"{inner}_record_failure({idx}, inp, expected=_e.exp, actual=_e.out)")
                 else:
                     out.append(f"{body_indent}except Exception as _e:")
-                    out.append(f"{inner}import sys as _s")
-                    out.append(f"{inner}_inp_r = repr(inp)[:200]")
                     out.append(f"{inner}try:")
                     out.append(f"{inner}    _ret = candidate(*inp)")
-                    out.append(f"{inner}    _ret_r = repr(_ret)[:200]")
+                    out.append(f"{inner}    _ret_r = repr(_ret)")
                     out.append(f"{inner}except Exception as _re:")
                     out.append(f"{inner}    _ret_r = f'<raised {{type(_re).__name__}}>'")
-                    out.append(f'{inner}print(f"FAILED test #{{{idx}}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Input: {{_inp_r}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Error: {{type(_e).__name__}}: {{_e}}", file=_s.stderr)')
-                    out.append(f'{inner}print(f"  Your function returned: {{_ret_r}}", file=_s.stderr)')
-                    out.append(f"{inner}_s.exit(1)")
+                    out.append(f"{inner}_record_failure({idx}, inp, error=f\"{{type(_e).__name__}}: {{_e}}\", actual=_ret_r)")
                 i += 1
                 continue
 
@@ -222,12 +233,22 @@ def _evaluate_solution(
     verify_code = (
         f"{solution_code}\n\n"
         f"{instrumented_test}\n\n"
-        f"check({entry_point})\n"
+        f"try:\n"
+        f"    check({entry_point})\n"
+        f"except Exception:\n"
+        f"    _report_failures()\n"
+        f"    import traceback as _tb\n"
+        f"    _tb.print_exc()\n"
+        f"    raise\n"
+        f"_fail_count = _report_failures()\n"
+        f"if _fail_count:\n"
+        f"    raise SystemExit(1)\n"
         f"print('All hidden tests passed!')\n"
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", verify_code],
+            [sys.executable, "-"],
+            input=verify_code,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -267,7 +288,7 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
     def _load_tasks(self) -> List[Dict[str, Any]]:
         return self._load_jsonl_tasks()
 
-    def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
         prompt = task["prompt"]
         entry_point = task["entry_point"]
@@ -285,60 +306,37 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
             agent = self._create_agent(workspace)
             initial_prompt = (
                 f"Implement the function `{entry_point}` in `solution.py`.\n\n"
-                f"Submission policy:\n"
-                f"- Hidden tests are evaluated only by the benchmark runner.\n"
-                f"- Do not create your own uncontrolled benchmark loop.\n"
-                f"- Each time you finish a controlled submission by calling `Finish`, the runner will execute hidden tests and send bounded feedback if needed.\n\n"
-                f"Steps:\n"
-                f"1. Read `solution.py` to see the signature, docstring, and examples.\n"
-                f"2. Implement the function body using Edit or Write.\n"
-                f"3. Perform lightweight self-checks if useful, but do not rely on local benchmark tests.\n"
-                f"4. When you want a controlled submission, call `Finish` alone with a brief summary of the current implementation.\n\n"
-                f"Important:\n"
+                f"Requirements:\n"
                 f"- Do NOT change the function signature or docstring.\n"
-                f"- The function must handle edge cases (empty inputs, boundary values, etc.).\n"
-                f"- The workspace contains only `solution.py`.\n"
+                f"- Handle edge cases (empty inputs, boundary values, etc.).\n"
+                f"- Hidden tests are evaluated only by the runner after each `Finish`.\n"
+                f"- Do not create your own uncontrolled benchmark test loop.\n"
+                f"- Only `solution.py` exists in the workspace.\n"
             )
 
             start = time.time()
-            agent_response = ""
-            feedback = None
-            passed = False
-            output = ""
-            rounds_used = 0
-
-            for round_idx in range(1, self.max_submission_rounds + 1):
-                rounds_used = round_idx
-                prompt_text = initial_prompt if round_idx == 1 else (
+            def _retry_prompt(round_idx: int, feedback: str) -> str:
+                return (
                     f"Controlled hidden-test feedback for submission round {round_idx - 1}:\n\n"
                     f"{feedback}\n\n"
                     f"Revise `solution.py` based on this feedback.\n"
                     f"- The failing hidden test index is reliable.\n"
-                    f"- The input/expected/actual previews are intentionally truncated.\n"
+                    f"- The hidden-test diagnostics include all discovered failures.\n"
                     f"- Use this feedback to reason about edge cases and logic errors, then call `Finish` alone again with a brief summary of the revision.\n"
                 )
-                prompt_history.append(prompt_text)
 
-                agent_response, error_result = self._run_agent_prompt(
-                    agent=agent,
-                    task_id=task_id,
-                    prompt_text=prompt_text,
-                    start_time=start,
-                    error_extra={"submission_rounds": round_idx},
-                )
-                if error_result is not None:
-                    result = error_result
-                    return result
-
+            def _evaluate_submission(round_idx: int, latest_response: str) -> Dict[str, Any]:
                 if not solution_file.exists():
-                    result = self._missing_output_result(
-                        task_id,
-                        path_label="solution.py",
-                        start_time=start,
-                        agent_response=agent_response,
-                        extra={"submission_rounds": round_idx},
-                    )
-                    return result
+                    return {
+                        "result": self._build_result(
+                            task_id,
+                            passed=False,
+                            error="solution.py not found after agent run",
+                            start_time=start,
+                            agent_response=latest_response,
+                            extra={"submission_rounds": round_idx},
+                        )
+                    }
 
                 passed, output = _evaluate_solution(
                     workspace=workspace,
@@ -348,23 +346,37 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                     test_code=test_code,
                     timeout=self.timeout,
                 )
-                if passed:
-                    break
-                feedback = truncate_feedback(output, max_lines=60, max_chars=10000)
+                return {"passed": passed, "output": output}
+
+            loop = self._run_controlled_submission_rounds(
+                task_id=task_id,
+                agent=agent,
+                start_time=start,
+                initial_prompt=initial_prompt,
+                max_rounds=self.max_submission_rounds,
+                prompt_history=prompt_history,
+                evaluate_submission=_evaluate_submission,
+                retry_prompt_builder=_retry_prompt,
+                error_extra_builder=lambda round_idx: {"submission_rounds": round_idx},
+            )
+            agent_response = loop["agent_response"]
+            if loop["early_result"] is not None:
+                result = loop["early_result"]
+                return result
 
             elapsed = round(time.time() - start, 2)
 
             result = self._build_result(
                 task_id,
-                passed=passed,
-                error=output if not passed else None,
+                passed=bool(loop["passed"]),
+                error=loop["output"] if not loop["passed"] else None,
                 agent_response=agent_response,
                 elapsed_s=elapsed,
-                extra={"submission_rounds": rounds_used},
+                extra={"submission_rounds": int(loop["rounds_used"])},
             )
             return result
         finally:
-            self._save_task_trajectory(
+            self._finalize_workspace_task(
                 task=task,
                 workspace=workspace,
                 agent=agent,
@@ -373,7 +385,6 @@ class HumanEvalPlusBenchmark(BenchmarkRunner):
                 artifact_paths=["solution.py"],
                 extra={"entry_point": entry_point},
             )
-            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main():
@@ -388,20 +399,18 @@ def main():
     BenchmarkRunner.add_shared_run_args(
         parser,
         default_temperature=1.0,
-        default_max_steps=32,
-        default_timeout=60,
+        default_max_steps=64,
+        default_timeout=120,
+        include_task_timeout=True,
+        default_task_timeout=600,
     )
     parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = HumanEvalPlusBenchmark(
         data_path=args.data_path,
-        output_dir=args.output_dir,
-        temperature=args.temperature,
-        max_steps=args.max_steps,
         max_submission_rounds=args.max_submission_rounds,
-        timeout=args.timeout,
-        trajectory_dir=args.trajectory_dir,
+        **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

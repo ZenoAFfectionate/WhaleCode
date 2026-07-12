@@ -431,22 +431,53 @@ class CLIUI:
 
     @staticmethod
     def _get_task_list(agent) -> list[dict]:
-        """Return the current task list from the agent's TodoWrite tool, or []."""
+        """Return the current task list from the agent's TodoWrite tool, or [].
+
+        重要-5: TodoWrite 已重构为 session-scoped TodoSessionStore，旧的
+        ``task_manager``/``task_*.json`` 集成早已失效。改为读取工具的
+        ``export_state()`` 快照，并把字段归一化为渲染层期望的 subject/status。
+        """
         registry = getattr(agent, "tool_registry", None)
         if not registry:
             return []
         todo_tool = registry.get_tool("TodoWrite")
-        if not todo_tool or not hasattr(todo_tool, "task_manager"):
+        if not todo_tool or not hasattr(todo_tool, "export_state"):
             return []
         try:
-            return todo_tool.task_manager.list_all()
+            state = todo_tool.export_state()
         except Exception:
             return []
+        todos = state.get("todos", []) if isinstance(state, dict) else []
+        normalized: list[dict] = []
+        for item in todos:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            normalized.append(
+                {
+                    "subject": content,
+                    "content": content,
+                    "status": str(item.get("status", "pending")),
+                    "priority": str(item.get("priority", "medium")),
+                }
+            )
+        return normalized
 
     def render_assistant(self, text: str) -> None:
+        """CLI-6: render the model's final answer cleanly — no enclosing Panel.
+
+        A dim Rule above the answer visually separates tool-execution noise from
+        the human-readable response.
+        """
+        if not text.strip():
+            return
         if self.use_rich:
-            self.console.print(Panel(Markdown(text), title="Assistant", border_style="blue", width=self.console.width))
+            self.console.print(Rule("Assistant", style="dim blue"))
+            self.console.print(Markdown(text))
         else:
+            print(f"\n── Assistant ──")
             print(text)
 
     def render_summary(self, elapsed_s: float, agent=None) -> None:
@@ -484,23 +515,39 @@ class CLIUI:
         else:
             print(title)
 
+    # CLI-10: three-tier visual hierarchy.
+    # Tier 1 (primary)   — model text output: no Panel, full weight.
+    # Tier 2 (secondary) — tool calls / thinking: dim compact line, thin border.
+    # Tier 3 (tertiary)  — observations / info: truncated, dim, small.
     _LOG_BLOCK_STYLES = {
-        "action":     ("Tool Call",        "bright_green", "🎬"),
-        "thinking":   ("Thinking",         "bright_blue",  "💭"),
-        "observation":("Observation",      "bright_cyan",  "👀"),
-        "info":       ("Info",             "cyan",         "ℹ️"),
-        "background": ("Background Update","magenta",      "📬"),
-        "warning":    ("Warning",          "yellow",       "⚠️"),
-        "error":      ("Error",            "red",          "❌"),
+        "action":      ("",                 "dim green",      ""),   # compact line
+        "thinking":    ("",                 "dim blue",       ""),   # compact line
+        "observation": ("",                 "dim",            ""),   # compact line
+        "info":        ("",                 "cyan",           ""),   # compact line
+        "background":  ("Background Update","magenta",       "📬"),
+        "warning":     ("Warning",          "yellow",        "⚠️"),
+        "error":       ("Error",            "red",           "❌"),
     }
 
     def render_log_block(self, kind: str, content: str) -> None:
+        """CLI-10: tiered rendering — secondary items are compact dim lines;
+        only warnings/errors get a full Panel.
+        """
         content = content.rstrip()
         if not content:
             return
 
         title, border, icon = self._LOG_BLOCK_STYLES.get(kind, (None, None, ""))
+        icon_str = f"{icon} " if icon else ""
+        # Secondary tier: compact dim line.
+        if kind in ("action", "thinking", "observation", "info"):
+            if self.use_rich:
+                self.console.print(f"[{border}]{icon_str}{content}[/{border}]")
+            else:
+                print(f"{icon_str}{content}")
+            return
 
+        # Primary tier: warning / error — keep the Panel for visibility.
         if not self.use_rich:
             prefix = f"[{title or kind}] " if title else ""
             print(f"{prefix}{content}")
@@ -592,16 +639,22 @@ class CLICodeAgentMixin:
     # Events that are intentionally suppressed in the CLI.
     _IGNORED_EVENTS = frozenset({
         "agent_start",      # Don't echo user input back
-        "step_start",       # Rendered implicitly by tool calls
         "direct_response",  # Rendered via render_assistant
         "final_answer",     # Rendered via render_assistant
         "timeout",          # Rendered by the agent loop itself
     })
 
+    # ── CLI-2: step visibility ──────────────────────────────────────
+    # Compact step prefix shown once per model turn.
+    _last_step_shown: int = 0
+
     def _reset_todo_turn_tracking(self) -> None:
         self._todo_changed_this_turn = False
         self._todo_mutating_call_ids = set()
         self._todo_mutating_call_without_id = False
+
+    # ── CLI-5: streaming line buffer ────────────────────────────────
+    _streaming_line_buffer: str = ""
 
     def _console(self, message: str = "", *, end: str = "\n") -> None:
         if end == "" and hasattr(self, "_streaming_line_buffer"):
@@ -618,9 +671,83 @@ class CLICodeAgentMixin:
         elif end == "\n":
             self.ui.print("")
 
+    # ── CLI-3: compact tool-call argument display ───────────────────
+    @staticmethod
+    def _compact_args(arguments, max_len: int = 120) -> str:
+        """Render tool arguments as a compact one-line summary."""
+        if not isinstance(arguments, dict) or not arguments:
+            return ""
+        # Prefer semantically-meaningful keys first.
+        for key in ("path", "command", "pattern", "query", "name", "url"):
+            val = arguments.get(key)
+            if isinstance(val, str) and val.strip():
+                return val[:max_len] + ("…" if len(val) > max_len else "")
+        # Fallback: flatten first value.
+        first_val = next(iter(arguments.values()), None)
+        text = str(first_val) if isinstance(first_val, str) else repr(first_val)
+        return text[:max_len] + ("…" if len(text) > max_len else "")
+
+    # ── CLI-4: tool-result truncation ───────────────────────────────
+    @staticmethod
+    def _truncate_observation(text: str, lines: int = 10, cols: int = 200) -> str:
+        """Return a head+tail preview of long tool output (CLI-4)."""
+        if not text:
+            return text
+        raw_lines = text.splitlines()
+        if len(raw_lines) <= lines:
+            return text
+        head = raw_lines[: lines - 2]
+        tail = raw_lines[-2:]
+        head_joined = "\n".join(line[:cols] for line in head)
+        tail_joined = "\n".join(line[-cols:] for line in tail)
+        omitted = len(raw_lines) - len(head) - len(tail)
+        return f"{head_joined}\n  ⋯ {omitted} lines omitted ⋯\n{tail_joined}"
+
+    # ── CLI-8: context pressure snapshot ────────────────────────────
+    @staticmethod
+    def _context_snapshot(agent) -> str:
+        """Return a compact ctx-usage string for the step label (CLI-8)."""
+        ctx = getattr(getattr(agent, "config", None), "context_window", 0)
+        used = getattr(agent, "_last_prompt_tokens", 0)
+        if ctx > 0 and used > 0:
+            pct = used * 100 / ctx
+            return f"[ctx {used:,} / {ctx:,}  {pct:.0f}%]"
+        return ""
+
+    # ═══════════════════════════════════════════════════════════════
+    # Main render dispatch
+    # ═══════════════════════════════════════════════════════════════
+
     def _render_event(self, event_type: str, payload: dict) -> None:
+        # ── CLI-2: compact step header ──────────────────────
+        if event_type == "step_start":
+            step = payload.get("step", 0)
+            ctx_info = self._context_snapshot(self) if isinstance(step, int) and step > 0 else ""
+            self.ui.info(f"✦ Step {step}  {ctx_info}")
+            return
+
         if event_type in self._IGNORED_EVENTS:
             return
+
+        # ── CLI-1: model reasoning / thinking ───────────────
+        if event_type == "model_output":
+            rc = str(payload.get("reasoning_content", "") or "")
+            if rc:
+                self.ui.render_log_block(
+                    "thinking",
+                    rc[:400] + ("…" if len(rc) > 400 else ""),
+                )
+            return
+
+        # ── CLI-5: streaming chunks → real-time ─────────────
+        if event_type == "stream_chunk":
+            chunk = str(payload.get("chunk", ""))
+            # Write directly so the user sees the model typing in real time.
+            self.ui.print(chunk, end="", flush=True) if hasattr(self.ui, "print") else print(chunk, end="", flush=True)
+            return
+
+        if event_type == "stream_newline":
+            return  # the chunk rendering already includes newlines
 
         if event_type == "compaction_notice":
             self.ui.render_log_block("warning", "[auto-compact triggered]")
@@ -636,14 +763,16 @@ class CLICodeAgentMixin:
         elif event_type == "tool_call":
             tool_name = payload.get("tool_name")
             arguments = payload.get("arguments", {})
-            tool_call_id = payload.get("tool_call_id")
-            prefix = f"[{tool_call_id}] " if tool_call_id else ""
-            self.ui.render_log_block("action", f"{prefix}{tool_name}({arguments})")
+            compact = self._compact_args(arguments)
+            label = f"▸ {tool_name}"
+            if compact:
+                label += f": {compact}"
+            self.ui.render_log_block("action", label)
 
             if tool_name == "TodoWrite" and isinstance(arguments, dict):
-                action = str(arguments.get("action", "")).strip().lower()
                 has_todos_payload = isinstance(arguments.get("todos"), list)
-                if action in TODO_MUTATING_ACTIONS or has_todos_payload:
+                if has_todos_payload:
+                    tool_call_id = payload.get("tool_call_id")
                     if tool_call_id:
                         if not hasattr(self, "_todo_mutating_call_ids"):
                             self._todo_mutating_call_ids = set()
@@ -652,38 +781,27 @@ class CLICodeAgentMixin:
                         self._todo_mutating_call_without_id = True
         elif event_type == "tool_result":
             kind = "error" if payload.get("status") == "error" else "observation"
+            raw = str(payload.get("result_content", ""))
+            display = self._truncate_observation(raw)
             tool_name = payload.get("tool_name")
-            tool_call_id = payload.get("tool_call_id")
-            header = ""
-            if tool_name or tool_call_id:
-                left = f"[{tool_call_id}] " if tool_call_id else ""
-                right = f"{tool_name}\n" if tool_name else ""
-                header = left + right
-            self.ui.render_log_block(kind, f"{header}{payload.get('result_content', '')}")
 
             if tool_name == "TodoWrite":
                 tracked_ids = getattr(self, "_todo_mutating_call_ids", set())
                 tracked_wo_id = getattr(self, "_todo_mutating_call_without_id", False)
-                is_mutating = (tool_call_id in tracked_ids) or tracked_wo_id
+                is_mutating = (payload.get("tool_call_id") in tracked_ids) or tracked_wo_id
                 if is_mutating:
                     status = str(payload.get("status", "")).lower()
-                    content = str(payload.get("result_content", ""))
-                    is_success = status != "error" and not content.startswith("❌")
+                    is_success = status != "error" and not raw.startswith("❌")
                     if is_success:
                         self._todo_changed_this_turn = True
                         self.ui.render_inline_task_progress(self)
-
-                if tool_call_id and tool_call_id in tracked_ids:
-                    tracked_ids.discard(tool_call_id)
+                if payload.get("tool_call_id") in tracked_ids:
+                    tracked_ids.discard(payload.get("tool_call_id"))
                 elif tracked_wo_id:
                     self._todo_mutating_call_without_id = False
-        elif event_type == "stream_chunk":
-            self._streaming_line_buffer += payload.get("chunk", "")
-        elif event_type == "stream_newline":
-            pending = getattr(self, "_streaming_line_buffer", "")
-            if pending:
-                self.ui.render_log_block("info", pending)
-                self._streaming_line_buffer = ""
+
+            # For observation, only show head. For errors, keep full.
+            self.ui.render_log_block(kind, display)
         elif event_type == "agent_error":
             self.ui.render_log_block("error", payload.get("message", ""))
         elif event_type == "background_update":
@@ -754,6 +872,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable automatic save-on-exit for interactive mode.",
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=100,
+        help=(
+            "Maximum ReAct steps per turn before the agent stops (default 100). "
+            "Set to 0 for unlimited stepping (advanced; no hard cost ceiling)."
+        ),
+    )
     return parser
 
 
@@ -796,7 +923,7 @@ def create_agent(args, ui: CLIUI):
         project_root=str(workspace),
         working_dir=str(workspace),
         config=config,
-        max_steps=0,
+        max_steps=args.max_steps,
         register_default_tools=True,
         enable_task_tool=True,
         ui=ui,
@@ -873,66 +1000,72 @@ def _task_snapshot_path(session_path: Path) -> Path:
     return session_path.with_name(f"{session_path.stem}.tasks.json")
 
 
-def _get_todo_task_dir(agent) -> Optional[Path]:
+def _get_todo_tool(agent):
+    """Return the agent's TodoWrite tool if it exposes the session-state API."""
     try:
-        if not hasattr(agent, "tool_registry") or not agent.tool_registry:
+        registry = getattr(agent, "tool_registry", None)
+        if not registry:
             return None
-        todo_tool = agent.tool_registry.get_tool("TodoWrite")
-        if not todo_tool or not hasattr(todo_tool, "task_manager"):
-            return None
-        task_dir = Path(todo_tool.task_manager.dir)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        return task_dir
+        todo_tool = registry.get_tool("TodoWrite")
+        if (
+            todo_tool
+            and hasattr(todo_tool, "export_state")
+            and hasattr(todo_tool, "import_state")
+        ):
+            return todo_tool
     except Exception:
         return None
+    return None
 
 
 def clear_todo_tasks(agent, ui: Optional[CLIUI] = None) -> None:
-    """Clear persisted TodoWrite tasks for starting a fresh conversation."""
-    task_dir = _get_todo_task_dir(agent)
-    if not task_dir:
+    """Reset TodoWrite tasks for starting a fresh conversation (重要-5)."""
+    todo_tool = _get_todo_tool(agent)
+    if not todo_tool:
         return
-
-    removed = 0
-    for path in task_dir.glob("task_*.json"):
-        try:
-            if path.is_file():
-                path.unlink()
-                removed += 1
-        except Exception:
-            continue
-
-    if ui and removed:
-        ui.info(f"Cleared {removed} task file(s) for fresh conversation.")
+    try:
+        state = todo_tool.export_state()
+        had = bool(state.get("todos")) if isinstance(state, dict) else False
+        todo_tool.import_state({"todos": []})
+    except Exception:
+        return
+    if ui and had:
+        ui.info("Cleared tasks for fresh conversation.")
 
 
 def maybe_save_task_snapshot(agent, session_path: Path, ui: Optional[CLIUI] = None) -> None:
-    """Persist current TodoWrite tasks beside the session file."""
-    task_dir = _get_todo_task_dir(agent)
-    if not task_dir:
+    """Persist current TodoWrite tasks beside the session file (重要-5).
+
+    The session JSON already embeds ``todo_state`` via ``save_session``; this
+    sidecar keeps the CLI's explicit /save + task-restore flow self-contained.
+    """
+    todo_tool = _get_todo_tool(agent)
+    if not todo_tool:
         return
-
-    tasks = []
-    for path in sorted(task_dir.glob("task_*.json")):
-        try:
-            tasks.append(json.loads(path.read_text(encoding="utf-8")))
-        except Exception:
-            continue
-
+    try:
+        state = todo_tool.export_state()
+    except Exception:
+        return
+    todos = state.get("todos", []) if isinstance(state, dict) else []
     snapshot_path = _task_snapshot_path(session_path)
-    payload = {"session_file": str(session_path), "tasks": tasks}
-    snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload = {"session_file": str(session_path), "todos": todos}
+    try:
+        snapshot_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        return
     if ui:
         ui.info(f"Task snapshot saved: {snapshot_path}")
 
 
 def maybe_restore_task_snapshot(agent, session_path: Path, ui: Optional[CLIUI] = None) -> bool:
-    """Restore TodoWrite tasks from sidecar snapshot file.
+    """Restore TodoWrite tasks from the sidecar snapshot file (重要-5).
 
     Returns True if a snapshot file is found and restored.
     """
-    task_dir = _get_todo_task_dir(agent)
-    if not task_dir:
+    todo_tool = _get_todo_tool(agent)
+    if not todo_tool:
         return False
 
     snapshot_path = _task_snapshot_path(session_path)
@@ -941,20 +1074,14 @@ def maybe_restore_task_snapshot(agent, session_path: Path, ui: Optional[CLIUI] =
 
     try:
         data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        tasks = data.get("tasks", [])
-        if not isinstance(tasks, list):
-            return False
-
-        clear_todo_tasks(agent)
-        for task in tasks:
-            task_id = task.get("id")
-            if task_id is None:
-                continue
-            target = task_dir / f"task_{int(task_id)}.json"
-            target.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
+        # Accept both the new {"todos": [...]} and legacy {"tasks": [...]} shapes.
+        todos = data.get("todos")
+        if not isinstance(todos, list):
+            legacy = data.get("tasks")
+            todos = legacy if isinstance(legacy, list) else []
+        todo_tool.import_state({"todos": todos})
         if ui:
-            ui.info(f"Restored {len(tasks)} task(s) from snapshot.")
+            ui.info(f"Restored {len(todos)} task(s) from snapshot.")
         return True
     except Exception as exc:
         if ui:
@@ -1014,15 +1141,16 @@ def run_agent_turn(
 
     response = result_holder[0] or ""
 
-    # Render final task status (static) after the turn.
+    # CLI-6: show answer *before* task status (answer is primary content).
+    ui.render_assistant(response)
+    ui.render_summary(time.time() - start_time, agent=agent)
+
+    # Render task status below the answer (secondary).
     ui.render_task_status(agent)
 
     # If all tasks are now completed, clear them so they won't show again.
     if ui.all_tasks_completed(agent):
         clear_todo_tasks(agent)
-
-    ui.render_assistant(response)
-    ui.render_summary(time.time() - start_time, agent=agent)
     return response
 
 
@@ -1050,15 +1178,32 @@ def print_help(ui: CLIUI) -> None:
 
 
 def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
+    cfg = agent.config
+    llm = agent.llm
+    tool_count = len(agent.tool_registry.list_tools()) if agent.tool_registry else 0
+    total_tokens = getattr(agent, "_total_tokens", 0)
+    max_steps = getattr(agent, "max_steps", "?")
+    current_step = getattr(agent, "_current_step", 0)
+    ctx_window = getattr(cfg, "context_window", 0)
+    ctx_used = getattr(agent, "_last_prompt_tokens", 0)
+    # Bash sandbox parameters
+    bash_tool = agent.tool_registry.get_tool("Bash") if agent.tool_registry else None
+    bash_cpu = getattr(bash_tool, "max_cpu_seconds", "?") if bash_tool else "?"
+    bash_net = getattr(bash_tool, "allow_network", False) if bash_tool else False
+
     lines = [
-        f"Workspace root: {workspace}",
-        f"Current working directory: {getattr(agent, 'working_dir', workspace)}",
-        f"Model: {getattr(agent.llm, 'model', '[unknown]')}",
-        f"Base URL: {getattr(agent.llm, 'base_url', '[unknown]')}",
-        f"Temperature: {getattr(agent.llm, 'temperature', '[unknown]')}",
-        f"Trace enabled: {getattr(agent.config, 'trace_enabled', False)}",
-        f"Session enabled: {bool(getattr(agent, 'session_store', None))}",
-        f"Registered tools: {len(agent.tool_registry.list_tools()) if agent.tool_registry else 0}",
+        f"Workspace:        {workspace}",
+        f"Working dir:      {getattr(agent, 'working_dir', workspace)}",
+        f"Model:            {getattr(llm, 'model', '[?]')}",
+        f"Base URL:         {getattr(llm, 'base_url', '[?]')}",
+        f"Temperature:      {getattr(llm, 'temperature', '[?]')}",
+        f"Max steps:        {max_steps}  (current: {current_step})",
+        f"Tokens used:      {total_tokens:,}",
+        f"Context:          {ctx_used:,} / {ctx_window:,}  ({ctx_used*100/max(ctx_window,1):.0f}%)" if ctx_window else "Context:          N/A",
+        f"Trace:            {'on' if getattr(cfg, 'trace_enabled', False) else 'off'}",
+        f"Session:          {'on' if getattr(agent, 'session_store', None) else 'off'}",
+        f"Tools registered: {tool_count}",
+        f"Bash CPU limit:   {bash_cpu}s  |  network: {'on' if bash_net else 'off'}",
     ]
     if ui.use_rich:
         ui.console.print(Panel("\n".join(lines), title="Runtime Info", border_style="cyan", width=ui.console.width))

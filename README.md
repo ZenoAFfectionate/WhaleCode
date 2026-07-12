@@ -48,32 +48,19 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2 vllm serve google/gemma-4-31B-it \
+CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3.6-27B-FP8 \
     --port 8000 \
     --tensor-parallel-size 2 \
-    --max-model-len=256000 \
-    --gpu-memory-utilization 0.90 \
-    --enable-prefix-caching \
-    --reasoning-parser gemma4 \
-    --enable-auto-tool-choice \
-    --tool-call-parser gemma4 \
-    --async-scheduling
-
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
-    --port 8000 \
-    --gpu-memory-utilization 0.90 \
-    --enable-prefix-caching \
+    --max-model-len 262144 \
+    --max-num-seqs 2 \
+    --gpu-memory-utilization 0.92 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder \
     --language-model-only \
-    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder
-
-CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
-    --port 8000 \
-    --mem-fraction-static 0.9 \
-    --reasoning-parser qwen3 \
-    --tool-call-parser qwen3_coder
+    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'
 ```
 
 ```bash
@@ -356,45 +343,65 @@ Whale Code includes a built-in benchmark suite to evaluate the coding agent on f
 > **Prerequisite**: The LLM backend must be running (e.g. vLLM, or set the API key in `.env`).
 
 ```bash
+bash scripts/run_aime.sh  # run AIME benchmark
+
 bash scripts/run_hevp.sh  # run HumanEval benchmark
 bash scripts/run_clev.sh  # run ClassEval benchmark
 bash scripts/run_mbpp.sh  # run MBPP benchmark
-bash scripts/run_aime.sh  # run AIME benchmark
-bash scripts/run_lcb6.sh  # run LiveCode benchmark
 
-# run Software Engineering Verified benchmark
-...
+bash scripts/run_lcb6.sh  # run LiveCode benchmark
+bash scripts/run_term.sh  # run Terminal benchmark
+
+# run SWE-bench Verified (Phase 1: inference)
+bash scripts/run_swev.sh --limit 5 --workers 2
+
+# run SWE-bench official Docker evaluation (Phase 2)
+bash scripts/run_swev_eval.sh data/_results/swev_predictions_YYYYMMDD_HHMMSS.jsonl
 ```
+
+SWEV phase-1 outputs now include:
+
+- `swev_predictions_<timestamp>.jsonl` (official harness format)
+- `swev_preds_<timestamp>.json` (dictionary format, compatible with SWE-agent style tooling)
+- `preds.json` (latest predictions snapshot, overwritten each run)
+
+Common `CalledProcessError` root causes in Docker runs:
+
+1. `docker info` fails (daemon not running / permission issue).
+2. image pull/start fails (network, registry rate limit, image not found, architecture mismatch).
+3. `git clone`/`git checkout` fails (bad commit hash, network failure, corrupted repo cache).
+
+The SWEV runner now records richer diagnostics (command, return code, stdout/stderr excerpt) in failure messages to make these issues actionable.
 
 ### Result
 
-> Model: **Qwen3.5-27B-FP8**
+> Model: **Gemma-4-31B-IT** (Speed: 25 tokens/s)
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**         | 378 |  | **** |  | 2026-03- |
-| **HumanEval+**    | 164 |  | **** |  | 2026-03- |
-| **ClassEval**     | 100 |  | **** |  | 2026-03- |
-| **LiveCodeBench** |     |  | **** |  | 2026-03- |
-| **SWE--Verified** |     |  | **** |  | 2026-03- |
+| **MBPP+**         | 378 |  | **** |  | 2026-04- |
+| **HumanEval+**    | 164 |  | **** |  | 2026-04- |
+| **ClassEval**     | 100 |  | **** |  | 2026-04- |
+| **LiveCodeBench** |     |  | **** |  | 2026-04- |
+| **SWE--Verified** | 500 |  | **** |  | 2026-04- |
 
-| **AIME 24** | 30  |  | **** |  | 2026-03- |
-| **AIME 25** | 30  |  | **** |  | 2026-03- |
-| **AIME 26** | 30  |  | **** |  | 2026-03- |
+| **AIME 24** | 30  | 29 | **** |  | 2026-04-06 |
+| **AIME 25** | 30  | 28 | **** |  | 2026-04-06 |
+| **AIME 26** | 30  | 30 | **** |  | 2026-04-06 |
 
-> Model: **Qwen3.5-35B-A3B-FP8**
+> Model: **Gemma-4-26B-A4B-IT** (Speed: 110 tokens/s)
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |-----------|------:|-------:|----------:|---------:|------|
-| **MBPP+**         | 378 | 375 | **99.2%** | 30.52s | 2026-03-24 |
-| **HumanEval+**    | 164 | 159 | **96.9%** | 32.71s | 2026-03-24 |
-| **ClassEval**     | 100 | 94  | **94.0%** | 139.5s | 2026-03-24 |
-| **LiveCodeBench** |     |     | ****      |        | 2026-03-28 |
-| **SWE--Verified** |     |     | ****      |        | 2026-03-28 |
+| **MBPP+**         | 378 |  | **** |  | 2026-04- |
+| **HumanEval+**    | 164 |  | **** |  | 2026-04- |
+| **ClassEval**     | 100 |  | **** |  | 2026-04- |
+| **LiveCodeBench** |     |  | **** |  | 2026-04- |
+| **SWE--Verified** | 500 |  | **** |  | 2026-04- |
 
-| **AIME 24** | 30  | 25  | **83.3%** | 216.86 | 2026-03-28 |
-| **AIME 25** | 30  | 25  | **83.3%** | 171.1s | 2026-03-28 |
-| **AIME 26** | 30  | 26  | **86.7%** | 196.3s | 2026-03-28 |
+| **AIME 24** | 30  |  | **** |  | 2026-04- |
+| **AIME 25** | 30  |  | **** |  | 2026-04- |
+| **AIME 26** | 30  |  | **** |  | 2026-04- |
 
 ---
 

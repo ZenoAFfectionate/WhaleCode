@@ -8,7 +8,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
-import re
+import shutil
 import sys
 import tempfile
 import time
@@ -122,12 +122,6 @@ class BenchmarkCodeAgent(CodeAgent):
         self._benchmark_protocol_errors = 0
         super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def _contains_embedded_tool_markup(text: Optional[str]) -> bool:
-        if not text:
-            return False
-        return bool(re.search(r"<tool_call>|<function=[^>]+>|<parameter=", text))
-
     def _console(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
         return
 
@@ -167,7 +161,6 @@ class BenchmarkCodeAgent(CodeAgent):
     ) -> tuple[bool, Optional[str], Optional[str]]:
         if self._benchmark_required_tool_choice and structured_output is None:
             self._benchmark_protocol_errors += 1
-            reasoning_has_tool_markup = self._contains_embedded_tool_markup(reasoning_content)
             response_unfinished = self._response_unfinished_flag(response_message)
 
             self._render_event(
@@ -178,7 +171,6 @@ class BenchmarkCodeAgent(CodeAgent):
                     "error": "tool_choice='required' but assistant returned no structured tool_calls",
                     "text_content_length": len(text_content or ""),
                     "reasoning_content_length": len(reasoning_content or ""),
-                    "reasoning_contains_tool_markup": reasoning_has_tool_markup,
                     "response_unfinished": response_unfinished,
                     "reasoning_source": reasoning_source,
                     "text_content": _clip_text(text_content, 400),
@@ -189,18 +181,9 @@ class BenchmarkCodeAgent(CodeAgent):
             feedback_lines = [
                 "Protocol error: the previous assistant response did not contain any structured tool_calls.",
                 "The benchmark is running with tool_choice='required'.",
+                "Do not answer in plain text at this step. Emit a real tool_calls response instead.",
+                "Retry now and return exactly one valid structured tool call.",
             ]
-            if reasoning_has_tool_markup:
-                feedback_lines.append(
-                    "Do not place tool-call markup inside the reasoning field. Emit a real tool_calls response instead."
-                )
-            elif text_content.strip():
-                feedback_lines.append(
-                    "Do not answer in plain text at this step. Emit a real tool_calls response instead."
-                )
-            feedback_lines.append(
-                "Retry now and return exactly one valid structured tool call."
-            )
 
             self._append_history_message(
                 Message("\n".join(feedback_lines), "user"),
@@ -218,17 +201,18 @@ class BenchmarkCodeAgent(CodeAgent):
         )
 
 
-def _evaluate_task_in_subprocess(
+def _run_task_in_subprocess(
     runner: "BenchmarkRunner",
     task: Dict[str, Any],
     result_queue: Any,
     progress_queue: Any,
     task_id: str,
 ) -> None:
-    """Execute ``runner._evaluate_task`` and send a serializable payload back."""
+    """Execute ``runner._run_task`` and send a serializable payload back."""
     try:
-        runner._bind_progress_queue(task_id, progress_queue)
-        result_queue.put({"ok": True, "result": runner._evaluate_task(task)})
+        runner._current_task_id = task_id
+        runner._progress_queue = progress_queue
+        result_queue.put({"ok": True, "result": runner._run_task(task)})
     except BaseException as exc:
         result_queue.put(
             {
@@ -238,7 +222,8 @@ def _evaluate_task_in_subprocess(
             }
         )
     finally:
-        runner._bind_progress_queue(None, None)
+        runner._current_task_id = None
+        runner._progress_queue = None
 
 
 BENCHMARK_BASE_SYSTEM_PROMPT: str = _build_benchmark_system_prompt(_PROJECT_ROOT)
@@ -247,10 +232,12 @@ BENCHMARK_BASE_SYSTEM_PROMPT: str = _build_benchmark_system_prompt(_PROJECT_ROOT
 class BenchmarkRunner(ABC):
     """Base class for all benchmark runners.
 
-    Subclasses must implement :meth:`_load_tasks` and :meth:`_evaluate_task`.
+    Subclasses must implement :meth:`_load_tasks` and :meth:`_run_task`.
     """
 
     benchmark_name: str = "base"
+
+    # ========== 1. Configuration & Data Loading ==========
 
     @staticmethod
     def add_shared_run_args(
@@ -277,6 +264,22 @@ class BenchmarkRunner(ABC):
         parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
         parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
         parser.add_argument("--dry-run", action="store_true")
+
+    @staticmethod
+    def runner_kwargs_from_args(args: Any, *, include_task_timeout: bool = False) -> Dict[str, Any]:
+        kwargs = {
+            "output_dir": args.output_dir,
+            "model": getattr(args, "model", None),
+            "base_url": getattr(args, "base_url", None),
+            "api_key": getattr(args, "api_key", None),
+            "temperature": args.temperature,
+            "max_steps": args.max_steps,
+            "timeout": args.timeout,
+            "trajectory_dir": args.trajectory_dir,
+        }
+        if include_task_timeout:
+            kwargs["task_timeout"] = args.task_timeout
+        return kwargs
 
     def __init__(
         self,
@@ -336,29 +339,15 @@ class BenchmarkRunner(ABC):
     def _make_workspace(self, prefix: str) -> Path:
         return Path(tempfile.mkdtemp(prefix=prefix))
 
-    def _build_result(
-        self,
-        task_id: str,
-        *,
-        passed: Optional[bool],
-        error: Optional[str],
-        agent_response: str = "",
-        start_time: Optional[float] = None,
-        elapsed_s: Optional[float] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if elapsed_s is None:
-            elapsed_s = 0.0 if start_time is None else round(time.time() - start_time, 2)
-        result: Dict[str, Any] = {
-            "task_id": task_id,
-            "passed": passed,
-            "error": error,
-            "agent_response": (agent_response or "")[:500],
-            "elapsed_s": round(float(elapsed_s), 2),
-        }
-        if extra:
-            result.update(extra)
-        return result
+    @abstractmethod
+    def _load_tasks(self) -> List[Dict[str, Any]]:
+        """Load and return the task list from ``self.data_path``."""
+
+    # ========== 2. Agent Factory ==========
+
+    def _configure_agent_config(self, config: Any) -> Any:
+        """Allow subclasses to tweak agent config after benchmark defaults are applied."""
+        return config
 
     @staticmethod
     def _benchmark_agent_run_kwargs(run_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -412,58 +401,6 @@ class BenchmarkRunner(ABC):
                 extra=error_extra,
             )
 
-    def _missing_output_result(
-        self,
-        task_id: str,
-        *,
-        path_label: str,
-        start_time: Optional[float] = None,
-        elapsed_s: Optional[float] = None,
-        agent_response: str = "",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        return self._build_result(
-            task_id,
-            passed=False,
-            error=f"{path_label} not found after agent run",
-            agent_response=agent_response,
-            start_time=start_time,
-            elapsed_s=elapsed_s,
-            extra=extra,
-        )
-
-    def _build_llm_kwargs(self) -> Dict[str, Any]:
-        llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
-        if self.model:
-            llm_kwargs["model"] = self.model
-        if self.base_url:
-            llm_kwargs["base_url"] = self.base_url
-        if self.api_key:
-            llm_kwargs["api_key"] = self.api_key
-        return llm_kwargs
-
-    def _configure_agent_config(self, config: Any) -> Any:
-        config.trace_enabled = False
-        return config
-
-    def _build_agent(self, *, workspace: Path, registry: Any, config: Any, llm: Any) -> BenchmarkCodeAgent:
-        task_id = self._current_task_id or workspace.name
-        return BenchmarkCodeAgent(
-            name="bench-agent",
-            llm=llm,
-            tool_registry=registry,
-            project_root=str(workspace),
-            working_dir=str(workspace),
-            config=config,
-            max_steps=self.max_steps,
-            register_default_tools=False,
-            enable_task_tool=False,
-            interactive=False,
-            system_prompt=self._get_system_prompt() or BENCHMARK_BASE_SYSTEM_PROMPT,
-            task_id=task_id,
-            event_sink=lambda event_type, payload: self._emit_progress_event(task_id, event_type, payload),
-        )
-
     def _register_agent_tools(self, *, registry: Any, workspace: Path, agent: BenchmarkCodeAgent) -> None:
         from hello_agents.tools.builtin.bash import BashTool
         from hello_agents.tools.builtin.file_tools import (
@@ -504,16 +441,231 @@ class BenchmarkRunner(ABC):
         from hello_agents.core.llm import HelloAgentsLLM
         from hello_agents.tools.registry import ToolRegistry
 
-        config = self._configure_agent_config(Config.from_env())
-        llm = HelloAgentsLLM(**self._build_llm_kwargs())
+        config = Config.from_env()
+        config.trace_enabled = False
+        config = self._configure_agent_config(config)
+
+        llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
+        if self.model:
+            llm_kwargs["model"] = self.model
+        if self.base_url:
+            llm_kwargs["base_url"] = self.base_url
+        if self.api_key:
+            llm_kwargs["api_key"] = self.api_key
+
+        llm = HelloAgentsLLM(**llm_kwargs)
         registry = ToolRegistry(config=config, verbose=False)
-        agent = self._build_agent(workspace=workspace, registry=registry, config=config, llm=llm)
+        task_id = self._current_task_id or workspace.name
+        agent = BenchmarkCodeAgent(
+            name="bench-agent",
+            llm=llm,
+            tool_registry=registry,
+            project_root=str(workspace),
+            working_dir=str(workspace),
+            config=config,
+            max_steps=self.max_steps,
+            register_default_tools=False,
+            enable_task_tool=False,
+            interactive=False,
+            system_prompt=self._get_system_prompt() or BENCHMARK_BASE_SYSTEM_PROMPT,
+            task_id=task_id,
+            event_sink=lambda event_type, payload: self._emit_progress_event(task_id, event_type, payload),
+        )
         self._register_agent_tools(registry=registry, workspace=workspace, agent=agent)
         return agent
 
-    def _bind_progress_queue(self, task_id: Optional[str], progress_queue: Any) -> None:
-        self._current_task_id = task_id
-        self._progress_queue = progress_queue
+    # ========== 3. Task Execution & Retry Loop ==========
+
+    def _use_subprocess_task_timeout(self) -> bool:
+        """Return True when ``task_timeout`` should wrap task execution in a subprocess."""
+        return True
+
+    def _run_controlled_submission_rounds(
+        self,
+        *,
+        task_id: str,
+        agent: CodeAgent,
+        start_time: float,
+        initial_prompt: str,
+        max_rounds: int,
+        prompt_history: List[str],
+        evaluate_submission: Callable[[int, str], Dict[str, Any]],
+        retry_prompt_builder: Callable[[int, str], str],
+        run_kwargs_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = None,
+        error_extra_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
+        """Run repeated controlled submissions with bounded evaluator feedback."""
+        total_rounds = max(1, int(max_rounds))
+        agent_response = ""
+        evaluation: Dict[str, Any] = {"passed": False, "output": ""}
+        feedback = ""
+
+        for round_idx in range(1, total_rounds + 1):
+            prompt_text = (
+                initial_prompt
+                if round_idx == 1
+                else retry_prompt_builder(round_idx, feedback)
+            )
+            prompt_history.append(prompt_text)
+
+            run_kwargs = run_kwargs_builder(round_idx) if run_kwargs_builder is not None else None
+            error_extra = error_extra_builder(round_idx) if error_extra_builder is not None else None
+            agent_response, error_result = self._run_agent_prompt(
+                agent=agent,
+                task_id=task_id,
+                prompt_text=prompt_text,
+                start_time=start_time,
+                run_kwargs=run_kwargs,
+                error_extra=error_extra,
+            )
+            if error_result is not None:
+                return {
+                    "agent_response": agent_response,
+                    "early_result": error_result,
+                    "rounds_used": round_idx,
+                }
+
+            evaluation = evaluate_submission(round_idx, agent_response) or {}
+            early_result = evaluation.get("result")
+            if early_result is not None:
+                return {
+                    "agent_response": agent_response,
+                    "early_result": early_result,
+                    "rounds_used": round_idx,
+                }
+
+            passed = bool(evaluation.get("passed"))
+            output = str(evaluation.get("output") or "")
+            if passed or evaluation.get("force_stop"):
+                return {
+                    "agent_response": agent_response,
+                    "early_result": None,
+                    "rounds_used": round_idx,
+                    "passed": passed,
+                    "output": output,
+                }
+
+            feedback = str(evaluation.get("feedback") or output)
+
+        return {
+            "agent_response": agent_response,
+            "early_result": None,
+            "rounds_used": total_rounds,
+            "passed": bool(evaluation.get("passed")),
+            "output": str(evaluation.get("output") or ""),
+        }
+
+    @abstractmethod
+    def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the agent on *task* and return a result dict.
+
+        The returned dict must include at least:
+        ``task_id``, ``passed`` (bool), ``error`` (str or None),
+        ``elapsed_s`` (float).
+        """
+
+    def evaluate(self, task: Dict[str, Any], *, task_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute one benchmark task with optional end-to-end wall-clock timeout."""
+        resolved_task_id = str(task_id or task.get("task_id") or uuid.uuid4().hex)
+
+        if self.task_timeout <= 0 or not self._use_subprocess_task_timeout():
+            return self._run_task(task)
+
+        try:
+            ctx = mp.get_context("fork")
+        except ValueError:
+            ctx = mp.get_context()
+
+        result_queue = ctx.Queue(maxsize=1)
+        progress_queue = ctx.Queue(maxsize=512)
+        process = ctx.Process(
+            target=_run_task_in_subprocess,
+            args=(self, task, result_queue, progress_queue, resolved_task_id),
+            name=f"{self.benchmark_name}-{resolved_task_id}",
+            daemon=True,
+        )
+        process.start()
+
+        deadline = time.time() + self.task_timeout
+        timed_out = False
+        progress_updates: List[Dict[str, Any]] = []
+        while process.is_alive():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                update = progress_queue.get(timeout=min(0.2, max(0.01, remaining)))
+            except queue.Empty:
+                update = None
+            except Exception:
+                update = None
+            if update is not None:
+                progress_updates.append(update)
+                self._handle_progress_update(update)
+
+        while progress_queue is not None:
+            try:
+                update = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            progress_updates.append(update)
+            self._handle_progress_update(update)
+
+        if timed_out and process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=5)
+            timeout_result = {
+                "task_id": resolved_task_id,
+                "passed": False,
+                "error": f"Timeout: problem solving exceeded {self.task_timeout}s",
+                "elapsed_s": float(self.task_timeout),
+                "timeout": True,
+            }
+            agent_stub = SimpleNamespace(
+                benchmark_events=self._progress_updates_to_events(progress_updates),
+                tool_registry=SimpleNamespace(read_metadata_cache={}),
+                get_history=lambda: [],
+            )
+            try:
+                self._save_task_trajectory(
+                    task=task,
+                    workspace=None,
+                    agent=agent_stub,
+                    prompt_texts=[],
+                    result=timeout_result,
+                    artifact_paths=None,
+                    extra={"timeout_stub": True},
+                )
+            except Exception:
+                pass
+            return timeout_result
+
+        process.join(timeout=1)
+        try:
+            payload = result_queue.get_nowait()
+        except Exception:
+            payload = None
+
+        if not payload:
+            return {
+                "task_id": resolved_task_id,
+                "passed": False,
+                "error": "Runner process exited without returning a result",
+                "elapsed_s": 0.0,
+            }
+
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("traceback") or payload.get("error") or "Unknown runner error")
+
+        return payload["result"]
+
+    # ========== 4. Progress & Trajectory ==========
 
     def _emit_progress_event(self, task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
         update = _build_progress_update(task_id, event_type, payload)
@@ -532,42 +684,7 @@ class BenchmarkRunner(ABC):
         if detail is not None or status is not None or step is not None:
             self._progress_manager.update(step=step, status=status, detail=detail)
 
-    def _drain_progress_queue(self, progress_queue: Any) -> None:
-        while progress_queue is not None:
-            try:
-                update = progress_queue.get_nowait()
-            except queue.Empty:
-                break
-            except Exception:
-                break
-            self._handle_progress_update(update)
-
     _progress_updates_to_events = staticmethod(_progress_updates_to_events)
-
-    def _save_timeout_stub_trajectory(
-        self,
-        *,
-        task: Dict[str, Any],
-        result: Dict[str, Any],
-        progress_updates: List[Dict[str, Any]],
-    ) -> None:
-        agent_stub = SimpleNamespace(
-            benchmark_events=self._progress_updates_to_events(progress_updates),
-            tool_registry=SimpleNamespace(read_metadata_cache={}),
-            get_history=lambda: [],
-        )
-        try:
-            self._save_task_trajectory(
-                task=task,
-                workspace=None,
-                agent=agent_stub,
-                prompt_texts=[],
-                result=result,
-                artifact_paths=None,
-                extra={"timeout_stub": True},
-            )
-        except Exception:
-            pass
 
     def _save_task_trajectory(
         self,
@@ -598,109 +715,62 @@ class BenchmarkRunner(ABC):
         (task_dir / "README.md").write_text(_build_trajectory_readme(payload), encoding="utf-8")
         return str(trajectory_path)
 
-    # ------------------------------------------------------------------
-    # Data loading & evaluation (subclass hooks)
-    # ------------------------------------------------------------------
-
-    @abstractmethod
-    def _load_tasks(self) -> List[Dict[str, Any]]:
-        """Load and return the task list from ``self.data_path``."""
-
-    @abstractmethod
-    def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Run the agent on *task* and return a result dict.
-
-        The returned dict must include at least:
-        ``task_id``, ``passed`` (bool), ``error`` (str or None),
-        ``elapsed_s`` (float).
-        """
-
-    # ------------------------------------------------------------------
-    # Main run loop
-    # ------------------------------------------------------------------
-
-    def _evaluate_task_with_timeout(self, task: Dict[str, Any], task_id: str) -> Dict[str, Any]:
-        """Run ``_evaluate_task`` with an end-to-end wall-clock timeout."""
-        if self.task_timeout <= 0:
-            return self._evaluate_task(task)
-
+    def _finalize_workspace_task(
+        self,
+        *,
+        task: Dict[str, Any],
+        workspace: Optional[Path],
+        agent: Optional[CodeAgent],
+        prompt_texts: Optional[List[str]] = None,
+        result: Optional[Dict[str, Any]] = None,
+        artifact_paths: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         try:
-            ctx = mp.get_context("fork")
-        except ValueError:
-            ctx = mp.get_context()
-
-        result_queue = ctx.Queue(maxsize=1)
-        progress_queue = ctx.Queue(maxsize=512)
-        process = ctx.Process(
-            target=_evaluate_task_in_subprocess,
-            args=(self, task, result_queue, progress_queue, task_id),
-            name=f"{self.benchmark_name}-{task_id}",
-            daemon=True,
-        )
-        process.start()
-
-        deadline = time.time() + self.task_timeout
-        timed_out = False
-        progress_updates: List[Dict[str, Any]] = []
-        while process.is_alive():
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                timed_out = True
-                break
-            try:
-                update = progress_queue.get(timeout=min(0.2, max(0.01, remaining)))
-            except queue.Empty:
-                update = None
-            except Exception:
-                update = None
-            if update is not None:
-                progress_updates.append(update)
-                self._handle_progress_update(update)
-
-        self._drain_progress_queue(progress_queue)
-
-        if timed_out and process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=5)
-            timeout_result = {
-                "task_id": task_id,
-                "passed": False,
-                "error": f"Timeout: problem solving exceeded {self.task_timeout}s",
-                "elapsed_s": float(self.task_timeout),
-                "timeout": True,
-            }
-            self._save_timeout_stub_trajectory(
+            self._save_task_trajectory(
                 task=task,
-                result=timeout_result,
-                progress_updates=progress_updates,
+                workspace=workspace,
+                agent=agent,
+                prompt_texts=prompt_texts,
+                result=result,
+                artifact_paths=artifact_paths,
+                extra=extra,
             )
-            return timeout_result
-
-        process.join(timeout=1)
-        try:
-            payload = result_queue.get_nowait()
         except Exception:
-            payload = None
+            pass
 
-        if not payload:
-            return {
-                "task_id": task_id,
-                "passed": False,
-                "error": "Runner process exited without returning a result",
-                "elapsed_s": 0.0,
-            }
+        if workspace is None:
+            return
+        try:
+            shutil.rmtree(workspace)
+        except Exception:
+            pass
 
-        if not payload.get("ok"):
-            raise RuntimeError(payload.get("traceback") or payload.get("error") or "Unknown runner error")
+    # ========== 5. Result Building ==========
 
-        return payload["result"]
-
-    # ------------------------------------------------------------------
-    # Resume support
-    # ------------------------------------------------------------------
+    def _build_result(
+        self,
+        task_id: str,
+        *,
+        passed: Optional[bool],
+        error: Optional[str],
+        agent_response: str = "",
+        start_time: Optional[float] = None,
+        elapsed_s: Optional[float] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if elapsed_s is None:
+            elapsed_s = 0.0 if start_time is None else round(time.time() - start_time, 2)
+        result: Dict[str, Any] = {
+            "task_id": task_id,
+            "passed": passed,
+            "error": error,
+            "agent_response": (agent_response or "")[:500],
+            "elapsed_s": round(float(elapsed_s), 2),
+        }
+        if extra:
+            result.update(extra)
+        return result
 
     _load_completed_ids = staticmethod(_load_completed_ids)
     _load_result_records = staticmethod(_load_result_records)
@@ -709,9 +779,7 @@ class BenchmarkRunner(ABC):
     _upsert_result_record = staticmethod(_upsert_result_record)
     _summarize_result_records = staticmethod(_summarize_result_records)
 
-    # ------------------------------------------------------------------
-    # Main run loop
-    # ------------------------------------------------------------------
+    # ========== 6. Main Run Loop ==========
 
     def run(
         self,
@@ -814,7 +882,7 @@ class BenchmarkRunner(ABC):
                 progress.begin_task(i + 1, task_id)
 
                 try:
-                    result = self._evaluate_task_with_timeout(task, task_id)
+                    result = self.evaluate(task, task_id=task_id)
                 except Exception as exc:
                     result = {
                         "task_id": task_id,
@@ -823,7 +891,14 @@ class BenchmarkRunner(ABC):
                         "elapsed_s": 0.0,
                     }
 
-                self._drain_progress_queue(self._progress_queue)
+                while self._progress_queue is not None:
+                    try:
+                        update = self._progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+                    self._handle_progress_update(update)
                 results.append(result)
                 if result.get("passed") is True:
                     passed_count += 1

@@ -9,13 +9,64 @@ output truncation/persistence.
 from __future__ import annotations
 
 import html as html_module
+import ipaddress
 import os
 import re
+import socket
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+
+
+class SSRFBlockedError(Exception):
+    """Raised when a URL resolves to a private/internal address (see 严重-3)."""
+
+
+def _resolve_host_ips(host: str) -> List[str]:
+    """Resolve a hostname to all its IP addresses (best effort)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+    return [info[4][0] for info in infos if info and info[4]]
+
+
+def _ip_is_blocked(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _host_is_blocked(host: str, *, allow_private: bool = False) -> bool:
+    """Return True when *host* resolves to a private/internal/metadata address."""
+    if allow_private:
+        return False
+    host = (host or "").strip().strip("[]")
+    if not host:
+        return True
+    # A literal IP can be checked directly (covers 169.254.169.254 metadata, etc.)
+    try:
+        return _ip_is_blocked(host)
+    except ValueError:
+        pass
+    ips = _resolve_host_ips(host)
+    if not ips:
+        # DNS failure: let the request layer surface a normal network error.
+        return False
+    # Block if ANY resolved address is internal (defends against split-horizon
+    # and partial DNS-rebinding tricks).
+    return any(_ip_is_blocked(ip) for ip in ips)
 
 from ...context.truncator import ObservationTruncator
 from ..base import Tool, ToolParameter
@@ -1259,6 +1310,7 @@ class WebFetchTool(_WebToolBase):
     DEFAULT_TIMEOUT_SECONDS = 20
     MAX_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+    MAX_REDIRECTS = 5
     DEFAULT_FORMAT = "text"
     DEFAULT_EXTRACT_MODE = "auto"
     ALLOWED_FORMATS = {"text", "html"}
@@ -1292,6 +1344,7 @@ class WebFetchTool(_WebToolBase):
         output_max_bytes: int = OUTPUT_MAX_BYTES,
         truncate_direction: str = "head_tail",
         session_factory: Optional[Callable[[], Any]] = None,
+        config: Any = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -1310,6 +1363,11 @@ class WebFetchTool(_WebToolBase):
         )
         self._session_factory = session_factory
         self._session: Any = None
+        # 建议-6: prefer Config field; env-var fallback (SSRF policy).
+        if config is not None and hasattr(config, "web_fetch_allow_private"):
+            self.allow_private = bool(getattr(config, "web_fetch_allow_private"))
+        else:
+            self.allow_private = _env_enabled("WEBFETCH_ALLOW_PRIVATE", False)
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -1418,15 +1476,20 @@ class WebFetchTool(_WebToolBase):
         try:
             try:
                 session = self._get_session(requests)
-                response = session.get(
+                response = self._guarded_get(
+                    session,
+                    requests,
                     url,
                     headers=self._build_headers(format_name or self.DEFAULT_FORMAT),
                     timeout=timeout_seconds,
-                    allow_redirects=True,
-                    stream=True,
                 )
                 response.raise_for_status()
                 raw_bytes = self._read_response_bytes(response)
+            except SSRFBlockedError as exc:
+                return ToolResponse.error(
+                    code=ToolErrorCode.ACCESS_DENIED,
+                    message=f"Blocked by SSRF policy: {exc}",
+                )
             except requests.exceptions.Timeout as exc:  # type: ignore[attr-defined]
                 return ToolResponse.error(code=ToolErrorCode.TIMEOUT, message=f"Request timed out: {exc}")
             except requests.exceptions.HTTPError as exc:  # type: ignore[attr-defined]
@@ -1551,6 +1614,50 @@ class WebFetchTool(_WebToolBase):
                     response.close()
                 except Exception:
                     pass
+
+    def _guarded_get(
+        self,
+        session: Any,
+        requests_module: Any,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        timeout: int,
+    ) -> Any:
+        """HTTP GET that validates every hop against the SSRF policy.
+
+        Redirects are followed manually with ``allow_redirects=False`` so each
+        intermediate target (including 30x ``Location`` hops) is re-checked,
+        defeating public-URL -> internal-address redirect bypasses.
+        """
+        redirect_codes = {301, 302, 303, 307, 308}
+        current = url
+        for _ in range(self.MAX_REDIRECTS + 1):
+            parsed = urlparse(current)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise SSRFBlockedError(f"refusing non-http(s) target {current!r}")
+            host = parsed.hostname or ""
+            if _host_is_blocked(host, allow_private=self.allow_private):
+                raise SSRFBlockedError(
+                    f"target {host!r} resolves to a private/internal/metadata address"
+                )
+            response = session.get(
+                current,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+            )
+            location = response.headers.get("Location") if response.status_code in redirect_codes else None
+            if location:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                current = urljoin(current, location)
+                continue
+            return response
+        raise SSRFBlockedError(f"exceeded {self.MAX_REDIRECTS} redirects")
 
     def _get_session(self, requests_module: Any) -> Any:
         if self._session is None:

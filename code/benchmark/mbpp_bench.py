@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -19,7 +18,6 @@ try:
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
         build_minimal_child_env,
-        truncate_feedback,
     )
 except ImportError:
     from base import (
@@ -27,18 +25,16 @@ except ImportError:
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
         build_minimal_child_env,
-        truncate_feedback,
     )
 
 _MBPP_ADDENDUM = """\
 You are implementing MBPP+ Python programming tasks.
 
 Workflow:
-1. Read the task description carefully and identify the required function behavior.
-2. Read `solution.py`, then implement the function there. Prefer `Edit` for focused changes and `Write` only if a full rewrite is simpler.
-3. Use only your own lightweight checks if you want to validate ideas locally.
-4. When ready for a controlled submission, call `Finish` alone with a short summary of the implementation.
-5. The benchmark runner will execute the benchmark tests outside the workspace and return bounded feedback if another revision is needed.
+1. Read the task description and infer required behavior + edge cases.
+2. Implement the target function in `solution.py` (prefer `Edit` for local changes).
+3. Use only lightweight self-checks.
+4. Submit with `Finish`; the runner evaluates externally and returns bounded feedback.
 
 Rules:
 - Benchmark test files are not available in the workspace.
@@ -183,7 +179,7 @@ class MBPPPlusBenchmark(BenchmarkRunner):
     def _load_tasks(self) -> List[Dict[str, Any]]:
         return self._load_jsonl_tasks()
 
-    def _evaluate_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_id = task["task_id"]
         prompt_text = task["prompt"]
         entry_point = task["entry_point"]
@@ -203,36 +199,20 @@ class MBPPPlusBenchmark(BenchmarkRunner):
 
             agent = self._create_agent(workspace)
             initial_prompt = (
-                f"Your task is to implement the Python function `{entry_point}` "
-                f"in `solution.py`.\n\n"
-                f"**Task description:**\n{prompt_text}\n\n"
-                f"Submission policy:\n"
-                f"- This benchmark uses controlled submissions.\n"
+                f"Implement Python function `{entry_point}` in `solution.py`.\n\n"
+                f"Task description:\n{prompt_text}\n\n"
+                f"Constraints:\n"
+                f"- Controlled submissions only: call `Finish` alone when ready for evaluation.\n"
                 f"- Benchmark test files are not present in the workspace.\n"
                 f"- Do not run your own benchmark test loop.\n"
-                f"- After each completed submission, typically when you call `Finish`, the runner will execute benchmark tests and send bounded feedback if needed.\n\n"
-                f"Follow these steps:\n"
-                f"1. Carefully analyze the task description and identify edge cases.\n"
-                f"2. Read `solution.py`, then implement the function there. Prefer `Edit` for focused changes and `Write` only if a full rewrite is simpler.\n"
-                f"3. You may run lightweight self-checks of your own design, but do not rely on benchmark tests.\n"
-                f"4. When ready for a controlled submission, call `Finish` alone with a brief summary of what you implemented.\n\n"
-                f"Important:\n"
-                f"- The function must satisfy the task requirements and examples.\n"
-                f"- Include any necessary imports at the top of the file.\n"
-                f"- Handle edge cases gracefully (empty inputs, special values).\n"
-                f"- Prefer simple, readable implementations over clever one-liners.\n"
-                f"- Only `solution.py` exists in the workspace.\n"
+                f"- Keep the required signature intact.\n"
+                f"- Handle edge cases and include required imports.\n"
+                f"- Keep the implementation simple and readable.\n"
             )
 
             start = time.time()
-            feedback = None
-            passed = False
-            output = ""
-            rounds_used = 0
-
-            for round_idx in range(1, self.max_submission_rounds + 1):
-                rounds_used = round_idx
-                prompt = initial_prompt if round_idx == 1 else (
+            def _retry_prompt(round_idx: int, feedback: str) -> str:
+                return (
                     f"Controlled evaluation feedback for submission round {round_idx - 1}:\n\n"
                     f"{feedback}\n\n"
                     f"Revise `solution.py` based on this feedback.\n"
@@ -241,52 +221,56 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                     f"- Use the feedback above plus the task description, not hidden benchmark files.\n"
                     f"When ready for the next controlled submission, call `Finish` alone with a brief summary of the revision."
                 )
-                prompt_history.append(prompt)
 
-                agent_response, error_result = self._run_agent_prompt(
-                    agent=agent,
-                    task_id=task_id,
-                    prompt_text=prompt,
-                    start_time=start,
-                    error_extra={"submission_rounds": round_idx},
-                )
-                if error_result is not None:
-                    result = error_result
-                    return result
-
+            def _evaluate_submission(round_idx: int, latest_response: str) -> Dict[str, Any]:
                 if not solution_file.exists():
-                    result = self._missing_output_result(
-                        task_id,
-                        path_label="solution.py",
-                        start_time=start,
-                        agent_response=agent_response,
-                        extra={"submission_rounds": round_idx},
-                    )
-                    return result
-
+                    return {
+                        "result": self._build_result(
+                            task_id,
+                            passed=False,
+                            error="solution.py not found after agent run",
+                            start_time=start,
+                            agent_response=latest_response,
+                            extra={"submission_rounds": round_idx},
+                        )
+                    }
                 passed, output = _evaluate_solution(
                     workspace=workspace,
                     solution_file=solution_file,
                     assertion_code=assertion_code,
                     timeout=self.timeout,
                 )
-                if passed:
-                    break
-                feedback = truncate_feedback(output, max_lines=80, max_chars=12000)
+                return {"passed": passed, "output": output}
+
+            loop = self._run_controlled_submission_rounds(
+                task_id=task_id,
+                agent=agent,
+                start_time=start,
+                initial_prompt=initial_prompt,
+                max_rounds=self.max_submission_rounds,
+                prompt_history=prompt_history,
+                evaluate_submission=_evaluate_submission,
+                retry_prompt_builder=_retry_prompt,
+                error_extra_builder=lambda round_idx: {"submission_rounds": round_idx},
+            )
+            agent_response = loop["agent_response"]
+            if loop["early_result"] is not None:
+                result = loop["early_result"]
+                return result
 
             elapsed = round(time.time() - start, 2)
 
             result = self._build_result(
                 task_id,
-                passed=passed,
-                error=output if not passed else None,
+                passed=bool(loop["passed"]),
+                error=loop["output"] if not loop["passed"] else None,
                 agent_response=agent_response,
                 elapsed_s=elapsed,
-                extra={"submission_rounds": rounds_used},
+                extra={"submission_rounds": int(loop["rounds_used"])},
             )
             return result
         finally:
-            self._save_task_trajectory(
+            self._finalize_workspace_task(
                 task=task,
                 workspace=workspace,
                 agent=agent,
@@ -295,7 +279,6 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 artifact_paths=["solution.py"],
                 extra={"entry_point": entry_point},
             )
-            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main():
@@ -311,19 +294,17 @@ def main():
         parser,
         default_temperature=1.0,
         default_max_steps=64,
-        default_timeout=60,
+        default_timeout=120,
+        include_task_timeout=True,
+        default_task_timeout=600,
     )
     parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = MBPPPlusBenchmark(
         data_path=args.data_path,
-        output_dir=args.output_dir,
-        temperature=args.temperature,
-        max_steps=args.max_steps,
         max_submission_rounds=args.max_submission_rounds,
-        timeout=args.timeout,
-        trajectory_dir=args.trajectory_dir,
+        **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
     bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
 

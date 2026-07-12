@@ -10,6 +10,8 @@ from ..core.config import Config
 from ..core.message import Message
 from ..core.streaming import StreamEvent, StreamEventType
 from ..core.lifecycle import LifecycleHook
+from ..core.logging import agent_print
+from ._tool_loop import run_tool_calling_loop
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -24,7 +26,7 @@ class Memory:
     def add_record(self, record_type: str, content: str):
         """Add a new record to memory"""
         self.records.append({"type": record_type, "content": content})
-        print(f"📝 Memory updated, added a new '{record_type}' record.")
+        agent_print(f"📝 Memory updated, added a new '{record_type}' record.")
 
     def get_trajectory(self) -> str:
         """Format all memory records into a coherent string text"""
@@ -116,38 +118,38 @@ Please always maintain critical thinking and strive for higher quality output.""
         Returns:
             The final optimized result
         """
-        print(f"\n🤖 {self.name} started processing task: {input_text}")
+        agent_print(f"\n🤖 {self.name} started processing task: {input_text}")
 
         # Reset memory
         self.memory = Memory()
 
         # 1. Initial execution
-        print("\n--- Making initial attempt ---")
+        agent_print("\n--- Making initial attempt ---")
         initial_result = self._execute_task(input_text, **kwargs)
         self.memory.add_record("execution", initial_result)
 
         # 2. Iteration loop: reflection and optimization
         for i in range(self.max_iterations):
-            print(f"\n--- Iteration {i+1}/{self.max_iterations} ---")
+            agent_print(f"\n--- Iteration {i+1}/{self.max_iterations} ---")
 
             # a. Reflection
-            print("\n-> Reflecting...")
+            agent_print("\n-> Reflecting...")
             last_result = self.memory.get_last_execution()
             feedback = self._reflect_on_result(input_text, last_result, **kwargs)
             self.memory.add_record("reflection", feedback)
 
             # b. Check if stopping is needed
             if "no need for improvement" in feedback.lower():
-                print("\n✅ Reflection indicates no need for improvement, task completed.")
+                agent_print("\n✅ Reflection indicates no need for improvement, task completed.")
                 break
 
             # c. Optimization
-            print("\n-> Optimizing...")
+            agent_print("\n-> Optimizing...")
             refined_result = self._refine_result(input_text, last_result, feedback, **kwargs)
             self.memory.add_record("execution", refined_result)
 
         final_result = self.memory.get_last_execution()
-        print(f"\n--- Task Completed ---\nFinal Result:\n{final_result}")
+        agent_print(f"\n--- Task Completed ---\nFinal Result:\n{final_result}")
 
         # Save to history
         self.add_message(Message(input_text, "user"))
@@ -215,81 +217,15 @@ Please provide an improved answer."""}
             llm_response = self.llm.invoke(messages, **kwargs)
             return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
 
-        # Enable tool calling mode
-        tool_schemas = self._build_tool_schemas()
-        current_iteration = 0
-
-        while current_iteration < self.max_tool_iterations:
-            current_iteration += 1
-
-            try:
-                response = self.llm.invoke_with_tools(
-                    messages=messages,
-                    tools=tool_schemas,
-                    tool_choice="auto",
-                    **kwargs
-                )
-            except Exception as e:
-                print(f"❌ LLM call failed: {e}")
-                break
-
-            response_message = response.choices[0].message
-
-            # Process tool calls
-            tool_calls = response_message.tool_calls
-            if not tool_calls:
-                # No tool calls, return text response
-                return response_message.content or ""
-
-            # Add assistant message to history
-            messages.append({
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in tool_calls
-                ]
-            })
-
-            # Execute all tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                tool_call_id = tool_call.id
-
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    print(f"❌ Tool argument parsing failed: {e}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": f"Error: Incorrect argument format - {str(e)}"
-                    })
-                    continue
-
-                # Execute tool (reuse base class method)
-                result = self._execute_tool_call(tool_name, arguments)
-
-                # Add tool result to messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result
-                })
-
-        # If max iterations exceeded, get the last answer
-        if current_iteration >= self.max_tool_iterations:
-            llm_response = self.llm.invoke(messages, **kwargs)
-            return llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
-
-        return ""
+        # 重要-9: shared function-calling loop (dedup with Simple/PlanSolve).
+        return run_tool_calling_loop(
+            llm=self.llm,
+            tool_schemas=self._build_tool_schemas(),
+            messages=messages,
+            execute_tool=self._execute_tool_call,
+            max_iterations=self.max_tool_iterations,
+            **kwargs,
+        )
 
     async def arun_stream(
         self,

@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-/home/kemove/CodeingAgent/data}"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a
@@ -22,6 +23,7 @@ export PYTHONNOUSERSITE=1
 
 echo "=== Terminal Bench 2.0 Benchmark ==="
 echo "Project root: $PROJECT_ROOT"
+echo "Data root: $BENCH_DATA_ROOT"
 echo "Python user site: disabled (PYTHONNOUSERSITE=1)"
 echo ""
 
@@ -38,7 +40,7 @@ from hello_agents.benchmark.term_bench import main
 sys.argv = ['term_bench'] + sys.argv[1:]
 main()
 " \
-    --data-path "$PROJECT_ROOT/data/TERM/test.jsonl" \
+    --data-path "$BENCH_DATA_ROOT/TERM/test.jsonl" \
     --output-dir "$PROJECT_ROOT/data/_results" \
     --trajectory-dir "$PROJECT_ROOT/data/_trajectory" \
     "$@"

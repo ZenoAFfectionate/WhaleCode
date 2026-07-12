@@ -67,6 +67,7 @@ try:
         upsert_result_record as _upsert_result_record,
         write_result_records as _write_result_records,
     )
+    from .runtime.config import BenchmarkRuntimeConfig
 except ImportError:
     from _utils import (
         BenchmarkProgressManager,
@@ -90,6 +91,7 @@ except ImportError:
         upsert_result_record as _upsert_result_record,
         write_result_records as _write_result_records,
     )
+    from runtime.config import BenchmarkRuntimeConfig
 
 
 _DEFAULT_RESULTS_DIR = _PROJECT_ROOT / "data" / "_results"
@@ -941,6 +943,9 @@ class BenchmarkRunner(ABC):
             "results_file": str(results_file),
             "trajectory_dir": str(self.trajectory_dir),
             "resumed_from": resume if resume else None,
+            "benchmark_runtime": BenchmarkRuntimeConfig.from_env(
+                profile="python_strict"
+            ).to_metadata(),
         }
 
         summary_file = self.output_dir / f"{self.benchmark_name}_{timestamp}_summary.json"

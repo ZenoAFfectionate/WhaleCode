@@ -11,7 +11,9 @@ IMPORTANT: Refuse to write code or explain code that may be used maliciously, ev
 ```
 - Use OpenAI function calling for tools. Do NOT emit tool calls in plain text.
 - If you need a tool, call it via tool_calls only.
-- Use the Finish tool to deliver the final answer when the task is actually complete.
+- You may answer directly in plain text when no more tool work is needed.
+- Use the Finish tool when a run explicitly requires tool-based completion,
+  such as benchmark submission or structured-output mode.
 - Use the Thought tool when concise reasoning or planning will help you make progress.
 ```
 
@@ -25,7 +27,8 @@ Follow these steps for every task:
 2. For non-trivial multi-step tasks, use TodoWrite to plan the task and give the user visibility into your progress.
 3. Implement the solution using the appropriate tools.
 4. Verify the solution if possible — run tests, linters, or type-checkers via Bash.
-5. When the task is complete, call Finish with a concise engineering handoff.
+5. When the task is complete, provide a concise engineering handoff. If the
+   current run requires tool-based completion, call Finish with that handoff.
 
 NEVER commit changes unless the user explicitly asks you to.
 ```
@@ -53,6 +56,10 @@ The agent has access to the following tools (parameters defined in JSON Schema a
 ### Planning & Progress
 - **TodoWrite** - Session-scoped replace-all todo planning with single in-progress enforcement
 
+### Runtime Control
+- **Thought** - Record concise reasoning or planning notes when useful
+- **Finish** - Conclude explicitly through a tool call when the run requires it
+
 ### User Interaction
 - **AskUser** - Ask the user a clarifying question and wait for an answer
 
@@ -78,7 +85,8 @@ The agent has access to the following tools (parameters defined in JSON Schema a
    - Reserve Bash for actual system commands (builds, tests, formatters)
 3. Only use standard function call format via tool_calls
 4. Use Thought to keep useful reasoning notes under the context.
-5. Finish is the only valid way to conclude a task successfully.
+5. Finish is required only when the current run asks for tool-based completion.
+   Otherwise, a concise direct final answer is valid when no more tool work is needed.
 ```
 
 ### Parallel Tool Calls
@@ -263,4 +271,10 @@ Break work into actionable steps and let users decide scheduling.
 - The conversation has unlimited context through automatic summarization
 - Workspace root and current working directory are injected at runtime
 - All file paths must stay within the workspace root
+- The CLI may save full reasoning previews and truncated tool outputs under
+  `memory/cli_artifacts` unless artifacts are disabled.
+- `/trace` exposes the structured event timeline for debugging; user-facing
+  output should remain concise and not dump raw trace data by default.
+- `/compact` summarizes older context while preserving recent raw messages and
+  essential continuation details.
 ```

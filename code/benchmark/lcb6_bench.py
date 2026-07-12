@@ -10,8 +10,6 @@ import io
 import json
 import pickle
 import re
-import subprocess
-import sys
 import time
 import zlib
 from pathlib import Path
@@ -24,16 +22,22 @@ try:
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
         truncate_feedback,
+    )
+    from .runtime.python_adapters import (
+        PythonFunctionalAdapter,
+        PythonStdinAdapter,
     )
 except ImportError:
     from base import (
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
         truncate_feedback,
+    )
+    from runtime.python_adapters import (
+        PythonFunctionalAdapter,
+        PythonStdinAdapter,
     )
 
 
@@ -509,106 +513,16 @@ def _evaluate_stdin_solution(
     cases: List[Dict[str, Any]],
     public_count: int,
 ) -> Dict[str, Any]:
-    failed = 0
-    private_failed = 0
-    timed_out = False
-    public_passed = 0
-    private_passed = 0
-    lines: List[str] = []
-
-    for idx, case in enumerate(cases, start=1):
-        visibility = "public" if idx <= public_count else "private"
-        stdin_text = str(case.get("input", ""))
-        if stdin_text and not stdin_text.endswith("\n"):
-            stdin_text += "\n"
-        expected = str(case.get("output", "")).strip()
-
-        try:
-            wrapped_solution = solution_file.parent / "._lcb6_wrapped_stdio.py"
-            wrapped_solution.write_text(
-                _merge_official_imports(solution_file.read_text(encoding="utf-8")),
-                encoding="utf-8",
-            )
-            proc = subprocess.run(
-                [sys.executable, str(wrapped_solution)],
-                input=stdin_text,
-                text=True,
-                capture_output=True,
-                timeout=10,
-                cwd=str(solution_file.parent),
-                env=build_minimal_child_env(),
-            )
-        except subprocess.TimeoutExpired:
-            failed += 1
-            timed_out = True
-            if visibility == "public":
-                lines.append(f"[TIMEOUT] public case {idx}")
-                lines.append(_format_public_context("stdin", case))
-            else:
-                private_failed += 1
-            continue
-        finally:
-            try:
-                wrapped_solution.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        if proc.returncode != 0:
-            failed += 1
-            if visibility == "public":
-                lines.append(f"[ERROR] public case {idx}")
-                lines.append(_format_public_context("stdin", case))
-                stderr_text = proc.stderr.strip()
-                if stderr_text:
-                    lines.append(stderr_text)
-            else:
-                private_failed += 1
-                lines.append(f"[ERROR] private case {idx}")
-            continue
-
-        actual = proc.stdout.strip()
-        if not _stdio_outputs_match(actual, expected):
-            failed += 1
-            if visibility == "public":
-                lines.append(f"[FAIL] public case {idx}")
-                lines.append(_format_public_context("stdin", case))
-                lines.append(f"  actual:   {actual!r}")
-                lines.append(f"  expected: {expected!r}")
-            else:
-                private_failed += 1
-                lines.append(f"[FAIL] private case {idx}")
-            continue
-
-        if visibility == "public":
-            public_passed += 1
-        else:
-            private_passed += 1
-
-    total = len(cases)
-    if timed_out:
-        lines.append(
-            "Timeout hint: prioritize algorithmic complexity reduction over local patching; "
-            "re-check constraints and replace asymptotically mismatched approaches instead of micro-optimizing loops."
-        )
-    if public_count == 0:
-        lines.append("No public tests were provided for this task.")
-    lines.append(f"{total - failed}/{total} total cases passed")
-    if public_count:
-        lines.append(f"{public_passed}/{public_count} public cases passed")
-    private_count = max(total - public_count, 0)
-    if private_count:
-        lines.append(f"{private_passed}/{private_count} private cases passed")
-        if private_failed:
-            lines.append("Private-case failures detected (details withheld).")
-    if failed == 0:
-        lines.append("All benchmark cases passed!")
-
-    return {
-        "passed": failed == 0,
-        "output": "\n".join(lines),
-        "public_passed": public_passed,
-        "private_passed": private_passed,
-    }
+    return PythonStdinAdapter(
+        source_wrapper=_merge_official_imports,
+        output_matcher=_stdio_outputs_match,
+        public_context_formatter=_format_public_context,
+        timeout=10,
+    ).evaluate(
+        solution_file=solution_file,
+        cases=cases,
+        public_count=public_count,
+    )
 
 
 def _evaluate_functional_solution(
@@ -618,101 +532,18 @@ def _evaluate_functional_solution(
     starter_code: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    failed = 0
-    private_failed = 0
-    timed_out = False
-    public_passed = 0
-    private_passed = 0
-    lines: List[str] = []
     call_spec = json.dumps(_resolve_call_spec(starter_code, metadata or {}), ensure_ascii=False)
-
-    for idx, case in enumerate(cases, start=1):
-        visibility = "public" if idx <= public_count else "private"
-        expr = str(case.get("input", ""))
-        expected = _parse_scalar_repr(str(case.get("output", "")))
-
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", _FUNCTIONAL_EVAL_HELPER, call_spec],
-                input=expr,
-                text=True,
-                capture_output=True,
-                timeout=10,
-                cwd=str(solution_file.parent),
-                env=build_minimal_child_env(),
-            )
-        except subprocess.TimeoutExpired:
-            failed += 1
-            timed_out = True
-            if visibility == "public":
-                lines.append(f"[TIMEOUT] public case {idx}")
-                lines.append(_format_public_context("functional", case))
-            else:
-                private_failed += 1
-            continue
-
-        helper_stdout = proc.stdout.strip()
-        try:
-            helper_result = json.loads(helper_stdout) if helper_stdout else {}
-        except json.JSONDecodeError:
-            helper_result = {}
-
-        if proc.returncode != 0 or helper_result.get("status") != "ok":
-            failed += 1
-            if visibility == "public":
-                lines.append(f"[ERROR] public case {idx}")
-                lines.append(_format_public_context("functional", case))
-                err_type = helper_result.get("type") or "RuntimeError"
-                err_message = helper_result.get("message") or proc.stderr.strip() or "helper execution failed"
-                lines.append(f"  {err_type}: {err_message}")
-            else:
-                private_failed += 1
-                lines.append(f"[ERROR] private case {idx}")
-            continue
-
-        actual = _parse_scalar_repr(str(helper_result.get("value_repr", "")))
-        if actual != expected:
-            failed += 1
-            if visibility == "public":
-                lines.append(f"[FAIL] public case {idx}")
-                lines.append(_format_public_context("functional", case))
-                lines.append(f"  actual:   {actual!r}")
-                lines.append(f"  expected: {expected!r}")
-            else:
-                private_failed += 1
-                lines.append(f"[FAIL] private case {idx}")
-            continue
-
-        if visibility == "public":
-            public_passed += 1
-        else:
-            private_passed += 1
-
-    total = len(cases)
-    if timed_out:
-        lines.append(
-            "Timeout hint: prioritize algorithmic complexity reduction over local patching; "
-            "re-check constraints and replace asymptotically mismatched approaches instead of micro-optimizing loops."
-        )
-    if public_count == 0:
-        lines.append("No public tests were provided for this task.")
-    lines.append(f"{total - failed}/{total} total cases passed")
-    if public_count:
-        lines.append(f"{public_passed}/{public_count} public cases passed")
-    private_count = max(total - public_count, 0)
-    if private_count:
-        lines.append(f"{private_passed}/{private_count} private cases passed")
-        if private_failed:
-            lines.append("Private-case failures detected (details withheld).")
-    if failed == 0:
-        lines.append("All benchmark cases passed!")
-
-    return {
-        "passed": failed == 0,
-        "output": "\n".join(lines),
-        "public_passed": public_passed,
-        "private_passed": private_passed,
-    }
+    return PythonFunctionalAdapter(
+        helper_code=_FUNCTIONAL_EVAL_HELPER,
+        call_spec=call_spec,
+        expected_parser=_parse_scalar_repr,
+        public_context_formatter=_format_public_context,
+        timeout=10,
+    ).evaluate(
+        solution_file=solution_file,
+        cases=cases,
+        public_count=public_count,
+    )
 
 
 class LCB6Benchmark(BenchmarkRunner):

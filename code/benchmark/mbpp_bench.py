@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,15 +15,15 @@ try:
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
     )
+    from .runtime.python_adapters import PythonAssertionAdapter
 except ImportError:
     from base import (
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
     )
+    from runtime.python_adapters import PythonAssertionAdapter
 
 _MBPP_ADDENDUM = """\
 You are implementing MBPP+ Python programming tasks.
@@ -126,34 +124,12 @@ def _evaluate_solution(
     assertion_code: str,
     timeout: int,
 ) -> tuple[bool, str]:
-    if not solution_file.exists():
-        return False, "solution.py not found"
-
-    verify_script = workspace / "._mbpp_verify.py"
-    verify_script.write_text(_build_verify_script(assertion_code), encoding="utf-8")
-    try:
-        result = subprocess.run(
-            [sys.executable, str(verify_script)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(workspace),
-            env=build_minimal_child_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"TIMEOUT: benchmark evaluation exceeded {timeout}s."
-    except Exception as exc:
-        return False, f"ERROR: benchmark evaluation failed: {exc}"
-    finally:
-        try:
-            verify_script.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode == 0:
-        return True, output or "All tests passed!"
-    return False, output or "Benchmark evaluation failed."
+    return PythonAssertionAdapter(_build_verify_script).evaluate(
+        workspace=workspace,
+        solution_file=solution_file,
+        assertion_code=assertion_code,
+        timeout=timeout,
+    )
 
 
 class MBPPPlusBenchmark(BenchmarkRunner):

@@ -1,0 +1,50 @@
+{
+  "session_id": "s-20260712-162324-71ff7280",
+  "created_at": "2026-07-12T16:23:24.368143",
+  "saved_at": "2026-07-12T16:23:32.057608",
+  "agent_config": {
+    "name": "web-code-agent",
+    "agent_type": "WebCodeAgent",
+    "llm_provider": "unknown",
+    "llm_model": "Qwen/Qwen3.6-27B-FP8",
+    "max_steps": 100
+  },
+  "history": [
+    {
+      "role": "user",
+      "content": "请只回复一句：WhaleCode Web OK。不要调用任何工具。",
+      "timestamp": "2026-07-12T16:23:24.371347",
+      "metadata": {}
+    },
+    {
+      "role": "assistant",
+      "content": "WhaleCode Web OK。",
+      "timestamp": "2026-07-12T16:23:32.051512",
+      "metadata": {
+        "reasoning_content": "The user wants me to just reply with a single sentence: \"WhaleCode Web OK.\" and not call any tools.",
+        "reasoning_source": "message.reasoning"
+      }
+    }
+  ],
+  "tool_schema_hash": "de8e88ecd5b55d58",
+  "read_cache": {},
+  "metadata": {
+    "session_id": "s-20260712-162324-71ff7280",
+    "created_at": "2026-07-12T16:23:24.368143",
+    "total_tokens": 6266,
+    "total_steps": 1,
+    "duration_seconds": 7.688674
+  },
+  "todo_state": {
+    "session_id": "s-20260712-162324-71ff7280",
+    "updated_at": null,
+    "todos": [],
+    "stats": {
+      "cancelled": 0,
+      "completed": 0,
+      "in_progress": 0,
+      "pending": 0,
+      "total": 0
+    }
+  }
+}

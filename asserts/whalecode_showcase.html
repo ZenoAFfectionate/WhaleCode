@@ -1,34 +1,43 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Whale Code | Product Showcase</title>
+  <title>WhaleCode | Agent Console</title>
   <meta
     name="description"
-    content="Whale Code is a production-grade coding agent framework built with a ReAct loop, atomized tools, context engineering, and persistent task orchestration."
+    content="WhaleCode 智能体 Web 控制台，支持对话式代码任务、运行详情、vLLM 模型管理与数据集测试。"
   />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
-    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap"
     rel="stylesheet"
   />
   <style>
     :root {
-      --primary: #2563eb;
-      --secondary: #1e293b;
-      --cta: #f97316;
-      --background: #f8fafc;
-      --surface: #ffffff;
-      --text: #1e293b;
-      --text-muted: #475569;
-      --border: #e2e8f0;
-      --success: #16a34a;
-      --shadow-soft: 0 12px 28px rgba(30, 41, 59, 0.08);
-      --radius-lg: 20px;
-      --radius-md: 14px;
-      --maxw: 1200px;
+      --bg: #070b14;
+      --bg-soft: #0b1220;
+      --panel: rgba(15, 23, 42, 0.78);
+      --panel-strong: #111827;
+      --panel-muted: #0f172a;
+      --line: #243047;
+      --line-soft: rgba(148, 163, 184, 0.16);
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --muted-2: #64748b;
+      --blue: #3b82f6;
+      --blue-strong: #2563eb;
+      --cyan: #22d3ee;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #a78bfa;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+      --radius: 18px;
+      --radius-sm: 12px;
+      --sidebar: 284px;
+      --topbar: 72px;
     }
 
     * {
@@ -38,874 +47,1515 @@
     html,
     body {
       margin: 0;
-      padding: 0;
-      background: var(--background);
+      min-height: 100%;
+      background:
+        linear-gradient(135deg, rgba(37, 99, 235, 0.14), transparent 36%),
+        radial-gradient(circle at 88% 6%, rgba(34, 211, 238, 0.12), transparent 24%),
+        linear-gradient(180deg, #050812 0%, #08111f 54%, #070b14 100%);
       color: var(--text);
-      font-family: "DM Sans", sans-serif;
-      scroll-behavior: smooth;
+      font-family: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-x: hidden;
     }
 
-    body::before,
-    body::after {
-      content: "";
-      position: fixed;
-      inset: auto;
-      z-index: -2;
-      pointer-events: none;
-      filter: blur(40px);
-      opacity: 0.26;
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
     }
 
-    body::before {
-      width: 460px;
-      height: 460px;
-      top: -140px;
-      right: -120px;
-      background: radial-gradient(circle, #93c5fd 0%, transparent 66%);
+    button {
+      cursor: pointer;
     }
 
-    body::after {
-      width: 520px;
-      height: 520px;
-      bottom: -190px;
-      left: -180px;
-      background: radial-gradient(circle, #fdba74 0%, transparent 64%);
+    .app-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: var(--sidebar) minmax(0, 1fr);
     }
 
-    .container {
-      width: min(var(--maxw), calc(100% - 2.6rem));
-      margin: 0 auto;
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      padding: 18px;
+      border-right: 1px solid var(--line-soft);
+      background: rgba(5, 10, 20, 0.88);
+      backdrop-filter: blur(16px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 38px;
+    }
+
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: linear-gradient(135deg, var(--blue), var(--cyan));
+      box-shadow: 0 16px 36px rgba(37, 99, 235, 0.35);
+      font-family: "Space Grotesk", sans-serif;
+      font-weight: 700;
+    }
+
+    .brand-title {
+      display: grid;
+      gap: 2px;
+    }
+
+    .brand-title strong {
+      font-family: "Space Grotesk", sans-serif;
+      letter-spacing: 0.01em;
+    }
+
+    .brand-title span {
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .nav {
+      display: grid;
+      gap: 8px;
+    }
+
+    .nav-button,
+    .ghost-button,
+    .primary-button,
+    .icon-button {
+      border: 0;
+      color: var(--text);
+      transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, opacity 0.18s ease;
+    }
+
+    .nav-button {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 12px;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+    }
+
+    .nav-button svg {
+      flex: 0 0 auto;
+    }
+
+    .nav-button.active,
+    .nav-button:hover {
+      color: var(--text);
+      border-color: rgba(59, 130, 246, 0.28);
+      background: rgba(59, 130, 246, 0.12);
+    }
+
+    .session-panel {
+      min-height: 0;
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      gap: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line-soft);
+    }
+
+    .section-kicker {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted-2);
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 8px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .session-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.48);
+    }
+
+    .session-item.active {
+      border-color: rgba(34, 211, 238, 0.34);
+      background: rgba(34, 211, 238, 0.08);
+    }
+
+    .session-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.9rem;
+    }
+
+    .session-meta {
+      margin-top: 3px;
+      color: var(--muted-2);
+      font-size: 0.74rem;
+    }
+
+    .icon-button {
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      background: rgba(148, 163, 184, 0.08);
+      color: var(--muted);
+    }
+
+    .icon-button:hover {
+      background: rgba(239, 68, 68, 0.14);
+      color: #fecaca;
+    }
+
+    .sidebar-footer {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      background: linear-gradient(180deg, rgba(59, 130, 246, 0.10), rgba(15, 23, 42, 0.42));
+    }
+
+    .mini-metric {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .mini-metric strong {
+      color: var(--text);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.82rem;
+    }
+
+    .main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: var(--topbar) minmax(0, 1fr);
     }
 
     .topbar {
       position: sticky;
-      top: 14px;
-      z-index: 10;
-      margin: 18px auto 28px;
-      width: min(var(--maxw), calc(100% - 2.6rem));
-      background: rgba(255, 255, 255, 0.86);
-      backdrop-filter: blur(10px);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 10px 16px;
+      top: 0;
+      z-index: 5;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      box-shadow: var(--shadow-soft);
+      gap: 18px;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--line-soft);
+      background: rgba(7, 11, 20, 0.78);
+      backdrop-filter: blur(18px);
     }
 
-    .brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 0.95rem;
-      font-weight: 700;
-      letter-spacing: 0.02em;
+    .topbar-title {
+      min-width: 0;
     }
 
-    .brand-mark {
-      width: 28px;
-      height: 28px;
-      border-radius: 8px;
-      background: linear-gradient(135deg, var(--primary), #60a5fa);
-      display: grid;
-      place-items: center;
-      color: #fff;
-      font-weight: 700;
-      font-size: 0.95rem;
-    }
-
-    .top-links {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    .top-links a {
-      text-decoration: none;
-      color: var(--text-muted);
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-size: 0.86rem;
-      transition: background-color 0.2s ease, color 0.2s ease;
-    }
-
-    .top-links a:hover {
-      background: #e0edff;
-      color: var(--primary);
-    }
-
-    .hero {
-      padding: 36px 0 34px;
-    }
-
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      border: 1px solid #bfdbfe;
-      color: #1d4ed8;
-      background: #eff6ff;
-      font-weight: 700;
-      font-size: 0.8rem;
-      border-radius: 999px;
-      padding: 6px 12px;
-      letter-spacing: 0.01em;
-    }
-
-    .hero-grid {
-      margin-top: 18px;
-      display: grid;
-      grid-template-columns: 1.4fr 1fr;
-      gap: 20px;
-    }
-
-    h1,
-    h2,
-    h3 {
+    .topbar-title h1 {
       margin: 0;
       font-family: "Space Grotesk", sans-serif;
-      line-height: 1.05;
+      font-size: clamp(1.2rem, 2vw, 1.6rem);
       letter-spacing: -0.02em;
     }
 
-    .hero h1 {
-      font-size: clamp(2.05rem, 4.8vw, 4.2rem);
-      max-width: 15ch;
+    .topbar-title p {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    .hero p {
-      margin-top: 14px;
-      color: var(--text-muted);
-      font-size: 1.05rem;
-      line-height: 1.65;
-      max-width: 60ch;
-    }
-
-    .hero-cta {
-      margin-top: 24px;
+    .model-strip {
       display: flex;
-      gap: 12px;
+      align-items: center;
+      gap: 10px;
       flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
-    .btn {
+    .pill {
       display: inline-flex;
       align-items: center;
-      justify-content: center;
-      gap: 8px;
-      text-decoration: none;
+      gap: 7px;
+      min-height: 32px;
+      padding: 7px 10px;
+      border: 1px solid var(--line-soft);
       border-radius: 999px;
-      padding: 12px 18px;
-      font-weight: 700;
-      transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
-      cursor: pointer;
+      background: rgba(15, 23, 42, 0.64);
+      color: var(--muted);
+      font-size: 0.82rem;
+      white-space: nowrap;
     }
 
-    .btn-primary {
-      background: var(--primary);
-      color: #fff;
-      box-shadow: 0 10px 20px rgba(37, 99, 235, 0.24);
+    .dot {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: var(--green);
+      box-shadow: 0 0 18px rgba(34, 197, 94, 0.8);
     }
 
-    .btn-primary:hover {
-      transform: translateY(-2px);
-      background: #1d4ed8;
+    .dot.warning {
+      background: var(--amber);
+      box-shadow: 0 0 18px rgba(245, 158, 11, 0.72);
     }
 
-    .btn-ghost {
-      border: 1px solid var(--border);
-      color: var(--secondary);
-      background: #fff;
+    .dot.error {
+      background: var(--red);
+      box-shadow: 0 0 18px rgba(239, 68, 68, 0.72);
     }
 
-    .btn-ghost:hover {
-      transform: translateY(-2px);
-      box-shadow: var(--shadow-soft);
+    .page {
+      display: none;
+      min-width: 0;
+      padding: 22px;
+    }
+
+    .page.active {
+      display: block;
+    }
+
+    .agent-layout {
+      height: calc(100vh - var(--topbar) - 44px);
+      min-height: 700px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 18px;
     }
 
     .panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      box-shadow: var(--shadow-soft);
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
     }
 
-    .stats-panel {
+    .chat-panel {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .panel-head h2,
+    .panel-title {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }
+
+    .panel-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .chat-stream {
+      overflow: auto;
       padding: 18px;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
       align-content: start;
+      gap: 14px;
     }
 
-    .stat {
-      padding: 14px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: linear-gradient(180deg, #ffffff, #f8fbff);
+    .message {
+      display: grid;
+      gap: 8px;
+      max-width: 840px;
     }
 
-    .stat-label {
-      font-size: 0.77rem;
-      font-weight: 700;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
+    .message.user {
+      justify-self: end;
+      width: min(760px, 88%);
     }
 
-    .stat-value {
-      margin-top: 6px;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--secondary);
+    .message.agent {
+      justify-self: start;
+      width: min(860px, 94%);
     }
 
-    section {
-      margin-top: 38px;
-    }
-
-    .section-head {
+    .message-label {
       display: flex;
-      justify-content: space-between;
-      align-items: end;
-      gap: 20px;
-      margin-bottom: 14px;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.78rem;
     }
 
-    .section-head h2 {
-      font-size: clamp(1.35rem, 3vw, 2.1rem);
+    .bubble {
+      border: 1px solid var(--line-soft);
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(15, 23, 42, 0.72);
+      line-height: 1.62;
     }
 
-    .section-head p {
-      margin: 0;
-      color: var(--text-muted);
-      max-width: 52ch;
-      line-height: 1.6;
+    .message.user .bubble {
+      color: #eff6ff;
+      border-color: rgba(59, 130, 246, 0.32);
+      background: linear-gradient(135deg, rgba(37, 99, 235, 0.78), rgba(34, 211, 238, 0.28));
     }
 
-    .grid-3 {
+    .code-block {
+      margin-top: 10px;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 12px;
+      background: #060a12;
+      color: #dbeafe;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.8rem;
+      line-height: 1.58;
+    }
+
+    .run-summary {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .feature-card {
-      padding: 18px;
-      background: #fff;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      box-shadow: var(--shadow-soft);
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
-      cursor: pointer;
-    }
-
-    .feature-card:hover {
-      transform: translateY(-4px);
-      box-shadow: 0 14px 30px rgba(30, 41, 59, 0.12);
-    }
-
-    .icon {
-      width: 34px;
-      height: 34px;
-      border-radius: 10px;
-      display: grid;
-      place-items: center;
-      margin-bottom: 12px;
-      color: #fff;
-      background: linear-gradient(135deg, var(--primary), #60a5fa);
-    }
-
-    .feature-card h3 {
-      font-size: 1.03rem;
-      margin-bottom: 8px;
-    }
-
-    .feature-card p {
-      margin: 0;
-      color: var(--text-muted);
-      line-height: 1.58;
-      font-size: 0.95rem;
-    }
-
-    .showcase {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
-    }
-
-    .media-card {
-      overflow: hidden;
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--border);
-      background: #fff;
-      box-shadow: var(--shadow-soft);
-    }
-
-    .media-card img {
-      width: 100%;
-      display: block;
-      aspect-ratio: 16 / 10;
-      object-fit: cover;
-      background: #dbeafe;
-    }
-
-    .media-caption {
-      padding: 12px 14px 14px;
-    }
-
-    .media-caption h3 {
-      font-size: 1.03rem;
-      margin-bottom: 6px;
-    }
-
-    .media-caption p {
-      margin: 0;
-      color: var(--text-muted);
-      line-height: 1.56;
-      font-size: 0.94rem;
-    }
-
-    .timeline {
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--border);
-      background: linear-gradient(140deg, #ffffff 0%, #f8fbff 60%, #f2f7ff 100%);
-      padding: 18px;
-      box-shadow: var(--shadow-soft);
-    }
-
-    .timeline-steps {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin-top: 12px;
     }
 
-    .step {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      background: #fff;
-      padding: 12px;
+    .summary-card,
+    .metric-card,
+    .model-card,
+    .dataset-card,
+    .history-row {
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.55);
     }
 
-    .step-num {
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 0.78rem;
-      color: #1d4ed8;
+    .summary-card {
+      padding: 10px;
+    }
+
+    .summary-label {
+      color: var(--muted-2);
+      font-size: 0.74rem;
       font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-    }
-
-    .step h3 {
-      margin-top: 6px;
-      font-size: 1rem;
-    }
-
-    .step p {
-      margin-top: 6px;
-      margin-bottom: 0;
-      color: var(--text-muted);
-      font-size: 0.9rem;
-      line-height: 1.5;
-    }
-
-    .bench {
-      display: grid;
-      grid-template-columns: 1.1fr 1fr;
-      gap: 14px;
-    }
-
-    .table {
-      width: 100%;
-      border-collapse: collapse;
-      border-radius: 14px;
-      overflow: hidden;
-      background: #fff;
-      border: 1px solid var(--border);
-      box-shadow: var(--shadow-soft);
-      font-size: 0.93rem;
-    }
-
-    .table th,
-    .table td {
-      padding: 10px 12px;
-      border-bottom: 1px solid #edf2f7;
-      text-align: left;
-    }
-
-    .table th {
-      background: #f8fbff;
-      font-weight: 700;
-      color: #334155;
-      font-size: 0.79rem;
       letter-spacing: 0.06em;
       text-transform: uppercase;
     }
 
-    .table tr:last-child td {
-      border-bottom: none;
-    }
-
-    .chip {
-      display: inline-flex;
+    .summary-value {
+      margin-top: 5px;
+      display: flex;
       align-items: center;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      font-weight: 700;
-      padding: 4px 8px;
-      background: #dcfce7;
-      color: #166534;
-    }
-
-    .bars {
-      padding: 16px;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      background: #fff;
-      box-shadow: var(--shadow-soft);
-      display: grid;
-      gap: 12px;
-    }
-
-    .bar {
-      display: grid;
-      grid-template-columns: 110px 1fr 66px;
-      gap: 10px;
-      align-items: center;
+      gap: 8px;
+      font-family: "JetBrains Mono", monospace;
       font-size: 0.9rem;
     }
 
-    .track {
-      height: 12px;
-      border-radius: 999px;
-      background: #e5edf7;
-      overflow: hidden;
-      position: relative;
+    .composer {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border-top: 1px solid var(--line-soft);
+      background: rgba(7, 11, 20, 0.55);
     }
 
-    .fill {
-      height: 100%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, var(--primary), #60a5fa);
-      width: 0;
-      animation: fillGrow 1.2s ease forwards;
+    textarea {
+      width: 100%;
+      min-height: 92px;
+      resize: vertical;
+      border: 1px solid var(--line-soft);
+      border-radius: 14px;
+      outline: none;
+      padding: 13px 14px;
+      background: rgba(2, 6, 23, 0.72);
+      color: var(--text);
+      line-height: 1.5;
     }
 
-    @keyframes fillGrow {
-      from {
-        width: 0;
-      }
-      to {
-        width: var(--w);
-      }
+    textarea:focus,
+    select:focus,
+    input:focus {
+      border-color: rgba(59, 130, 246, 0.78);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
     }
 
-    .workflow {
-      margin-top: 14px;
-      border: 1px solid var(--border);
-      background: #0f172a;
-      color: #e2e8f0;
-      border-radius: var(--radius-lg);
-      overflow: hidden;
-      box-shadow: var(--shadow-soft);
-    }
-
-    .workflow-head {
+    .composer-actions {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 14px;
-      border-bottom: 1px solid #334155;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 0.9rem;
-      color: #94a3b8;
-      background: #111b33;
+      gap: 12px;
+      flex-wrap: wrap;
     }
 
-    pre {
-      margin: 0;
-      padding: 14px;
+    .quick-prompts {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .ghost-button,
+    .primary-button {
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border-radius: 12px;
+      padding: 9px 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .ghost-button {
+      border: 1px solid var(--line-soft);
+      background: rgba(148, 163, 184, 0.08);
+      color: var(--muted);
+    }
+
+    .ghost-button:hover {
+      color: var(--text);
+      border-color: rgba(148, 163, 184, 0.32);
+      background: rgba(148, 163, 184, 0.14);
+    }
+
+    .primary-button {
+      border: 1px solid rgba(59, 130, 246, 0.62);
+      background: linear-gradient(135deg, var(--blue-strong), #06b6d4);
+      color: #fff;
+      box-shadow: 0 16px 34px rgba(37, 99, 235, 0.28);
+    }
+
+    .primary-button:disabled,
+    .ghost-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .details-panel {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+
+    .details-body {
       overflow: auto;
-      font-family: "JetBrains Mono", "Fira Code", monospace;
+      padding: 16px;
+      display: grid;
+      align-content: start;
+      gap: 12px;
+    }
+
+    details {
+      border: 1px solid var(--line-soft);
+      border-radius: 14px;
+      background: rgba(2, 6, 23, 0.32);
+      overflow: hidden;
+    }
+
+    details[open] {
+      border-color: rgba(59, 130, 246, 0.24);
+    }
+
+    summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 13px;
+      cursor: pointer;
+      list-style: none;
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .detail-content {
+      border-top: 1px solid var(--line-soft);
+      padding: 12px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.58;
+    }
+
+    .trace-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .trace-list li {
+      display: grid;
+      gap: 4px;
+      padding: 9px;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.58);
+    }
+
+    .mono {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.8rem;
+    }
+
+    .status-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 26px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(34, 197, 94, 0.28);
+      background: rgba(34, 197, 94, 0.09);
+      color: #86efac;
+      font-size: 0.76rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status-tag.pending {
+      border-color: rgba(245, 158, 11, 0.28);
+      background: rgba(245, 158, 11, 0.09);
+      color: #fcd34d;
+    }
+
+    .status-tag.error {
+      border-color: rgba(239, 68, 68, 0.28);
+      background: rgba(239, 68, 68, 0.09);
+      color: #fca5a5;
+    }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .grid.two {
+      grid-template-columns: minmax(0, 1fr) 380px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .metric-card {
+      padding: 15px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .metric-value {
+      margin-top: 8px;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 1.7rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .metric-foot {
+      margin-top: 7px;
+      color: var(--muted-2);
+      font-size: 0.78rem;
+    }
+
+    .model-grid,
+    .dataset-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .model-card,
+    .dataset-card {
+      padding: 14px;
+      transition: border-color 0.18s ease, background-color 0.18s ease;
+    }
+
+    .model-card.active,
+    .dataset-card.selected {
+      border-color: rgba(34, 211, 238, 0.42);
+      background: rgba(34, 211, 238, 0.08);
+    }
+
+    .model-card h3,
+    .dataset-card h3 {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 0.98rem;
+    }
+
+    .model-card p,
+    .dataset-card p {
+      margin: 8px 0 0;
+      color: var(--muted);
       font-size: 0.84rem;
-      line-height: 1.6;
-      color: #dbeafe;
+      line-height: 1.48;
     }
 
-    .highlight {
-      color: #fdba74;
+    .card-meta {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+      margin-top: 12px;
     }
 
-    .fade-up {
-      opacity: 0;
-      transform: translateY(20px);
-      transition: opacity 0.7s ease, transform 0.7s ease;
+    .progress {
+      height: 9px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.14);
     }
 
-    .fade-up.in {
-      opacity: 1;
-      transform: translateY(0);
+    .progress span {
+      display: block;
+      width: var(--value, 0%);
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--blue), var(--cyan));
+      transition: width 0.3s ease;
     }
 
-    footer {
-      margin: 44px 0 26px;
-      color: #64748b;
-      font-size: 0.9rem;
-      border-top: 1px solid var(--border);
-      padding-top: 14px;
+    .control-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
     }
 
-    @media (max-width: 980px) {
-      .hero-grid,
-      .showcase,
-      .bench {
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    select,
+    input {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid var(--line-soft);
+      border-radius: 12px;
+      outline: none;
+      padding: 9px 10px;
+      background: rgba(2, 6, 23, 0.72);
+      color: var(--text);
+    }
+
+    .history-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .history-row {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr 0.9fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .history-row strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+
+    .case-panel {
+      display: grid;
+      gap: 10px;
+    }
+
+    .case-row {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 12px;
+      background: rgba(2, 6, 23, 0.28);
+    }
+
+    .case-row p {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .spinner {
+      width: 15px;
+      height: 15px;
+      border-radius: 999px;
+      border: 2px solid rgba(255, 255, 255, 0.24);
+      border-top-color: #fff;
+      animation: spin 0.78s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    @media (max-width: 1180px) {
+      .agent-layout,
+      .grid.two {
+        height: auto;
+        min-height: 0;
         grid-template-columns: 1fr;
       }
 
-      .grid-3 {
-        grid-template-columns: 1fr 1fr;
+      .details-panel {
+        min-height: 520px;
       }
 
-      .timeline-steps {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .section-head {
-        display: block;
+      .model-grid,
+      .dataset-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
-    @media (max-width: 640px) {
+    @media (max-width: 900px) {
+      .app-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .nav {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .session-panel,
+      .sidebar-footer {
+        display: none;
+      }
+
       .topbar {
-        border-radius: 18px;
+        position: static;
         align-items: flex-start;
         flex-direction: column;
-        gap: 8px;
       }
 
-      .grid-3,
-      .timeline-steps {
+      .model-strip {
+        justify-content: flex-start;
+      }
+
+      .main {
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+    }
+
+    @media (max-width: 680px) {
+      .sidebar,
+      .page,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .nav {
         grid-template-columns: 1fr;
       }
 
-      .stats-panel {
+      .run-summary,
+      .grid.three,
+      .model-grid,
+      .dataset-grid,
+      .form-row,
+      .history-row {
         grid-template-columns: 1fr;
       }
 
-      .bar {
-        grid-template-columns: 84px 1fr 52px;
-        font-size: 0.84rem;
+      .message.user,
+      .message.agent {
+        width: 100%;
+      }
+
+      .composer-actions,
+      .control-row {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .quick-prompts,
+      .primary-button,
+      .ghost-button {
+        width: 100%;
       }
     }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark">W</span>
-      Whale Code
-    </div>
-    <nav class="top-links">
-      <a href="#highlights">Highlights</a>
-      <a href="#architecture">Architecture</a>
-      <a href="#benchmarks">Benchmarks</a>
-      <a href="#workflow">Workflow</a>
-    </nav>
-  </header>
-
-  <main class="container">
-    <section class="hero fade-up">
-      <span class="eyebrow">Production-Grade Coding Agent Framework</span>
-      <div class="hero-grid">
-        <div>
-          <h1>Whale Code builds reliable autonomous coding workflows.</h1>
-          <p>
-            Whale Code is a from-scratch coding agent framework built around a strict ReAct loop and OpenAI-compatible function calling. It combines safe atomized tools, layered context engineering, and persistent task orchestration to solve real repository work end-to-end.
-          </p>
-          <div class="hero-cta">
-            <a class="btn btn-primary" href="#highlights">Explore Highlights</a>
-            <a class="btn btn-ghost" href="../README.md">Read Full README</a>
-          </div>
-        </div>
-        <aside class="panel stats-panel">
-          <article class="stat">
-            <div class="stat-label">Model Context</div>
-            <div class="stat-value">262,144</div>
-          </article>
-          <article class="stat">
-            <div class="stat-label">Tools (Core Set)</div>
-            <div class="stat-value">14+</div>
-          </article>
-          <article class="stat">
-            <div class="stat-label">Pass Rate (MBPP+)</div>
-            <div class="stat-value">98.9%</div>
-          </article>
-          <article class="stat">
-            <div class="stat-label">Pass Rate (HE+)</div>
-            <div class="stat-value">96.9%</div>
-          </article>
-        </aside>
-      </div>
-    </section>
-
-    <section id="highlights" class="fade-up">
-      <div class="section-head">
-        <h2>What Makes Whale Code Stand Out</h2>
-        <p>
-          The framework focuses on reliability under real coding pressure: structured tool calls, safe writes, resilient long-context behavior, and observable execution.
-        </p>
-      </div>
-      <div class="grid-3">
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M4 12l4 4L20 4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <h3>Structured Function Calling</h3>
-          <p>
-            Native tool-calling JSON replaces fragile regex parsing, delivering robust action execution and high parse reliability in production-style loops.
-          </p>
-        </article>
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M12 3v6m0 0l3-3m-3 3L9 6M4 14v4a3 3 0 003 3h10a3 3 0 003-3v-4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <h3>Layered Context Engine</h3>
-          <p>
-            Micro-compaction, auto-summary compaction, token tracking, and transcript persistence keep long sessions responsive and memory-efficient.
-          </p>
-        </article>
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M4 7h16M7 4v6m10-6v6M6 11h12l-1 9H7l-1-9z" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <h3>Safe, Atomized Tooling</h3>
-          <p>
-            Read/Write/Edit/Glob/Grep are sandboxed to workspace scope, support optimistic locking, and return structured status codes for deterministic control.
-          </p>
-        </article>
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M4 19h16M7 15l3-3 2 2 5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <h3>Persistent Task Graph</h3>
-          <p>
-            File-backed tasks with dependency edges survive context compression and support multi-step delivery across long development sessions.
-          </p>
-        </article>
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M5 12h14M5 7h14M5 17h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-            </svg>
-          </div>
-          <h3>Interactive CLI Experience</h3>
-          <p>
-            Rich terminal UI, slash commands, session snapshots, resume/load flows, and readable tool telemetry make daily usage smooth.
-          </p>
-        </article>
-        <article class="feature-card">
-          <div class="icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M5 19V5h14v14H5zm4-4h6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <h3>Built-in Benchmark Harness</h3>
-          <p>
-            Includes MBPP+, HumanEval+, ClassEval, AIME, and SWE-bench workflows with reproducible scripts and explicit evaluation pipelines.
-          </p>
-        </article>
-      </div>
-    </section>
-
-    <section id="architecture" class="fade-up">
-      <div class="section-head">
-        <h2>Visual Architecture & Product Surface</h2>
-        <p>
-          Core assets from the project show how Whale Code is engineered: top-level architecture, key design map, and real CLI interaction.
-        </p>
-      </div>
-      <div class="showcase">
-        <article class="media-card">
-          <img src="./architecture.png" alt="Whale Code architecture overview" />
-          <div class="media-caption">
-            <h3>Architecture</h3>
-            <p>End-to-end ReAct lifecycle with tool execution, observation flow, context compaction, and persistence integration.</p>
-          </div>
-        </article>
-        <article class="media-card">
-          <img src="./key_design.png" alt="Whale Code key design diagram" />
-          <div class="media-caption">
-            <h3>Key Design</h3>
-            <p>Design decisions around reliability, traceability, and safe autonomous coding in local repositories.</p>
-          </div>
-        </article>
-        <article class="media-card">
-          <img src="./cli-demo.png" alt="Whale Code CLI screenshot" />
-          <div class="media-caption">
-            <h3>CLI Demo</h3>
-            <p>Interactive, developer-first terminal loop with observability and command ergonomics.</p>
-          </div>
-        </article>
-        <article class="timeline">
-          <h3>Execution Loop</h3>
-          <p style="margin: 8px 0 0; color: var(--text-muted); line-height: 1.58;">
-            Whale Code executes with a strict loop that keeps reasoning and action aligned:
-            <strong>Think → Act → Observe → Re-think</strong>.
-          </p>
-          <div class="timeline-steps">
-            <div class="step">
-              <div class="step-num">Step 01</div>
-              <h3>Think</h3>
-              <p>Model analyzes objective, history, and state under policy constraints.</p>
-            </div>
-            <div class="step">
-              <div class="step-num">Step 02</div>
-              <h3>Act</h3>
-              <p>Calls specialized tools through structured function-calling payloads.</p>
-            </div>
-            <div class="step">
-              <div class="step-num">Step 03</div>
-              <h3>Observe</h3>
-              <p>Processes typed tool responses with status and machine-readable fields.</p>
-            </div>
-            <div class="step">
-              <div class="step-num">Step 04</div>
-              <h3>Re-think</h3>
-              <p>Updates plan, compacts context if needed, and iterates safely.</p>
-            </div>
-          </div>
-        </article>
-      </div>
-    </section>
-
-    <section id="benchmarks" class="fade-up">
-      <div class="section-head">
-        <h2>Benchmark Snapshot</h2>
-        <p>
-          Measured with Qwen3.5-35B-A3B-FP8, showcasing strong pass rates on coding and reasoning-oriented benchmarks.
-        </p>
-      </div>
-      <div class="bench">
-        <div>
-          <table class="table" aria-label="Whale Code benchmark table">
-            <thead>
-              <tr>
-                <th>Benchmark</th>
-                <th>Tasks</th>
-                <th>Pass Rate</th>
-                <th>Date</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>MBPP+</td>
-                <td>378</td>
-                <td><span class="chip">98.9%</span></td>
-                <td>2026-03-22</td>
-              </tr>
-              <tr>
-                <td>HumanEval+</td>
-                <td>164</td>
-                <td><span class="chip">96.9%</span></td>
-                <td>2026-03-22</td>
-              </tr>
-              <tr>
-                <td>ClassEval</td>
-                <td>100</td>
-                <td><span class="chip">90.0%</span></td>
-                <td>2026-03-22</td>
-              </tr>
-              <tr>
-                <td>AIME</td>
-                <td>30</td>
-                <td><span class="chip">80.0%</span></td>
-                <td>2026-03-22</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="bars">
-          <div class="bar">
-            <div>MBPP+</div>
-            <div class="track"><div class="fill" style="--w: 98.9%;"></div></div>
-            <strong>98.9%</strong>
-          </div>
-          <div class="bar">
-            <div>HumanEval+</div>
-            <div class="track"><div class="fill" style="--w: 96.9%;"></div></div>
-            <strong>96.9%</strong>
-          </div>
-          <div class="bar">
-            <div>ClassEval</div>
-            <div class="track"><div class="fill" style="--w: 90%;"></div></div>
-            <strong>90.0%</strong>
-          </div>
-          <div class="bar">
-            <div>AIME</div>
-            <div class="track"><div class="fill" style="--w: 80%;"></div></div>
-            <strong>80.0%</strong>
-          </div>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="WhaleCode sidebar">
+      <div class="brand">
+        <div class="brand-mark">W</div>
+        <div class="brand-title">
+          <strong>WhaleCode</strong>
+          <span>Agent Console</span>
         </div>
       </div>
-    </section>
 
-    <section id="workflow" class="fade-up">
-      <div class="section-head">
-        <h2>Fast Path to Run Whale Code</h2>
-        <p>
-          Start the local model backend, then launch the CLI in a target workspace and assign coding tasks directly.
-        </p>
-      </div>
-      <article class="workflow">
-        <div class="workflow-head">
-          <span>Terminal Workflow</span>
-          <span>vLLM + run_cli.py</span>
+      <nav class="nav" aria-label="Primary navigation">
+        <button class="nav-button active" data-page="agent">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16v10H7l-3 3V5z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          智能体交互
+        </button>
+        <button class="nav-button" data-page="models">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 4h12v6H6V4zm0 10h12v6H6v-6zm3-7h1m-1 10h1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          模型管理
+        </button>
+        <button class="nav-button" data-page="datasets">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6c0-1.1 3.6-2 8-2s8 .9 8 2-3.6 2-8 2-8-.9-8-2zm0 0v6c0 1.1 3.6 2 8 2s8-.9 8-2V6M4 12v6c0 1.1 3.6 2 8 2s8-.9 8-2v-6" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          数据集测试
+        </button>
+      </nav>
+
+      <div class="session-panel">
+        <div class="section-kicker">
+          <span>历史会话</span>
+          <button class="icon-button" id="newSession" aria-label="新建会话">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+          </button>
         </div>
-        <pre><code>CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
-  --port 8000 \
-  --gpu-memory-utilization 0.92 \
-  --reasoning-parser qwen3 \
-  --enable-auto-tool-choice \
-  --language-model-only \
-  --tool-call-parser qwen3_xml
+        <div class="session-list" id="sessionList">
+          <article class="session-item active">
+            <div>
+              <div class="session-name">修复数据处理异常</div>
+              <div class="session-meta">8 steps · 2m ago</div>
+            </div>
+            <button class="icon-button" aria-label="删除会话">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </article>
+          <article class="session-item">
+            <div>
+              <div class="session-name">重构 benchmark runner</div>
+              <div class="session-meta">12 steps · yesterday</div>
+            </div>
+            <button class="icon-button" aria-label="删除会话">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </article>
+          <article class="session-item">
+            <div>
+              <div class="session-name">新增工具调用审计日志</div>
+              <div class="session-meta">5 steps · Jul 12</div>
+            </div>
+            <button class="icon-button" aria-label="删除会话">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </article>
+        </div>
+      </div>
 
-python run_cli.py --workspace /working/space
+      <div class="sidebar-footer">
+        <div class="mini-metric"><span>Context</span><strong>128k / 262k</strong></div>
+        <div class="mini-metric"><span>Trace</span><strong>enabled</strong></div>
+        <div class="mini-metric"><span>Tools</span><strong>14 active</strong></div>
+      </div>
+    </aside>
 
-<span class="highlight">&gt; Read the main entry point and summarize its structure</span>
-<span class="highlight">&gt; Add error handling to the data processing pipeline</span></code></pre>
-      </article>
-    </section>
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title">
+          <h1 id="pageTitle">智能体交互主页面</h1>
+          <p id="pageSub">默认只呈现运行状态、最终结果和总耗时；运行详情按需展开。</p>
+        </div>
+        <div class="model-strip">
+          <span class="pill"><span class="dot" id="serviceDot"></span><span id="serviceText">vLLM running</span></span>
+          <span class="pill"><span>当前模型</span><strong id="activeModel">Qwen3.5-35B-A3B-FP8</strong></span>
+          <span class="pill"><span>显存</span><strong id="gpuText">42.6 / 80 GB</strong></span>
+        </div>
+      </header>
 
-    <footer>
-      Whale Code Showcase Page · Built from project README facts and local repository assets.
-    </footer>
-  </main>
+      <section class="page active" id="agentPage">
+        <div class="agent-layout">
+          <section class="panel chat-panel" aria-label="Agent chat">
+            <div class="panel-head">
+              <div>
+                <h2>WhaleCode Assistant</h2>
+                <p>面向代码仓库的 ReAct 智能体交互入口</p>
+              </div>
+              <span class="status-tag" id="runState"><span class="dot"></span>已完成</span>
+            </div>
+
+            <div class="chat-stream" id="chatStream">
+              <article class="message user">
+                <div class="message-label">User · 当前会话</div>
+                <div class="bubble">请阅读项目主入口，找出 CLI 初始化链路，并说明如何接入新的 benchmark 命令。</div>
+              </article>
+              <article class="message agent">
+                <div class="message-label">WhaleCode · Final Output</div>
+                <div class="bubble">
+                  已完成入口链路梳理：<strong>run_cli.py</strong> 负责参数解析、环境加载、Rich/Prompt Toolkit UI 初始化、Agent 工厂创建与交互循环调度。新增 benchmark 命令建议接入 slash command 分发层，并复用现有 <span class="mono">code/benchmark</span> 模块的 runner 抽象。
+                  <div class="code-block">/bench aime --model Qwen3.5-35B-A3B-FP8 --limit 30
+/bench swev --dataset small --trace enabled</div>
+                  <div class="run-summary">
+                    <div class="summary-card">
+                      <div class="summary-label">状态</div>
+                      <div class="summary-value"><span class="dot"></span>已完成</div>
+                    </div>
+                    <div class="summary-card">
+                      <div class="summary-label">总耗时</div>
+                      <div class="summary-value">18.4s</div>
+                    </div>
+                    <div class="summary-card">
+                      <div class="summary-label">Token</div>
+                      <div class="summary-value">19,482</div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <form class="composer" id="agentForm">
+              <textarea id="promptInput" placeholder="输入代码问题或开发需求，例如：为 benchmark runner 增加失败重试和结构化日志..."></textarea>
+              <div class="composer-actions">
+                <div class="quick-prompts">
+                  <button type="button" class="ghost-button quick" data-prompt="分析 run_cli.py 的启动链路，并输出关键函数调用顺序。">分析入口</button>
+                  <button type="button" class="ghost-button quick" data-prompt="为 vLLM 模型切换流程设计后端 API，并给出错误处理方案。">设计 API</button>
+                  <button type="button" class="ghost-button quick" data-prompt="运行数据集测试前，请生成完整的测试计划和风险点。">测试计划</button>
+                </div>
+                <button type="submit" class="primary-button" id="sendButton">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  运行智能体
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <aside class="panel details-panel" aria-label="Run details">
+            <div class="panel-head">
+              <div>
+                <h2>运行详情</h2>
+                <p>完整链路默认折叠，按步骤查看</p>
+              </div>
+              <button class="ghost-button" id="expandAll">全部展开</button>
+            </div>
+            <div class="details-body" id="detailsBody">
+              <details open>
+                <summary><span>01 · 思考链摘要</span><span class="status-tag">done</span></summary>
+                <div class="detail-content">
+                  识别用户目标，定位 CLI 入口、Agent 初始化、工具注册、benchmark 模块与 slash command 分发边界。
+                </div>
+              </details>
+              <details>
+                <summary><span>02 · 工具调用记录</span><span class="status-tag">4 calls</span></summary>
+                <div class="detail-content">
+                  <ul class="trace-list">
+                    <li><strong class="mono">ReadTool</strong><span>run_cli.py · 入口解析与 UI 初始化</span></li>
+                    <li><strong class="mono">GrepTool</strong><span>benchmark / slash command references</span></li>
+                    <li><strong class="mono">ReadTool</strong><span>code/benchmark/base.py · runner contract</span></li>
+                    <li><strong class="mono">TodoWrite</strong><span>生成命令接入任务列表</span></li>
+                  </ul>
+                </div>
+              </details>
+              <details>
+                <summary><span>03 · 中间代码片段</span><span class="status-tag">preview</span></summary>
+                <div class="detail-content">
+                  <div class="code-block">elif command == "/bench":
+    return handle_benchmark_command(args, agent_context)</div>
+                </div>
+              </details>
+              <details>
+                <summary><span>04 · 报错日志</span><span class="status-tag pending">clean</span></summary>
+                <div class="detail-content">本次执行无异常；未触发 circuit breaker，未产生 sandbox violation。</div>
+              </details>
+              <details>
+                <summary><span>05 · Token 消耗</span><span class="status-tag">19,482</span></summary>
+                <div class="detail-content">
+                  Prompt 12,340 · Completion 4,112 · Tool observations 3,030 · 自动压缩未触发。
+                </div>
+              </details>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="modelsPage">
+        <div class="grid">
+          <div class="grid three">
+            <article class="metric-card">
+              <div class="metric-label">vLLM 服务状态</div>
+              <div class="metric-value" id="modelServiceMetric">Running</div>
+              <div class="metric-foot">localhost:8000 · OpenAI-compatible</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">当前加载模型</div>
+              <div class="metric-value" style="font-size:1.15rem" id="loadedModelMetric">Qwen3.5-35B-A3B-FP8</div>
+              <div class="metric-foot">reasoning-parser: qwen3</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">显存占用</div>
+              <div class="metric-value" id="gpuMetric">53%</div>
+              <div class="metric-foot"><div class="progress"><span id="gpuBar" style="--value:53%"></span></div></div>
+            </article>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>模型控制台</h2>
+                <p>启动、停止、切换与卸载 vLLM 推理服务</p>
+              </div>
+              <div class="control-row">
+                <button class="ghost-button" id="stopService">停止服务</button>
+                <button class="primary-button" id="startService">启动服务</button>
+                <button class="ghost-button" id="unloadModel">卸载模型</button>
+              </div>
+            </div>
+            <div style="padding:18px; display:grid; gap:14px;">
+              <div class="control-row">
+                <span class="pill"><span id="loadStatus">就绪</span></span>
+                <span class="pill">加载进度 <strong id="loadPercent">100%</strong></span>
+              </div>
+              <div class="progress"><span id="loadBar" style="--value:100%"></span></div>
+              <div class="model-grid" id="modelGrid">
+                <article class="model-card active" data-model="Qwen3.5-35B-A3B-FP8" data-gpu="42.6 / 80 GB">
+                  <h3>Qwen3.5-35B-A3B-FP8</h3>
+                  <p>推荐生产编码任务，支持工具调用与长上下文。</p>
+                  <div class="card-meta"><span class="status-tag">已加载</span><span class="pill">35B · FP8</span><span class="pill">80GB</span></div>
+                </article>
+                <article class="model-card" data-model="Qwen3-Coder-30B-A3B" data-gpu="36.8 / 80 GB">
+                  <h3>Qwen3-Coder-30B-A3B</h3>
+                  <p>适合代码生成、仓库理解与修复任务。</p>
+                  <div class="card-meta"><span class="status-tag pending">未加载</span><span class="pill">30B</span><span class="pill">64GB</span></div>
+                </article>
+                <article class="model-card" data-model="DeepSeek-Coder-V2-Lite" data-gpu="18.2 / 80 GB">
+                  <h3>DeepSeek-Coder-V2-Lite</h3>
+                  <p>轻量快速，适合交互式探索与小型测试。</p>
+                  <div class="card-meta"><span class="status-tag pending">未加载</span><span class="pill">16B</span><span class="pill">24GB</span></div>
+                </article>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="datasetsPage">
+        <div class="grid two">
+          <div class="grid">
+            <div class="grid three">
+              <article class="metric-card">
+                <div class="metric-label">测试进度</div>
+                <div class="metric-value" id="testProgressText">0 / 164</div>
+                <div class="metric-foot"><div class="progress"><span id="testProgressBar" style="--value:0%"></span></div></div>
+              </article>
+              <article class="metric-card">
+                <div class="metric-label">通过率</div>
+                <div class="metric-value" id="passRate">96.9%</div>
+                <div class="metric-foot">动态统计 pass@1 / pass@k</div>
+              </article>
+              <article class="metric-card">
+                <div class="metric-label">平均耗时</div>
+                <div class="metric-value" id="avgLatency">11.8s</div>
+                <div class="metric-foot">失败数 <span id="failCount">5</span></div>
+              </article>
+            </div>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>数据集选择</h2>
+                  <p>选择测试集与模型后启动批量评测</p>
+                </div>
+              </div>
+              <div style="padding:18px; display:grid; gap:16px;">
+                <div class="dataset-grid" id="datasetGrid">
+                  <article class="dataset-card selected" data-size="164">
+                    <h3>HumanEval+</h3>
+                    <p>函数级代码生成评测，覆盖边界用例增强。</p>
+                    <div class="card-meta"><span class="status-tag">164 cases</span><span class="pill">pass@1</span></div>
+                  </article>
+                  <article class="dataset-card selected" data-size="378">
+                    <h3>MBPP+</h3>
+                    <p>Python 编程题增强集，适合日常代码能力回归。</p>
+                    <div class="card-meta"><span class="status-tag">378 cases</span><span class="pill">pass@k</span></div>
+                  </article>
+                  <article class="dataset-card" data-size="100">
+                    <h3>ClassEval</h3>
+                    <p>类与对象场景评测，覆盖多方法依赖。</p>
+                    <div class="card-meta"><span class="status-tag pending">100 cases</span><span class="pill">OOP</span></div>
+                  </article>
+                </div>
+                <div class="form-row">
+                  <label>模型
+                    <select id="testModel">
+                      <option>Qwen3.5-35B-A3B-FP8</option>
+                      <option>Qwen3-Coder-30B-A3B</option>
+                      <option>DeepSeek-Coder-V2-Lite</option>
+                    </select>
+                  </label>
+                  <label>pass@k
+                    <select id="passK">
+                      <option>pass@1</option>
+                      <option>pass@3</option>
+                      <option>pass@5</option>
+                    </select>
+                  </label>
+                  <button class="primary-button" id="runDatasetTest">一键运行测试</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>历史测试记录</h2>
+                  <p>支持筛选、排序与查看完整用例明细</p>
+                </div>
+                <div class="control-row">
+                  <select aria-label="筛选历史记录">
+                    <option>全部数据集</option>
+                    <option>HumanEval+</option>
+                    <option>MBPP+</option>
+                  </select>
+                  <select aria-label="排序历史记录">
+                    <option>按时间倒序</option>
+                    <option>按通过率排序</option>
+                    <option>按失败数排序</option>
+                  </select>
+                </div>
+              </div>
+              <div style="padding:18px;">
+                <div class="history-list">
+                  <article class="history-row">
+                    <div><strong>2026-07-12 21:18</strong>HumanEval+ · MBPP+</div>
+                    <div>Qwen3.5-35B-A3B-FP8</div>
+                    <div>pass@1 97.4%</div>
+                    <button class="ghost-button">查看明细</button>
+                  </article>
+                  <article class="history-row">
+                    <div><strong>2026-07-11 18:44</strong>ClassEval</div>
+                    <div>Qwen3-Coder-30B-A3B</div>
+                    <div>pass@1 90.0%</div>
+                    <button class="ghost-button">查看明细</button>
+                  </article>
+                  <article class="history-row">
+                    <div><strong>2026-07-10 09:06</strong>AIME · SWEV</div>
+                    <div>DeepSeek-Coder-V2-Lite</div>
+                    <div>pass@3 84.2%</div>
+                    <button class="ghost-button">查看明细</button>
+                  </article>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <aside class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>当前用例详情</h2>
+                <p>运行中实时更新执行样本与错误摘要</p>
+              </div>
+            </div>
+            <div class="details-body">
+              <div class="case-panel" id="casePanel">
+                <article class="case-row">
+                  <span class="status-tag">pass</span>
+                  <div><strong>HumanEval/042</strong><p>修复边界条件后输出与 reference 一致。</p></div>
+                  <span class="mono">8.4s</span>
+                </article>
+                <article class="case-row">
+                  <span class="status-tag pending">running</span>
+                  <div><strong>MBPP/211</strong><p>正在生成候选代码并执行沙箱验证。</p></div>
+                  <span class="mono">...</span>
+                </article>
+                <article class="case-row">
+                  <span class="status-tag error">fail</span>
+                  <div><strong>HumanEval/117</strong><p>断言失败：空列表输入未返回默认值。</p></div>
+                  <span class="mono">13.9s</span>
+                </article>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
 
   <script>
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            entry.target.classList.add("in");
-          }
-        });
-      },
-      { threshold: 0.12 }
-    );
+    const pageMeta = {
+      agent: ["智能体交互主页面", "默认只呈现运行状态、最终结果和总耗时；运行详情按需展开。"],
+      models: ["vLLM 模型管理", "启动、停止、热切换与卸载模型，实时展示加载进度和显存占用。"],
+      datasets: ["数据集测试", "批量运行测试集，实时统计通过率、失败数、平均耗时与 pass@k 指标。"]
+    };
 
-    document.querySelectorAll(".fade-up").forEach((el) => observer.observe(el));
+    const navButtons = document.querySelectorAll(".nav-button");
+    const pages = {
+      agent: document.getElementById("agentPage"),
+      models: document.getElementById("modelsPage"),
+      datasets: document.getElementById("datasetsPage")
+    };
+
+    navButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        const page = button.dataset.page;
+        navButtons.forEach((item) => item.classList.toggle("active", item === button));
+        Object.entries(pages).forEach(([key, el]) => el.classList.toggle("active", key === page));
+        document.getElementById("pageTitle").textContent = pageMeta[page][0];
+        document.getElementById("pageSub").textContent = pageMeta[page][1];
+      });
+    });
+
+    document.querySelectorAll(".quick").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.getElementById("promptInput").value = button.dataset.prompt;
+        document.getElementById("promptInput").focus();
+      });
+    });
+
+    document.getElementById("expandAll").addEventListener("click", () => {
+      const details = document.querySelectorAll("#detailsBody details");
+      const shouldOpen = Array.from(details).some((item) => !item.open);
+      details.forEach((item) => {
+        item.open = shouldOpen;
+      });
+      document.getElementById("expandAll").textContent = shouldOpen ? "全部折叠" : "全部展开";
+    });
+
+    document.getElementById("agentForm").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("promptInput");
+      const value = input.value.trim();
+      if (!value) return;
+
+      const chat = document.getElementById("chatStream");
+      const userMessage = document.createElement("article");
+      userMessage.className = "message user";
+      userMessage.innerHTML = `<div class="message-label">User · 新任务</div><div class="bubble">${escapeHtml(value)}</div>`;
+      chat.appendChild(userMessage);
+
+      const runState = document.getElementById("runState");
+      const sendButton = document.getElementById("sendButton");
+      runState.className = "status-tag pending";
+      runState.innerHTML = '<span class="spinner"></span>处理中';
+      sendButton.disabled = true;
+      sendButton.innerHTML = '<span class="spinner"></span>智能体运行中';
+      input.value = "";
+      chat.scrollTop = chat.scrollHeight;
+
+      setTimeout(() => {
+        const agentMessage = document.createElement("article");
+        agentMessage.className = "message agent";
+        agentMessage.innerHTML = `
+          <div class="message-label">WhaleCode · Final Output</div>
+          <div class="bubble">
+            已完成任务拆解与执行模拟。建议把需求拆成 API 编排、实时事件流、任务状态持久化和前端状态机四层，并通过统一 trace_id 串联智能体步骤、工具调用和测试结果。
+            <div class="run-summary">
+              <div class="summary-card"><div class="summary-label">状态</div><div class="summary-value"><span class="dot"></span>已完成</div></div>
+              <div class="summary-card"><div class="summary-label">总耗时</div><div class="summary-value">12.7s</div></div>
+              <div class="summary-card"><div class="summary-label">Token</div><div class="summary-value">8,936</div></div>
+            </div>
+          </div>`;
+        chat.appendChild(agentMessage);
+        runState.className = "status-tag";
+        runState.innerHTML = '<span class="dot"></span>已完成';
+        sendButton.disabled = false;
+        sendButton.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>运行智能体';
+        chat.scrollTop = chat.scrollHeight;
+      }, 1250);
+    });
+
+    document.getElementById("newSession").addEventListener("click", () => {
+      const list = document.getElementById("sessionList");
+      list.querySelectorAll(".session-item").forEach((item) => item.classList.remove("active"));
+      const item = document.createElement("article");
+      item.className = "session-item active";
+      item.innerHTML = `
+        <div>
+          <div class="session-name">新建代码任务</div>
+          <div class="session-meta">0 steps · just now</div>
+        </div>
+        <button class="icon-button" aria-label="删除会话">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>`;
+      list.prepend(item);
+    });
+
+    document.getElementById("sessionList").addEventListener("click", (event) => {
+      const deleteButton = event.target.closest(".icon-button");
+      const row = event.target.closest(".session-item");
+      if (!row) return;
+      if (deleteButton) {
+        row.remove();
+        return;
+      }
+      document.querySelectorAll(".session-item").forEach((item) => item.classList.remove("active"));
+      row.classList.add("active");
+    });
+
+    function simulateLoading(targetModel, gpuText) {
+      const cards = document.querySelectorAll(".model-card");
+      const loadBar = document.getElementById("loadBar");
+      const loadPercent = document.getElementById("loadPercent");
+      const loadStatus = document.getElementById("loadStatus");
+      const buttons = [document.getElementById("startService"), document.getElementById("stopService"), document.getElementById("unloadModel")];
+      let progress = 0;
+      buttons.forEach((button) => (button.disabled = true));
+      loadStatus.innerHTML = '<span class="spinner"></span> 加载中';
+      const timer = setInterval(() => {
+        progress += 20;
+        loadBar.style.setProperty("--value", progress + "%");
+        loadPercent.textContent = progress + "%";
+        if (progress >= 100) {
+          clearInterval(timer);
+          cards.forEach((card) => {
+            const active = card.dataset.model === targetModel;
+            card.classList.toggle("active", active);
+            const tag = card.querySelector(".status-tag");
+            tag.className = active ? "status-tag" : "status-tag pending";
+            tag.textContent = active ? "已加载" : "未加载";
+          });
+          document.getElementById("activeModel").textContent = targetModel;
+          document.getElementById("loadedModelMetric").textContent = targetModel;
+          document.getElementById("gpuText").textContent = gpuText;
+          document.getElementById("gpuMetric").textContent = targetModel.includes("Lite") ? "23%" : targetModel.includes("30B") ? "46%" : "53%";
+          document.getElementById("gpuBar").style.setProperty("--value", document.getElementById("gpuMetric").textContent);
+          loadStatus.textContent = "切换完成";
+          buttons.forEach((button) => (button.disabled = false));
+        }
+      }, 260);
+    }
+
+    document.getElementById("modelGrid").addEventListener("click", (event) => {
+      const card = event.target.closest(".model-card");
+      if (!card || card.classList.contains("active")) return;
+      simulateLoading(card.dataset.model, card.dataset.gpu);
+    });
+
+    document.getElementById("stopService").addEventListener("click", () => {
+      document.getElementById("serviceDot").className = "dot error";
+      document.getElementById("serviceText").textContent = "vLLM stopped";
+      document.getElementById("modelServiceMetric").textContent = "Stopped";
+    });
+
+    document.getElementById("startService").addEventListener("click", () => {
+      document.getElementById("serviceDot").className = "dot";
+      document.getElementById("serviceText").textContent = "vLLM running";
+      document.getElementById("modelServiceMetric").textContent = "Running";
+    });
+
+    document.getElementById("unloadModel").addEventListener("click", () => {
+      document.getElementById("activeModel").textContent = "未加载";
+      document.getElementById("loadedModelMetric").textContent = "未加载";
+      document.getElementById("gpuText").textContent = "0 / 80 GB";
+      document.getElementById("gpuMetric").textContent = "0%";
+      document.getElementById("gpuBar").style.setProperty("--value", "0%");
+      document.querySelectorAll(".model-card").forEach((card) => {
+        card.classList.remove("active");
+        const tag = card.querySelector(".status-tag");
+        tag.className = "status-tag pending";
+        tag.textContent = "未加载";
+      });
+    });
+
+    document.getElementById("datasetGrid").addEventListener("click", (event) => {
+      const card = event.target.closest(".dataset-card");
+      if (card) card.classList.toggle("selected");
+    });
+
+    document.getElementById("runDatasetTest").addEventListener("click", () => {
+      const selected = Array.from(document.querySelectorAll(".dataset-card.selected"));
+      const total = selected.reduce((sum, card) => sum + Number(card.dataset.size), 0) || 164;
+      const button = document.getElementById("runDatasetTest");
+      const progressText = document.getElementById("testProgressText");
+      const progressBar = document.getElementById("testProgressBar");
+      let done = 0;
+      button.disabled = true;
+      button.innerHTML = '<span class="spinner"></span>测试运行中';
+      const timer = setInterval(() => {
+        done = Math.min(total, done + Math.ceil(total / 9));
+        const percent = Math.round((done / total) * 100);
+        progressText.textContent = `${done} / ${total}`;
+        progressBar.style.setProperty("--value", percent + "%");
+        document.getElementById("passRate").textContent = (94 + percent / 35).toFixed(1) + "%";
+        document.getElementById("avgLatency").textContent = (13.6 - percent / 42).toFixed(1) + "s";
+        document.getElementById("failCount").textContent = Math.max(2, Math.round((100 - percent) / 7));
+        if (done >= total) {
+          clearInterval(timer);
+          button.disabled = false;
+          button.textContent = "一键运行测试";
+        }
+      }, 420);
+    });
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      })[char]);
+    }
   </script>
 </body>
 </html>

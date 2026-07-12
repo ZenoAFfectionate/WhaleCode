@@ -77,6 +77,14 @@ class Config(BaseModel):
     backup_max_per_file: int = 5                # 每个文件最多保留的旧版本数
     backup_retention_days: int = 7              # 备份保留天数
 
+    # Benchmark runtime profiles（Benchmark-P5）
+    bench_eval_cpu_seconds: int = 0
+    bench_eval_memory_bytes: int = 0
+    bench_eval_max_processes: int = 128
+    bench_eval_file_size_bytes: int = 256 * 1024 * 1024
+    bench_eval_network: bool = False
+    bench_eval_artifact_retention: int = 200
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置
@@ -87,7 +95,10 @@ class Config(BaseModel):
             BASH_ALLOW_NETWORK, BASH_MAX_CPU_SECONDS, BASH_MAX_PROCESSES,
             BASH_MAX_EXECUTION_MS, WEB_TOOLS_ENABLED, WEBFETCH_ALLOW_PRIVATE,
             LLM_MAX_RETRIES, LLM_RETRY_BASE_DELAY, LLM_RETRY_MAX_DELAY,
-            CODE_AGENT_MAX_STEPS
+            CODE_AGENT_MAX_STEPS, WHALE_BENCH_EVAL_CPU_SECONDS,
+            WHALE_BENCH_EVAL_MEMORY_BYTES, WHALE_BENCH_EVAL_MAX_PROCESSES,
+            WHALE_BENCH_EVAL_FILE_SIZE_BYTES, WHALE_BENCH_EVAL_NETWORK,
+            WHALE_BENCH_EVAL_ARTIFACT_RETENTION
         """
         def _bool(name: str, default: bool) -> bool:
             raw = os.getenv(name)
@@ -141,6 +152,12 @@ class Config(BaseModel):
         kwargs["llm_retry_base_delay"] = _float("LLM_RETRY_BASE_DELAY", cls.model_fields["llm_retry_base_delay"].default)
         kwargs["llm_retry_max_delay"] = _float("LLM_RETRY_MAX_DELAY", cls.model_fields["llm_retry_max_delay"].default)
         kwargs["code_agent_max_steps"] = _int("CODE_AGENT_MAX_STEPS", cls.model_fields["code_agent_max_steps"].default)
+        kwargs["bench_eval_cpu_seconds"] = _int("WHALE_BENCH_EVAL_CPU_SECONDS", cls.model_fields["bench_eval_cpu_seconds"].default)
+        kwargs["bench_eval_memory_bytes"] = _int("WHALE_BENCH_EVAL_MEMORY_BYTES", cls.model_fields["bench_eval_memory_bytes"].default)
+        kwargs["bench_eval_max_processes"] = _int("WHALE_BENCH_EVAL_MAX_PROCESSES", cls.model_fields["bench_eval_max_processes"].default)
+        kwargs["bench_eval_file_size_bytes"] = _int("WHALE_BENCH_EVAL_FILE_SIZE_BYTES", cls.model_fields["bench_eval_file_size_bytes"].default)
+        kwargs["bench_eval_network"] = _bool("WHALE_BENCH_EVAL_NETWORK", cls.model_fields["bench_eval_network"].default)
+        kwargs["bench_eval_artifact_retention"] = _int("WHALE_BENCH_EVAL_ARTIFACT_RETENTION", cls.model_fields["bench_eval_artifact_retention"].default)
 
         return cls(**kwargs)
 

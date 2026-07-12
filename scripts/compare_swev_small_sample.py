@@ -30,7 +30,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "SWEV" / "test.jsonl"
+DEFAULT_BENCH_DATA_ROOT = Path(os.getenv("WHALE_BENCH_DATA_ROOT", "/home/kemove/CodeingAgent/data"))
+DEFAULT_DATA_PATH = DEFAULT_BENCH_DATA_ROOT / "SWEV" / "test.jsonl"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "_results"
 BOOTSTRAP_CODE = """
 import sys, types

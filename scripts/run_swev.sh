@@ -19,6 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-/home/kemove/CodeingAgent/data}"
 
 # Load environment variables
 if [ -f "$PROJECT_ROOT/.env" ]; then
@@ -29,6 +30,7 @@ fi
 
 echo "=== SWE-bench Verified Benchmark (Phase 1: Agent Inference) ==="
 echo "Project root: $PROJECT_ROOT"
+echo "Data root: $BENCH_DATA_ROOT"
 echo ""
 
 cd "$PROJECT_ROOT"
@@ -44,7 +46,7 @@ from hello_agents.benchmark.swev_bench import main
 sys.argv = ['swev_bench'] + sys.argv[1:]
 main()
 " \
-    --data-path "$PROJECT_ROOT/data/SWEV/test.jsonl" \
+    --data-path "$BENCH_DATA_ROOT/SWEV/test.jsonl" \
     --output-dir "$PROJECT_ROOT/data/_results" \
     --repo-cache-dir "$PROJECT_ROOT/data/_repo_cache" \
     --workers "${SWEV_WORKERS:-1}" \

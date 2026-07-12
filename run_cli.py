@@ -56,6 +56,7 @@ INTERACTIVE_EXACT_COMMANDS = (
     "/tools",
     "/pwd",
     "/log",
+    "/trace",
     "/clear",
     "/sessions",
 )
@@ -66,6 +67,8 @@ INTERACTIVE_PREFIX_COMMANDS = (
     "/resume",
     "/compact",
 )
+REASONING_MODES = ("off", "summary", "preview", "full")
+DEFAULT_CLI_ARTIFACT_DIRNAME = "cli_artifacts"
 
 
 class InputBuffer:
@@ -559,6 +562,13 @@ class CLIUI:
         else:
             self.console.print(safe)
 
+    def status(self, message: str) -> None:
+        """Render a compact current-phase hint."""
+        if self.use_rich:
+            self.console.print(f"[dim cyan]{message}[/dim cyan]")
+        else:
+            print(message)
+
     def render_tools(self, agent) -> None:
         tools = sorted(agent.tool_registry.get_all_tools(), key=lambda item: item.name)
         if self.use_rich:
@@ -599,6 +609,32 @@ class CLIUI:
 
         for index, message in enumerate(items, start=1):
             print(f"{index}. [{message.role}] {message.content}")
+
+    def render_event_history(self, events: Iterable[dict], limit: Optional[int] = None) -> None:
+        """Render the structured CLI event timeline for debugging a turn."""
+        all_items = list(events)
+        items = all_items[-limit:] if limit and limit > 0 else all_items
+        if not items:
+            self.warning("Event trace is empty.")
+            return
+
+        start_index = max(1, len(all_items) - len(items) + 1)
+        if self.use_rich:
+            table = Table(title="Event Trace", border_style="cyan")
+            table.add_column("#", style="cyan", width=4)
+            table.add_column("Event", style="magenta", width=14)
+            table.add_column("Summary", style="white")
+            for index, event in enumerate(items, start=start_index):
+                table.add_row(
+                    str(index),
+                    str(event.get("event", "")),
+                    str(event.get("summary", "")),
+                )
+            self.console.print(table)
+            return
+
+        for index, event in enumerate(items, start=start_index):
+            print(f"{index}. [{event.get('event', '')}] {event.get('summary', '')}")
 
     def render_sessions(self, sessions: list[dict]) -> None:
         if not sessions:
@@ -652,9 +688,32 @@ class CLICodeAgentMixin:
         self._todo_changed_this_turn = False
         self._todo_mutating_call_ids = set()
         self._todo_mutating_call_without_id = False
+        self._ensure_cli_runtime_state()
 
     # ── CLI-5: streaming line buffer ────────────────────────────────
     _streaming_line_buffer: str = ""
+
+    def _ensure_cli_runtime_state(self) -> None:
+        """Initialize per-CLI runtime state lazily for tests and resumed sessions."""
+        if not hasattr(self, "_cli_events"):
+            self._cli_events = []
+        if not hasattr(self, "_tool_call_state"):
+            self._tool_call_state = {}
+        if not hasattr(self, "reasoning_mode"):
+            self.reasoning_mode = "preview"
+
+    def _record_cli_event(self, event: str, summary: str, **fields) -> dict:
+        self._ensure_cli_runtime_state()
+        item = {"ts": time.time(), "event": event, "summary": summary}
+        item.update(fields)
+        self._cli_events.append(item)
+        if len(self._cli_events) > 500:
+            del self._cli_events[:-500]
+        return item
+
+    def get_cli_events(self) -> list[dict]:
+        self._ensure_cli_runtime_state()
+        return list(self._cli_events)
 
     def _console(self, message: str = "", *, end: str = "\n") -> None:
         if end == "" and hasattr(self, "_streaming_line_buffer"):
@@ -687,21 +746,107 @@ class CLICodeAgentMixin:
         text = str(first_val) if isinstance(first_val, str) else repr(first_val)
         return text[:max_len] + ("…" if len(text) > max_len else "")
 
+    @staticmethod
+    def _artifact_safe_name(value: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+        return safe[:40] or "artifact"
+
+    def _cli_artifact_root(self) -> Optional[Path]:
+        if getattr(self, "save_cli_artifacts", True) is False:
+            return None
+        base = getattr(self, "working_dir", None) or getattr(self, "project_root", None)
+        try:
+            root = Path(base).expanduser().resolve() if base else PROJECT_ROOT
+            configured = getattr(self, "cli_artifact_dir", None)
+            if configured:
+                artifact_root = Path(configured).expanduser()
+                if not artifact_root.is_absolute():
+                    artifact_root = root / artifact_root
+                artifact_root = artifact_root.resolve()
+            else:
+                artifact_root = root / "memory" / DEFAULT_CLI_ARTIFACT_DIRNAME
+            return artifact_root
+        except Exception:
+            return None
+
+    def _cli_artifact_dir(self, subdir: str) -> Optional[Path]:
+        try:
+            artifact_root = self._cli_artifact_root()
+            if artifact_root is None:
+                return None
+            path = artifact_root / subdir
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            return None
+
+    def _save_cli_artifact(self, subdir: str, stem: str, content: str) -> Optional[Path]:
+        if not content:
+            return None
+        directory = self._cli_artifact_dir(subdir)
+        if directory is None:
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = len(getattr(self, "_cli_events", [])) + 1
+        path = directory / f"{stamp}-{suffix:04d}-{self._artifact_safe_name(stem)}.txt"
+        try:
+            path.write_text(content, encoding="utf-8")
+            return path
+        except Exception:
+            return None
+
+    @staticmethod
+    def _short_path(path: Optional[Path]) -> str:
+        if path is None:
+            return ""
+        try:
+            return str(path.relative_to(Path.cwd()))
+        except Exception:
+            return str(path)
+
+    @staticmethod
+    def _reasoning_display_text(text: str, mode: str) -> str:
+        mode = mode if mode in REASONING_MODES else "preview"
+        if not text or mode == "off":
+            return ""
+        if mode == "full":
+            return text
+        if mode == "summary":
+            first_lines = [line.strip() for line in text.splitlines() if line.strip()]
+            summary = first_lines[0] if first_lines else text.strip()
+            return summary[:180] + ("…" if len(summary) > 180 or len(text) > len(summary) else "")
+        return text[:400] + ("…" if len(text) > 400 else "")
+
     # ── CLI-4: tool-result truncation ───────────────────────────────
     @staticmethod
     def _truncate_observation(text: str, lines: int = 10, cols: int = 200) -> str:
         """Return a head+tail preview of long tool output (CLI-4)."""
+        return CLICodeAgentMixin._truncate_observation_info(text, lines, cols)["display"]
+
+    @staticmethod
+    def _truncate_observation_info(text: str, lines: int = 10, cols: int = 200) -> dict:
+        """Return a head+tail preview of long tool output with metadata."""
         if not text:
-            return text
+            return {"display": text, "truncated": False, "omitted": 0, "line_count": 0}
         raw_lines = text.splitlines()
         if len(raw_lines) <= lines:
-            return text
+            return {
+                "display": text,
+                "truncated": False,
+                "omitted": 0,
+                "line_count": len(raw_lines),
+            }
         head = raw_lines[: lines - 2]
         tail = raw_lines[-2:]
         head_joined = "\n".join(line[:cols] for line in head)
         tail_joined = "\n".join(line[-cols:] for line in tail)
         omitted = len(raw_lines) - len(head) - len(tail)
-        return f"{head_joined}\n  ⋯ {omitted} lines omitted ⋯\n{tail_joined}"
+        return {
+            "display": f"{head_joined}\n  ⋯ {omitted} lines omitted ⋯\n{tail_joined}",
+            "truncated": True,
+            "omitted": omitted,
+            "line_count": len(raw_lines),
+        }
 
     # ── CLI-8: context pressure snapshot ────────────────────────────
     @staticmethod
@@ -719,11 +864,15 @@ class CLICodeAgentMixin:
     # ═══════════════════════════════════════════════════════════════
 
     def _render_event(self, event_type: str, payload: dict) -> None:
+        self._ensure_cli_runtime_state()
         # ── CLI-2: compact step header ──────────────────────
         if event_type == "step_start":
             step = payload.get("step", 0)
             ctx_info = self._context_snapshot(self) if isinstance(step, int) and step > 0 else ""
             self.ui.info(f"✦ Step {step}  {ctx_info}")
+            if hasattr(self.ui, "status"):
+                self.ui.status("Thinking...")
+            self._record_cli_event("step", f"Step {step} {ctx_info}".strip(), step=step)
             return
 
         if event_type in self._IGNORED_EVENTS:
@@ -733,9 +882,28 @@ class CLICodeAgentMixin:
         if event_type == "model_output":
             rc = str(payload.get("reasoning_content", "") or "")
             if rc:
-                self.ui.render_log_block(
-                    "thinking",
-                    rc[:400] + ("…" if len(rc) > 400 else ""),
+                path = self._save_cli_artifact(
+                    "reasoning",
+                    f"step-{payload.get('step', 'model')}",
+                    rc,
+                )
+                display = self._reasoning_display_text(
+                    rc,
+                    getattr(self, "reasoning_mode", "preview"),
+                )
+                hint = (
+                    f"full reasoning: {self._short_path(path)}"
+                    if path
+                    else "full reasoning retained in /trace"
+                )
+                if display:
+                    self.ui.render_log_block("thinking", f"{display}\n  ({hint})")
+                self._record_cli_event(
+                    "model_output",
+                    f"reasoning {len(rc)} chars; {hint}",
+                    reasoning=rc,
+                    reasoning_path=str(path) if path else None,
+                    mode=getattr(self, "reasoning_mode", "preview"),
                 )
             return
 
@@ -750,6 +918,9 @@ class CLICodeAgentMixin:
             return  # the chunk rendering already includes newlines
 
         if event_type == "compaction_notice":
+            if hasattr(self.ui, "status"):
+                self.ui.status("Compacting context...")
+            self._record_cli_event("status", "Compacting context")
             self.ui.render_log_block("warning", "[auto-compact triggered]")
         elif event_type == "llm_error":
             self.ui.render_log_block("error", f"LLM call failed: {payload.get('error', '')}")
@@ -764,10 +935,26 @@ class CLICodeAgentMixin:
             tool_name = payload.get("tool_name")
             arguments = payload.get("arguments", {})
             compact = self._compact_args(arguments)
+            tool_call_id = payload.get("tool_call_id") or f"__no_id_{len(self._tool_call_state) + 1}"
+            self._tool_call_state[tool_call_id] = {
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "compact": compact,
+                "started_at": time.time(),
+            }
+            if hasattr(self.ui, "status"):
+                self.ui.status(f"Running {tool_name}...")
             label = f"▸ {tool_name}"
             if compact:
                 label += f": {compact}"
             self.ui.render_log_block("action", label)
+            self._record_cli_event(
+                "tool_call",
+                label,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
 
             if tool_name == "TodoWrite" and isinstance(arguments, dict):
                 has_todos_payload = isinstance(arguments.get("todos"), list)
@@ -782,8 +969,50 @@ class CLICodeAgentMixin:
         elif event_type == "tool_result":
             kind = "error" if payload.get("status") == "error" else "observation"
             raw = str(payload.get("result_content", ""))
-            display = self._truncate_observation(raw)
+            info = self._truncate_observation_info(raw)
+            display = info["display"]
             tool_name = payload.get("tool_name")
+            tool_call_id = payload.get("tool_call_id")
+            state = self._tool_call_state.pop(tool_call_id, None) if tool_call_id else None
+            if state is None and len(self._tool_call_state) == 1:
+                fallback_id, state = next(iter(self._tool_call_state.items()))
+                self._tool_call_state.pop(fallback_id, None)
+
+            started_at = state.get("started_at") if state else None
+            elapsed = max(0.0, time.time() - started_at) if started_at else 0.0
+            display_tool_name = tool_name or (state or {}).get("tool_name") or "Tool"
+            status_text = str(payload.get("status", "") or "success").lower()
+            is_error = status_text == "error"
+            marker = "✗" if is_error else "✓"
+            line_count = info["line_count"]
+            size_text = f"{line_count} lines, {len(raw)} chars"
+            completion = f"{marker} {display_tool_name} {elapsed:.1f}s {size_text}"
+            output_path = None
+            if info["truncated"]:
+                output_path = self._save_cli_artifact("tool_outputs", str(display_tool_name), raw)
+                full_hint = (
+                    f"full output: {self._short_path(output_path)}"
+                    if output_path
+                    else "full output available in /log"
+                )
+                completion += f" (truncated; {full_hint})"
+                display = f"{display}\n  ({full_hint}; /trace shows event metadata)"
+            reason = str(payload.get("error") or payload.get("message") or "").strip()
+            if is_error and reason:
+                completion += f" - {reason[:120]}"
+            self.ui.render_log_block("error" if is_error else "action", completion)
+            self._record_cli_event(
+                "tool_result",
+                completion,
+                tool_call_id=tool_call_id,
+                tool_name=display_tool_name,
+                status=status_text,
+                elapsed_s=elapsed,
+                line_count=line_count,
+                char_count=len(raw),
+                truncated=info["truncated"],
+                full_output_path=str(output_path) if output_path else None,
+            )
 
             if tool_name == "TodoWrite":
                 tracked_ids = getattr(self, "_todo_mutating_call_ids", set())
@@ -847,6 +1076,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-trace",
         action="store_true",
         help="Disable trace logging for this run.",
+    )
+    parser.add_argument(
+        "--reasoning",
+        choices=REASONING_MODES,
+        default="preview",
+        help=(
+            "Control terminal reasoning display: off, summary, preview, or full. "
+            "Full reasoning is still saved to CLI artifacts when present."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        help=(
+            "Directory for full CLI artifacts such as reasoning and truncated tool outputs. "
+            "Relative paths are resolved under the workspace. Default: memory/cli_artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="Do not write full CLI reasoning/tool-output artifacts to disk.",
     )
     parser.add_argument(
         "--interactive",
@@ -928,6 +1178,9 @@ def create_agent(args, ui: CLIUI):
         enable_task_tool=True,
         ui=ui,
     )
+    agent.reasoning_mode = args.reasoning
+    agent.save_cli_artifacts = not args.no_artifacts
+    agent.cli_artifact_dir = args.artifact_dir
 
     if args.resume:
         resume_path = resolve_session_to_load(agent, args.resume, args.session_name)
@@ -1163,6 +1416,8 @@ def print_help(ui: CLIUI) -> None:
         "- /pwd                  Show the current working directory",
         "- /cd <path>            Change the agent working directory within the workspace",
         "- /history [n]          Show recent conversation turns",
+        "- /history --events [n] Show recent structured step/tool/model events",
+        "- /trace [n]            Show the structured event timeline",
         "- /log                  View all terminal output in a scrollable pager",
         "- /clear                Clear in-memory conversation history",
         "- /save [name]          Save a session snapshot into the session directory",
@@ -1190,6 +1445,7 @@ def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
     bash_tool = agent.tool_registry.get_tool("Bash") if agent.tool_registry else None
     bash_cpu = getattr(bash_tool, "max_cpu_seconds", "?") if bash_tool else "?"
     bash_net = getattr(bash_tool, "allow_network", False) if bash_tool else False
+    artifact_root = agent._cli_artifact_root() if hasattr(agent, "_cli_artifact_root") else None
 
     lines = [
         f"Workspace:        {workspace}",
@@ -1200,6 +1456,8 @@ def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
         f"Max steps:        {max_steps}  (current: {current_step})",
         f"Tokens used:      {total_tokens:,}",
         f"Context:          {ctx_used:,} / {ctx_window:,}  ({ctx_used*100/max(ctx_window,1):.0f}%)" if ctx_window else "Context:          N/A",
+        f"Reasoning view:   {getattr(agent, 'reasoning_mode', 'preview')}",
+        f"Artifacts:        {artifact_root if artifact_root else 'off'}",
         f"Trace:            {'on' if getattr(cfg, 'trace_enabled', False) else 'off'}",
         f"Session:          {'on' if getattr(agent, 'session_store', None) else 'off'}",
         f"Tools registered: {tool_count}",
@@ -1320,15 +1578,37 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             ui.error(f"cd failed: {exc}")
 
     def _cmd_history(raw, lowered):
-        parts = raw.split(maxsplit=1)
+        parts = raw.split()
+        limit = None
+        if len(parts) > 1 and parts[1] == "--events":
+            if len(parts) > 2:
+                try:
+                    limit = int(parts[2])
+                except ValueError:
+                    ui.warning("Usage: /history --events [n]")
+                    return
+            events = agent.get_cli_events() if hasattr(agent, "get_cli_events") else []
+            ui.render_event_history(events, limit=limit)
+            return
+        if len(parts) > 1:
+            try:
+                limit = int(parts[1])
+            except ValueError:
+                ui.warning("Usage: /history [n] or /history --events [n]")
+                return
+        ui.render_history(agent.get_history(), limit=limit)
+
+    def _cmd_trace(raw, lowered):
+        parts = raw.split()
         limit = None
         if len(parts) > 1:
             try:
-                limit = int(parts[1].strip())
+                limit = int(parts[1])
             except ValueError:
-                ui.warning("Usage: /history [n]")
+                ui.warning("Usage: /trace [n]")
                 return
-        ui.render_history(agent.get_history(), limit=limit)
+        events = agent.get_cli_events() if hasattr(agent, "get_cli_events") else []
+        ui.render_event_history(events, limit=limit)
 
     def _cmd_log(raw, lowered):
         if not ui.use_rich:
@@ -1399,6 +1679,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         "/tools": _cmd_tools,
         "/pwd": _cmd_pwd,
         "/log": _cmd_log,
+        "/trace": _cmd_trace,
         "/clear": _cmd_clear,
         "/sessions": _cmd_sessions,
     }

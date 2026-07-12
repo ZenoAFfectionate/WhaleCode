@@ -2,6 +2,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-/home/kemove/CodeingAgent/data}"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a
@@ -66,9 +67,11 @@ done
 run_aime() {
     local label="$1"
     shift
+    local data_path="$BENCH_DATA_ROOT/AIME/test_${label}.jsonl"
 
     echo "=== AIME Benchmark (${label}) ==="
     echo "Project root: $PROJECT_ROOT"
+    echo "Data root: $BENCH_DATA_ROOT"
     echo ""
 
     cd "$PROJECT_ROOT"
@@ -86,6 +89,7 @@ main()
 " \
         --output-dir "$PROJECT_ROOT/data/_results" \
         --timeout 60 \
+        --data-path "$data_path" \
         "$@" \
         "${passthrough_args[@]}"
 }

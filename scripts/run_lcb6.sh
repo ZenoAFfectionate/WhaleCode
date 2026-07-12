@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-/home/kemove/CodeingAgent/data}"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a
@@ -25,6 +26,7 @@ export PYTHONNOUSERSITE=1
 
 echo "=== LiveCodeBench v6 Benchmark ==="
 echo "Project root: $PROJECT_ROOT"
+echo "Data root: $BENCH_DATA_ROOT"
 echo "Python user site: disabled (PYTHONNOUSERSITE=1)"
 echo ""
 
@@ -41,6 +43,6 @@ from hello_agents.benchmark.lcb6_bench import main
 sys.argv = ['lcb6_bench'] + sys.argv[1:]
 main()
 " \
-    --data-path "$PROJECT_ROOT/data/LCB6/test.jsonl" \
+    --data-path "$BENCH_DATA_ROOT/LCB6/test.jsonl" \
     --output-dir "$PROJECT_ROOT/data/_results" \
     "$@"

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,15 +14,15 @@ try:
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
     )
+    from .runtime.python_adapters import PythonVerifierAdapter
 except ImportError:
     from base import (
         BenchmarkRunner,
         BENCHMARK_BASE_SYSTEM_PROMPT,
         _PROJECT_ROOT,
-        build_minimal_child_env,
     )
+    from runtime.python_adapters import PythonVerifierAdapter
 
 
 _CLEV_ADDENDUM = """\
@@ -249,31 +247,22 @@ def _evaluate_solution(
     test_code: str,
     timeout: int,
 ) -> tuple[bool, str]:
-    solution_code = solution_file.read_text(encoding="utf-8") if solution_file.exists() else fallback_solution
     test_code_literal = repr(test_code)
-    verify_code = (
-        f"{solution_code}\n\n"
-        f"{test_code}\n\n"
-        f"__CLEV_TEST_CODE__ = {test_code_literal}\n\n"
-        f"{_CLEV_HOST_EVAL_SUFFIX}\n"
-    )
-    try:
-        result = subprocess.run(
-            [sys.executable, "-"],
-            input=verify_code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(workspace),
-            env=build_minimal_child_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"TIMEOUT: hidden evaluation exceeded {timeout}s."
-    except Exception as exc:
-        return False, f"ERROR: host-side evaluation failed: {exc}"
 
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, output or ("All hidden tests passed!" if result.returncode == 0 else "Hidden evaluation failed.")
+    def _build_verify_code(solution_code: str) -> str:
+        return (
+            f"{solution_code}\n\n"
+            f"{test_code}\n\n"
+            f"__CLEV_TEST_CODE__ = {test_code_literal}\n\n"
+            f"{_CLEV_HOST_EVAL_SUFFIX}\n"
+        )
+
+    return PythonVerifierAdapter(_build_verify_code).evaluate(
+        workspace=workspace,
+        solution_file=solution_file,
+        fallback_solution=fallback_solution,
+        timeout=timeout,
+    )
 
 
 class ClassEvalBenchmark(BenchmarkRunner):

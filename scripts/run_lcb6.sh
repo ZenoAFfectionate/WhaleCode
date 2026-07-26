@@ -5,7 +5,7 @@
 #   bash scripts/run_lcb6.sh --limit 10         # First 10 tasks
 #   bash scripts/run_lcb6.sh --dry-run          # Dry run
 #   bash scripts/run_lcb6.sh --model gpt-4o     # Override model
-#   bash scripts/run_lcb6.sh --resume data/_results/lcb6_xxx.jsonl
+#   bash scripts/run_lcb6.sh --resume result/_results/lcb6_xxx.jsonl
 #                                             # Resume into a specific results file; rerun results replace same-task records
 
 set -euo pipefail
@@ -44,5 +44,5 @@ sys.argv = ['lcb6_bench'] + sys.argv[1:]
 main()
 " \
     --data-path "$BENCH_DATA_ROOT/LCB6/test.jsonl" \
-    --output-dir "$PROJECT_ROOT/data/_results" \
+    --output-dir "$PROJECT_ROOT/result/_results" \
     "$@"

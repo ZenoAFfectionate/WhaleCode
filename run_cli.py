@@ -22,17 +22,59 @@ CODE_DIR = PROJECT_ROOT / "code"
 
 try:
     from rich.align import Align
+    from rich.box import HEAVY, ROUNDED
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.rule import Rule
     from rich.table import Table
     from rich.text import Text
+    from rich.theme import Theme
 
     RICH_AVAILABLE = True
 except ImportError:
-    Align = Console = Markdown = Panel = Rule = Table = Text = None
+    Align = Console = Markdown = Panel = Rule = Table = Text = Theme = None
+    HEAVY = ROUNDED = None
     RICH_AVAILABLE = False
+
+
+class Palette:
+    """Central CLI color palette — mirrors the project Web showcase
+    (``asserts/whalecode_showcase.html``) so the terminal matches the brand:
+    a deep-navy dark theme with blue/cyan accents and slate muted text.
+    """
+
+    BG_PANEL = "#0b1220"     # panel fill (thinking / tool cards)
+    BORDER_DIM = "#243047"   # thin separators / step rule
+    ACCENT = "#3b82f6"       # primary (assistant / step)
+    CYAN = "#22d3ee"         # tools / links
+    THINKING = "#a78bfa"     # reasoning
+    SUCCESS = "#22c55e"      # success state
+    WARNING = "#f59e0b"      # warnings / truncation
+    ERROR = "#ef4444"        # errors
+    MUTED = "#64748b"        # metadata (elapsed, sizes, paths)
+    TEXT = "#f1f5f9"         # body text
+
+
+# A Rich theme built from the same palette so markup can use semantic names
+# (e.g. ``[muted]``) and console styling stays centralized (VR-6).
+if RICH_AVAILABLE:
+    WHALE_THEME = Theme(
+        {
+            "accent": Palette.ACCENT,
+            "accent.cyan": Palette.CYAN,
+            "thinking": Palette.THINKING,
+            "success": Palette.SUCCESS,
+            "warning": Palette.WARNING,
+            "error": Palette.ERROR,
+            "muted": Palette.MUTED,
+            "text": Palette.TEXT,
+            "border.dim": Palette.BORDER_DIM,
+            "panel.bg": f"on {Palette.BG_PANEL}",
+        }
+    )
+else:
+    WHALE_THEME = None
 
 try:
     from prompt_toolkit import PromptSession
@@ -53,7 +95,6 @@ INTERACTIVE_EXIT_WORDS = frozenset({"exit"})
 INTERACTIVE_EXACT_COMMANDS = (
     "/help",
     "/info",
-    "/tools",
     "/pwd",
     "/log",
     "/trace",
@@ -61,6 +102,7 @@ INTERACTIVE_EXACT_COMMANDS = (
     "/sessions",
 )
 INTERACTIVE_PREFIX_COMMANDS = (
+    "/tools",
     "/cd",
     "/history",
     "/save",
@@ -218,7 +260,37 @@ class CLIUI:
 
     def __init__(self, use_rich: bool = True):
         self.use_rich = bool(use_rich and RICH_AVAILABLE)
-        self.console = Console(record=True) if self.use_rich else None
+        self.console = (
+            Console(record=True, theme=WHALE_THEME) if self.use_rich else None
+        )
+
+    def spacer(self, n: int = 1) -> None:
+        """Emit *n* blank lines to keep a consistent vertical rhythm (VR-5)."""
+        for _ in range(max(0, n)):
+            if self.use_rich:
+                self.console.print("")
+            else:
+                print("")
+
+    def render_step_header(self, step, ctx_info: str = "") -> None:
+        """Render a ReAct step boundary (VR-5).
+
+        Rich mode draws a left-aligned dim rule with a leading blank line so
+        each step reads as its own paragraph; plain mode keeps the ``✦ Step N``
+        marker string that the transcript tests assert on.
+        """
+        label = f"✦ Step {step}"
+        if ctx_info:
+            label += f"  {ctx_info}"
+        if self.use_rich:
+            self.spacer(1)
+            # Pass a Text (not a str) so a bracketed ctx snapshot like
+            # "[ctx 3,200 / 100,000  3%]" is not eaten by Rich markup parsing.
+            self.console.print(
+                Rule(Text(label, style=Palette.MUTED), style=Palette.BORDER_DIM, align="left")
+            )
+        else:
+            print(label)
 
     def print(self, message: str = "") -> None:
         if self.use_rich:
@@ -469,16 +541,26 @@ class CLIUI:
         return normalized
 
     def render_assistant(self, text: str) -> None:
-        """CLI-6: render the model's final answer cleanly — no enclosing Panel.
+        """CLI-6 / VR-3: render the model's final answer.
 
-        A dim Rule above the answer visually separates tool-execution noise from
-        the human-readable response.
+        Rich mode boxes the answer in an accent-bordered panel so it reads as
+        the highest-weight block on screen; plain mode keeps the ``── Assistant ──``
+        rule text that the render tests assert on.
         """
         if not text.strip():
             return
         if self.use_rich:
-            self.console.print(Rule("Assistant", style="dim blue"))
-            self.console.print(Markdown(text))
+            self.spacer(1)
+            self.console.print(
+                Panel(
+                    Markdown(text),
+                    title="Whale ▸ Assistant",
+                    title_align="left",
+                    border_style=Palette.ACCENT,
+                    box=ROUNDED,
+                    padding=(1, 2),
+                )
+            )
         else:
             print(f"\n── Assistant ──")
             print(text)
@@ -542,6 +624,24 @@ class CLIUI:
 
         title, border, icon = self._LOG_BLOCK_STYLES.get(kind, (None, None, ""))
         icon_str = f"{icon} " if icon else ""
+
+        # VR-2: reasoning gets its own low-saturation panel in rich mode so the
+        # "what the model is thinking" block is clearly bounded and separable.
+        if kind == "thinking" and self.use_rich:
+            self.spacer(1)
+            self.console.print(
+                Panel(
+                    Text(content, style=f"italic {Palette.MUTED}"),
+                    title="🧠 thinking",
+                    title_align="left",
+                    border_style=Palette.THINKING,
+                    box=ROUNDED,
+                    padding=(0, 1),
+                    style=f"on {Palette.BG_PANEL}",
+                )
+            )
+            return
+
         # Secondary tier: compact dim line.
         if kind in ("action", "thinking", "observation", "info"):
             if self.use_rich:
@@ -556,11 +656,84 @@ class CLIUI:
             print(f"{prefix}{content}")
             return
 
+        # Primary tier: warning / error / background — boxed for visibility.
         safe = Text(content)
         if title:
-            self.console.print(Panel(safe, title=title, border_style=border, width=self.console.width))
+            border_map = {
+                "Warning": Palette.WARNING,
+                "Error": Palette.ERROR,
+                "Background Update": Palette.CYAN,
+            }
+            box_style = border_map.get(title, border)
+            self.spacer(1)
+            self.console.print(
+                Panel(
+                    safe,
+                    title=f"{icon_str}{title}".strip(),
+                    title_align="left",
+                    border_style=box_style,
+                    box=HEAVY,
+                    padding=(0, 1),
+                    width=self.console.width,
+                )
+            )
         else:
             self.console.print(safe)
+
+    def render_tool_card(
+        self,
+        tool_name: str,
+        arg_summary: str = "",
+        *,
+        is_error: bool = False,
+        elapsed: float = 0.0,
+        meta: str = "",
+        body: str = "",
+    ) -> None:
+        """VR-4: render one tool call+result as a single bounded card.
+
+        The title carries the tool name and a compact argument summary; the
+        right-aligned subtitle carries the status marker, elapsed time and size;
+        the body holds the (already head/tail-truncated) output preview. A
+        leading blank line keeps cards visually separated.
+        """
+        marker = "✗" if is_error else "✓"
+        border = Palette.ERROR if is_error else Palette.SUCCESS
+
+        if not self.use_rich:
+            line = f"{marker} {tool_name} {elapsed:.1f}s {meta}".rstrip()
+            print(line)
+            if body:
+                print(body)
+            return
+
+        title = Text()
+        title.append(f"▸ {tool_name}", style=Palette.CYAN)
+        if arg_summary:
+            title.append(f"  {arg_summary}", style=Palette.MUTED)
+
+        subtitle = Text()
+        subtitle.append(marker, style=border)
+        tail = f" {elapsed:.1f}s"
+        if meta:
+            tail += f" · {meta}"
+        subtitle.append(tail, style=Palette.MUTED)
+
+        card_body = Text(body if body else "(no output)", style=Palette.MUTED)
+        self.spacer(1)
+        self.console.print(
+            Panel(
+                card_body,
+                title=title,
+                title_align="left",
+                subtitle=subtitle,
+                subtitle_align="right",
+                border_style=border,
+                box=ROUNDED,
+                padding=(0, 1),
+                style=f"on {Palette.BG_PANEL}",
+            )
+        )
 
     def status(self, message: str) -> None:
         """Render a compact current-phase hint."""
@@ -569,22 +742,88 @@ class CLIUI:
         else:
             print(message)
 
-    def render_tools(self, agent) -> None:
+    # ── VR-4b: /tools categorization ────────────────────────────────
+    _TOOL_CATEGORY = {
+        "Read": "File", "Write": "File", "Edit": "File", "MultiEdit": "File",
+        "LS": "File", "Delete": "File", "Glob": "File", "Grep": "File",
+        "Bash": "Shell",
+        "WebFetch": "Web", "WebSearch": "Web",
+        "TodoWrite": "Planning", "Task": "Planning", "AskUser": "Planning",
+    }
+    _TOOL_TAGS = {
+        "Read": ("read",), "LS": ("read",), "Glob": ("read",), "Grep": ("read",),
+        "Write": ("write",), "Edit": ("write",), "MultiEdit": ("write",),
+        "Delete": ("write", "risk"),
+        "Bash": ("shell", "risk"),
+        "WebFetch": ("net",), "WebSearch": ("net",),
+        "TodoWrite": ("plan",), "Task": ("plan",), "AskUser": ("ask",),
+    }
+    _TOOL_CATEGORY_ORDER = ("File", "Shell", "Web", "Planning", "Benchmark", "Other")
+
+    @classmethod
+    def _tool_category(cls, name: str) -> str:
+        return cls._TOOL_CATEGORY.get(name, "Other")
+
+    @classmethod
+    def _tool_tags(cls, name: str) -> tuple:
+        return cls._TOOL_TAGS.get(name, ())
+
+    def render_tools(self, agent, full: bool = False) -> None:
         tools = sorted(agent.tool_registry.get_all_tools(), key=lambda item: item.name)
-        if self.use_rich:
-            table = Table(title="Registered Tools", border_style="cyan")
-            table.add_column("Tool", style="bold cyan")
-            table.add_column("Description", style="white")
+
+        # Full view: complete schema-style table with descriptions.
+        if full:
+            if self.use_rich:
+                table = Table(title="Registered Tools (full)", border_style=Palette.CYAN)
+                table.add_column("Tool", style=f"bold {Palette.CYAN}")
+                table.add_column("Category", style=Palette.MUTED)
+                table.add_column("Description", style=Palette.TEXT)
+                for tool in tools:
+                    description = (tool.description or "").strip().replace("\n", " ")
+                    table.add_row(tool.name, self._tool_category(tool.name), description)
+                self.console.print(table)
+                return
+            print("Registered tools (full):")
             for tool in tools:
                 description = (tool.description or "").strip().replace("\n", " ")
-                table.add_row(tool.name, description)
-            self.console.print(table)
+                print(f"- [{self._tool_category(tool.name)}] {tool.name}: {description}")
             return
 
-        print("Registered tools:")
+        # Default view: compact, category-grouped, scannable.
+        from collections import defaultdict
+
+        groups = defaultdict(list)
         for tool in tools:
-            description = (tool.description or "").strip().replace("\n", " ")
-            print(f"- {tool.name}: {description}")
+            groups[self._tool_category(tool.name)].append(tool)
+        ordered = [c for c in self._TOOL_CATEGORY_ORDER if c in groups]
+
+        if not self.use_rich:
+            print("Registered tools  (/tools --full for schemas):")
+            for cat in ordered:
+                names = ", ".join(t.name for t in groups[cat])
+                print(f"  {cat}: {names}")
+            return
+
+        self.console.print(
+            Rule(
+                Text("Registered Tools  ·  /tools --full for schemas", style=Palette.MUTED),
+                style=Palette.BORDER_DIM,
+                align="left",
+            )
+        )
+        for cat in ordered:
+            header = Text(f"{cat}", style=f"bold {Palette.ACCENT}")
+            self.console.print(header)
+            row = Text("  ")
+            for i, tool in enumerate(groups[cat]):
+                if i:
+                    row.append("   ")
+                row.append(tool.name, style=Palette.TEXT)
+                tags = self._tool_tags(tool.name)
+                if tags:
+                    row.append(f" [{'/'.join(tags)}]", style=Palette.MUTED)
+            self.console.print(row)
+            self.spacer(1)
 
     def render_history(self, history: Iterable, limit: Optional[int] = None) -> None:
         all_items = list(history)
@@ -746,6 +985,77 @@ class CLICodeAgentMixin:
         text = str(first_val) if isinstance(first_val, str) else repr(first_val)
         return text[:max_len] + ("…" if len(text) > max_len else "")
 
+    # ── VR-4: per-tool argument summarizer ──────────────────────────
+    @staticmethod
+    def _summarize_tool_args(tool_name: str, arguments, max_len: int = 120) -> str:
+        """Render a tool-specific, human-scannable argument summary.
+
+        Falls back to the generic :meth:`_compact_args` for unknown tools.
+        Only covers tools that actually exist in this repo's registry.
+        """
+        if not isinstance(arguments, dict) or not arguments:
+            return ""
+
+        def _clip(value: str) -> str:
+            value = str(value)
+            return value[:max_len] + ("…" if len(value) > max_len else "")
+
+        name = (tool_name or "").strip()
+
+        if name == "Bash":
+            cmd = str(arguments.get("command", "")).strip()
+            if not cmd:
+                return ""
+            lines = cmd.splitlines()
+            summary = _clip(lines[0])
+            if len(lines) > 1 and not summary.endswith("…"):
+                summary += "…"
+            return summary
+        if name in ("Read", "LS", "Delete"):
+            path = str(arguments.get("path", "")).strip()
+            offset = arguments.get("offset")
+            return f"{path}:{offset}" if path and offset else path
+        if name == "Write":
+            path = str(arguments.get("path", "")).strip()
+            content = arguments.get("content", "")
+            size = len(content) if isinstance(content, str) else 0
+            return f"{path} ({size} chars)" if path else f"{size} chars"
+        if name == "Edit":
+            path = str(arguments.get("path", "")).strip()
+            return f"{path} (replace all)" if arguments.get("replace_all") else path
+        if name in ("Grep", "Glob"):
+            pattern = str(arguments.get("pattern", "")).strip()
+            path = str(arguments.get("path", "")).strip()
+            include = str(arguments.get("include", "")).strip()
+            summary = pattern
+            if path:
+                summary += f" in {path}"
+            if include:
+                summary += f" ({include})"
+            return _clip(summary)
+        if name == "WebSearch":
+            return _clip(str(arguments.get("query", "")).strip())
+        if name == "WebFetch":
+            return _clip(str(arguments.get("url", "")).strip())
+        if name == "TodoWrite":
+            todos = arguments.get("todos")
+            if isinstance(todos, list):
+                total = len(todos)
+                done = sum(
+                    1 for t in todos if isinstance(t, dict) and t.get("status") == "completed"
+                )
+                active = sum(
+                    1 for t in todos if isinstance(t, dict) and t.get("status") == "in_progress"
+                )
+                summary = f"{total} tasks · {done} done"
+                if active:
+                    summary += f" · {active} active"
+                return summary
+            return ""
+
+        # Unknown tool → generic summary.
+        return CLICodeAgentMixin._compact_args(arguments, max_len)
+
     @staticmethod
     def _artifact_safe_name(value: str) -> str:
         safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
@@ -869,7 +1179,10 @@ class CLICodeAgentMixin:
         if event_type == "step_start":
             step = payload.get("step", 0)
             ctx_info = self._context_snapshot(self) if isinstance(step, int) and step > 0 else ""
-            self.ui.info(f"✦ Step {step}  {ctx_info}")
+            if hasattr(self.ui, "render_step_header"):
+                self.ui.render_step_header(step, ctx_info)
+            else:
+                self.ui.info(f"✦ Step {step}  {ctx_info}")
             if hasattr(self.ui, "status"):
                 self.ui.status("Thinking...")
             self._record_cli_event("step", f"Step {step} {ctx_info}".strip(), step=step)
@@ -891,16 +1204,19 @@ class CLICodeAgentMixin:
                     rc,
                     getattr(self, "reasoning_mode", "preview"),
                 )
-                hint = (
-                    f"full reasoning: {self._short_path(path)}"
-                    if path
-                    else "full reasoning retained in /trace"
-                )
                 if display:
-                    self.ui.render_log_block("thinking", f"{display}\n  ({hint})")
+                    self.ui.render_log_block("thinking", display)
+                    # When the preview was truncated, point to the saved full
+                    # reasoning artifact (mirrors the tool-output "full output"
+                    # hint) so nothing is silently lost.
+                    if display != rc and path:
+                        self.ui.render_log_block(
+                            "observation",
+                            f"  (full reasoning: {self._short_path(path)})",
+                        )
                 self._record_cli_event(
                     "model_output",
-                    f"reasoning {len(rc)} chars; {hint}",
+                    f"reasoning {len(rc)} chars",
                     reasoning=rc,
                     reasoning_path=str(path) if path else None,
                     mode=getattr(self, "reasoning_mode", "preview"),
@@ -934,7 +1250,7 @@ class CLICodeAgentMixin:
         elif event_type == "tool_call":
             tool_name = payload.get("tool_name")
             arguments = payload.get("arguments", {})
-            compact = self._compact_args(arguments)
+            compact = self._summarize_tool_args(tool_name, arguments)
             tool_call_id = payload.get("tool_call_id") or f"__no_id_{len(self._tool_call_state) + 1}"
             self._tool_call_state[tool_call_id] = {
                 "tool_name": tool_name,
@@ -947,7 +1263,10 @@ class CLICodeAgentMixin:
             label = f"▸ {tool_name}"
             if compact:
                 label += f": {compact}"
-            self.ui.render_log_block("action", label)
+            # Rich mode defers this header into the unified tool card rendered
+            # at tool_result (VR-4); plain mode prints it now (transcript contract).
+            if not getattr(self.ui, "use_rich", False):
+                self.ui.render_log_block("action", label)
             self._record_cli_event(
                 "tool_call",
                 label,
@@ -1000,7 +1319,25 @@ class CLICodeAgentMixin:
             reason = str(payload.get("error") or payload.get("message") or "").strip()
             if is_error and reason:
                 completion += f" - {reason[:120]}"
-            self.ui.render_log_block("error" if is_error else "action", completion)
+
+            # VR-4: rich mode merges call + result into one bounded card; plain
+            # mode keeps the two-line completion + body contract for the tests.
+            rich_card = getattr(self.ui, "use_rich", False) and hasattr(
+                self.ui, "render_tool_card"
+            )
+            if rich_card:
+                arg_summary = (state or {}).get("compact", "") if state else ""
+                card_meta = size_text + ("  (truncated)" if info["truncated"] else "")
+                self.ui.render_tool_card(
+                    display_tool_name,
+                    arg_summary,
+                    is_error=is_error,
+                    elapsed=elapsed,
+                    meta=card_meta,
+                    body=display,
+                )
+            else:
+                self.ui.render_log_block("error" if is_error else "action", completion)
             self._record_cli_event(
                 "tool_result",
                 completion,
@@ -1029,8 +1366,11 @@ class CLICodeAgentMixin:
                 elif tracked_wo_id:
                     self._todo_mutating_call_without_id = False
 
-            # For observation, only show head. For errors, keep full.
-            self.ui.render_log_block(kind, display)
+            # Plain mode prints the observation body separately (rich already
+            # folded it into the card above).
+            if not rich_card:
+                # For observation, only show head. For errors, keep full.
+                self.ui.render_log_block(kind, display)
         elif event_type == "agent_error":
             self.ui.render_log_block("error", payload.get("message", ""))
         elif event_type == "background_update":
@@ -1412,7 +1752,7 @@ def print_help(ui: CLIUI) -> None:
         "Commands:",
         "- /help                 Show this help message",
         "- /info                 Show workspace, model, and runtime info",
-        "- /tools                Show registered tools and descriptions",
+        "- /tools [--full]       Show registered tools grouped by category (--full for schemas)",
         "- /pwd                  Show the current working directory",
         "- /cd <path>            Change the agent working directory within the workspace",
         "- /history [n]          Show recent conversation turns",
@@ -1469,7 +1809,23 @@ def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
         print("\n".join(lines))
 
 
-def build_prompt_reader(history_file: Path):
+def _input_style_tokens() -> dict:
+    """prompt_toolkit style tokens for the input zone (VR-1).
+
+    The ``chip`` (prompt glyph) and ``toolbar`` (status bar) both carry a
+    ``bg:`` so the input area is visibly backed by a dark surface — the signal
+    that "this is where you type".
+    """
+    return {
+        "chip": f"bg:{Palette.BG_PANEL} {Palette.CYAN} bold",
+        "toolbar": f"bg:#0f172a {Palette.MUTED}",
+        "placeholder": Palette.MUTED,
+        "user": f"{Palette.CYAN} bold",
+        "arrow": f"{Palette.ACCENT} bold",
+    }
+
+
+def build_prompt_reader(history_file: Path, status_provider=None):
     if PROMPT_TOOLKIT_AVAILABLE and sys.stdin.isatty():
         from prompt_toolkit.filters import in_paste_mode
 
@@ -1505,17 +1861,26 @@ def build_prompt_reader(history_file: Path):
             """Insert a literal newline on Esc+Enter (manual multi-line)."""
             event.current_buffer.insert_text("\n")
 
+        def _bottom_toolbar():
+            """Full-width status bar under the input (VR-1) — gives the input
+            area a visible bottom border/background so it reads as a field."""
+            if not status_provider:
+                return None
+            try:
+                return HTML(f"<toolbar> {status_provider()} </toolbar>")
+            except Exception:
+                return None
+
         session = PromptSession(
             history=FileHistory(str(history_file)),
-            style=PromptStyle.from_dict(
-                {
-                    "user": "#00ff99 bold",
-                    "arrow": "#00aaff bold",
-                }
-            ),
+            style=PromptStyle.from_dict(_input_style_tokens()),
             multiline=True,
             mouse_support=False,
             key_bindings=bindings,
+            bottom_toolbar=_bottom_toolbar,
+            placeholder=HTML(
+                "<placeholder>输入需求，Enter 发送 · Esc+Enter 换行 · /help 查看命令</placeholder>"
+            ),
             prompt_continuation=lambda width, line_number, wrap_count: " " * width,
         )
 
@@ -1523,7 +1888,7 @@ def build_prompt_reader(history_file: Path):
         session.default_buffer.on_text_changed += _on_text_changed
 
         def read_prompt() -> str:
-            return session.prompt(HTML("<user>user</user> <arrow>➜</arrow> ")).strip()
+            return session.prompt(HTML("<chip> ▌ › </chip> ")).strip()
 
         return read_prompt
 
@@ -1545,7 +1910,18 @@ def run_once(agent, prompt: str, ui: CLIUI) -> int:
 def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
     history_file = Path(args.history_file).expanduser() if args.history_file else default_history_file(workspace)
     history_file.parent.mkdir(parents=True, exist_ok=True)
-    read_prompt = build_prompt_reader(history_file)
+
+    def _prompt_status() -> str:
+        model = getattr(getattr(agent, "llm", None), "model", "?")
+        mode = getattr(agent, "reasoning_mode", "preview")
+        wd = getattr(agent, "working_dir", str(workspace))
+        try:
+            wd = str(wd).replace(str(Path.home()), "~", 1)
+        except Exception:
+            pass
+        return f"{model}  ·  reasoning:{mode}  ·  {wd}"
+
+    read_prompt = build_prompt_reader(history_file, status_provider=_prompt_status)
 
     input_buffer = InputBuffer()
 
@@ -1558,7 +1934,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         show_runtime_info(agent, workspace, ui)
 
     def _cmd_tools(raw, lowered):
-        ui.render_tools(agent)
+        ui.render_tools(agent, full="--full" in raw)
 
     def _cmd_pwd(raw, lowered):
         ui.info(f"Current working directory: {getattr(agent, 'working_dir', workspace)}")
@@ -1676,7 +2052,6 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
     _exact_cmds = {
         "/help": _cmd_help,
         "/info": _cmd_info,
-        "/tools": _cmd_tools,
         "/pwd": _cmd_pwd,
         "/log": _cmd_log,
         "/trace": _cmd_trace,
@@ -1686,6 +2061,7 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
 
     # Prefix-match commands (lowered.startswith(key))
     _prefix_cmds = [
+        ("/tools", _cmd_tools),
         ("/cd", _cmd_cd),
         ("/history", _cmd_history),
         ("/save", _cmd_save),

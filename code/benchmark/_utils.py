@@ -198,6 +198,8 @@ def build_benchmark_system_prompt(project_root: Path) -> str:
     text = re.sub(r"- \*\*AskUser\*\*.*\n", "", text)
     text = re.sub(r"- \*\*WebSearch\*\*.*\n", "", text)
     text = re.sub(r"- \*\*WebFetch\*\*.*\n", "", text)
+    # Remove interactive-mode convenience that contradicts benchmark requirements
+    text = re.sub(r"- You may answer directly in plain text[^\n]*\n", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     benchmark_runtime_notes = """
@@ -205,8 +207,20 @@ def build_benchmark_system_prompt(project_root: Path) -> str:
 
 ## Benchmark Runtime Notes
 
-- `TodoWrite` is optional in benchmark runs. Use it only when genuine multi-step planning is worth the step budget.
-- When a submission is ready, call `Finish` alone after all other tool work is complete.
+- This is a benchmark evaluation run. There is no human in the loop.
+- **Always call `Finish` to submit.** The evaluation system only processes
+  `Finish` tool calls. Plain-text answers will be treated as incomplete —
+  the task will time out without being evaluated.
+- Call `Finish` alone after all other tool work is complete. Do not bundle
+  `Finish` with other tool calls in the same response.
+- `TodoWrite` is optional. Use it only when genuine multi-step planning is
+  worth the step budget.
+- If you are a reasoning / thinking model: think concisely, then act.
+  After you have a plan, transition to tool calls promptly. Do not spend
+  excessive tokens on reasoning — the evaluation rewards correct code, not
+  elaborate analysis.
+- Hidden tests run outside the workspace. Do not attempt to read, import,
+  or access hidden test data in any way.
 """
     return text.strip() + "\n\n" + benchmark_runtime_notes.strip() + "\n"
 

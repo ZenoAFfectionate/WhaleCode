@@ -48,19 +48,16 @@ pip install -r requirements.txt
 ### Running the Agent
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3.6-27B-FP8 \
+CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --port 8000 \
-    --tensor-parallel-size 2 \
     --max-model-len 262144 \
     --max-num-seqs 2 \
-    --gpu-memory-utilization 0.92 \
+    --gpu-memory-utilization 0.95 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
     --language-model-only \
-    --enable-prefix-caching \
-    --enable-chunked-prefill \
     --enable-auto-tool-choice \
-    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'
+    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
 ```
 
 ```bash

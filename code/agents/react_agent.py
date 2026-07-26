@@ -1,6 +1,5 @@
 """ReAct agent built on top of tool-calling chat models."""
 
-import asyncio
 import json
 from copy import deepcopy
 from dataclasses import dataclass
@@ -113,6 +112,8 @@ class _ExecutionState:
     stagnation_detected: bool = False
     last_reasoning_content: Optional[str] = None
     last_reasoning_source: Optional[str] = None
+    last_finish_reason: Optional[str] = None
+    truncation_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -331,9 +332,6 @@ class ReActAgent(Agent):
 
     def _render_agent_error(self, message: str) -> None:
         self._render_event("agent_error", {"message": message})
-
-    def add_tool(self, tool) -> None:
-        self.tool_registry.register_tool(tool)
 
     @staticmethod
     def _builtin_tool_names() -> tuple[str, str]:
@@ -596,6 +594,17 @@ class ReActAgent(Agent):
         return normalized if normalized >= 0 else 0
 
     @staticmethod
+    def _apply_prompt_instruction(messages: List[Dict[str, Any]], instruction: str) -> None:
+        """向 messages 的第一个 system 消息追加 instruction；无 system 则插入。"""
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content", "")
+            message["content"] = f"{content}\n\n{instruction}" if content else instruction
+            return
+        messages.insert(0, {"role": "system", "content": instruction})
+
+    @staticmethod
     def _builtin_tool_instruction() -> str:
         return (
             "Builtin control tools are available.\n"
@@ -606,14 +615,7 @@ class ReActAgent(Agent):
         )
 
     def _apply_builtin_tool_prompt(self, messages: List[Dict[str, Any]]) -> None:
-        instruction = self._builtin_tool_instruction()
-        for message in messages:
-            if message.get("role") != "system":
-                continue
-            content = message.get("content", "")
-            message["content"] = f"{content}\n\n{instruction}" if content else instruction
-            return
-        messages.insert(0, {"role": "system", "content": instruction})
+        self._apply_prompt_instruction(messages, self._builtin_tool_instruction())
 
     @staticmethod
     def _structured_output_instruction(spec: _StructuredOutputSpec) -> str:
@@ -630,14 +632,7 @@ class ReActAgent(Agent):
         messages: List[Dict[str, Any]],
         spec: _StructuredOutputSpec,
     ) -> None:
-        instruction = self._structured_output_instruction(spec)
-        for message in messages:
-            if message.get("role") != "system":
-                continue
-            content = message.get("content", "")
-            message["content"] = f"{content}\n\n{instruction}" if content else instruction
-            return
-        messages.insert(0, {"role": "system", "content": instruction})
+        self._apply_prompt_instruction(messages, self._structured_output_instruction(spec))
 
     @staticmethod
     def _tool_choice_for(structured_output: Optional[_StructuredOutputSpec]) -> str:
@@ -736,6 +731,14 @@ class ReActAgent(Agent):
 
     def _record_model_response(self, response: Any, current_step: int, state: _ExecutionState) -> Any:
         response_message = response.choices[0].message
+        # Capture the real finish_reason so truncated generations
+        # (finish_reason == "length") can be detected downstream.
+        try:
+            state.last_finish_reason = getattr(response.choices[0], "finish_reason", None)
+        except Exception:
+            state.last_finish_reason = None
+        if response_message.tool_calls:
+            state.truncation_retries = 0
         message_reasoning = extract_reasoning_payload(response_message)
         choice_reasoning = (
             extract_reasoning_payload(response.choices[0])
@@ -879,19 +882,13 @@ class ReActAgent(Agent):
         *,
         status: str,
     ) -> None:
-        if not self.trace_logger:
-            return
         duration = (datetime.now() - session_start_time).total_seconds()
-        self.trace_logger.log_event(
-            "session_end",
-            {
-                "duration": duration,
-                "total_steps": current_step,
-                "final_answer": final_answer,
-                "status": status,
-            },
+        self._finalize_trace(
+            status,
+            duration=duration,
+            total_steps=current_step,
+            final_answer=final_answer,
         )
-        self.trace_logger.finalize()
 
     def _complete_local_turn(
         self,
@@ -958,6 +955,12 @@ class ReActAgent(Agent):
         final_answer = text_content.strip() or fallback_text.strip()
         return final_answer or "Sorry, I could not answer this question."
 
+    _TRUNCATION_NUDGE = (
+        "Your previous response was cut off by the output token limit before it "
+        "produced a tool call. Do not restate your reasoning. Continue concisely "
+        "and emit the required tool call (or your final answer) now."
+    )
+
     def _resolve_no_tool_call_response(
         self,
         response_message: Any,
@@ -967,7 +970,43 @@ class ReActAgent(Agent):
         fallback_text: str = "",
         reasoning_content: Optional[str] = None,
         reasoning_source: Optional[str] = None,
+        state: Optional[_ExecutionState] = None,
     ) -> tuple[bool, Optional[str], Optional[str]]:
+        # Truncated generation (finish_reason == "length") with no tool call:
+        # instead of treating the empty/partial text as a final answer, nudge
+        # the model to continue and retry ONCE. A second consecutive truncation
+        # falls through to the original behavior.
+        truncated = (
+            state is not None
+            and state.last_finish_reason == "length"
+            and structured_output is None
+        )
+        if truncated and state.truncation_retries < 1:
+            state.truncation_retries += 1
+            if text_content.strip():
+                assistant_metadata = self._assistant_reasoning_metadata(
+                    reasoning_content=reasoning_content,
+                    reasoning_source=reasoning_source,
+                )
+                assistant_metadata["unfinished_response"] = True
+                self._append_history_message(
+                    Message(
+                        text_content,
+                        "assistant",
+                        metadata=assistant_metadata,
+                    ),
+                    allow_compact=False,
+                )
+            self._append_history_message(
+                Message(self._TRUNCATION_NUDGE, "user"),
+                allow_compact=False,
+            )
+            self._render_event(
+                "truncation_retry",
+                {"finish_reason": "length", "retry": state.truncation_retries},
+            )
+            return True, None, None
+
         if structured_output is None and not self._response_unfinished_flag(response_message):
             final_answer = self._direct_response_text(text_content, fallback_text=fallback_text)
             self._render_direct_response(
@@ -1265,6 +1304,7 @@ class ReActAgent(Agent):
 
     def run(self, input_text: str, **kwargs) -> str:
         session_start_time = datetime.now()
+        self._init_trace()
 
         try:
             final_answer = self._run_impl(input_text, session_start_time, **kwargs)
@@ -1273,6 +1313,7 @@ class ReActAgent(Agent):
             return final_answer
         except KeyboardInterrupt:
             self._console("\n⚠️ User interrupted, auto-saving session...")
+            self._finalize_trace("interrupted", message="run aborted by interruption")
             if self.session_store:
                 try:
                     filepath = self.save_session("session-interrupted")
@@ -1282,6 +1323,7 @@ class ReActAgent(Agent):
             raise
         except Exception as exc:
             self._console(f"\n❌ Error: {exc}")
+            self._finalize_trace("error", message=str(exc))
             if self.session_store:
                 try:
                     filepath = self.save_session("session-error")
@@ -1342,6 +1384,7 @@ class ReActAgent(Agent):
                     structured_output=structured_output,
                     reasoning_content=state.last_reasoning_content,
                     reasoning_source=state.last_reasoning_source,
+                    state=state,
                 )
                 if should_continue:
                     continue
@@ -1389,12 +1432,6 @@ class ReActAgent(Agent):
             include_reasoning=False,
         )
 
-    def _build_messages(self, input_text: Optional[str] = None) -> List[Dict[str, str]]:
-        return self.history_manager.build_llm_messages(
-            system_prompt=self._get_context_system_prompt(),
-            latest_user_input=input_text,
-        )
-
     def _before_model_call(self, messages: List[Dict[str, Any]], current_step: int) -> None:
         return None
 
@@ -1422,6 +1459,7 @@ class ReActAgent(Agent):
     ) -> str:
         session_start_time = datetime.now()
         start_step = self._normalize_start_step(kwargs.pop("start_step", 0))
+        self._init_trace()
 
         structured_output = self._extract_structured_output_spec(kwargs)
         tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
@@ -1485,6 +1523,7 @@ class ReActAgent(Agent):
                         structured_output=structured_output,
                         reasoning_content=state.last_reasoning_content,
                         reasoning_source=state.last_reasoning_source,
+                        state=state,
                     )
                     if should_continue:
                         continue
@@ -1565,6 +1604,7 @@ class ReActAgent(Agent):
                 include_reasoning=False,
             )
         except Exception as exc:
+            self._finalize_trace("error", message=str(exc))
             await self._emit_event(
                 EventType.AGENT_ERROR,
                 on_error,
@@ -1634,6 +1674,7 @@ class ReActAgent(Agent):
     ) -> AsyncGenerator[StreamEvent, None]:
         session_start_time = datetime.now()
         start_step = self._normalize_start_step(kwargs.pop("start_step", 0))
+        self._init_trace()
 
         structured_output = self._extract_structured_output_spec(kwargs)
         tool_choice = kwargs.pop("tool_choice", self._tool_choice_for(structured_output))
@@ -1726,6 +1767,7 @@ class ReActAgent(Agent):
                             fallback_text=full_response.strip(),
                             reasoning_content=state.last_reasoning_content,
                             reasoning_source=state.last_reasoning_source,
+                            state=state,
                         )
                         if should_continue:
                             continue
@@ -1755,7 +1797,7 @@ class ReActAgent(Agent):
                         return
 
                     self._append_assistant_tool_call_message(response_message)
-                    tool_results = await self._execute_tools_async_stream(
+                    tool_results = await self._execute_tools_async(
                         tool_calls,
                         state.current_step,
                         on_tool_call,
@@ -1872,6 +1914,7 @@ class ReActAgent(Agent):
                 )
         except Exception as exc:
             error_msg = f"Agent execution failed: {exc}"
+            self._finalize_trace("error", message=error_msg)
             yield StreamEvent.create(
                 StreamEventType.ERROR,
                 self.name,
@@ -1881,16 +1924,3 @@ class ReActAgent(Agent):
             await self._emit_event(EventType.AGENT_ERROR, on_error, error=error_msg)
             raise
 
-    async def _execute_tools_async_stream(
-        self,
-        tool_calls: List[Any],
-        current_step: int,
-        on_tool_call: LifecycleHook = None,
-        structured_output: Optional[_StructuredOutputSpec] = None,
-    ) -> List[tuple]:
-        return await self._execute_tools_async(
-            tool_calls,
-            current_step,
-            on_tool_call,
-            structured_output=structured_output,
-        )

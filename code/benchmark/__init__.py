@@ -7,8 +7,6 @@ from .hevp_bench import HumanEvalPlusBenchmark
 from .lcb6_bench import LCB6Benchmark
 from .mbpp_bench import MBPPPlusBenchmark
 from .swev_bench import SWEBenchVerifiedBenchmark
-from .term_bench import TerminalBench2Benchmark
-
 __all__ = [
     "BenchmarkRunner",
     "AIMEBenchmark",
@@ -17,5 +15,4 @@ __all__ = [
     "LCB6Benchmark",
     "MBPPPlusBenchmark",
     "SWEBenchVerifiedBenchmark",
-    "TerminalBench2Benchmark",
 ]

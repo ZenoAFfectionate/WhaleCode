@@ -73,32 +73,21 @@ class Agent(ABC):
             token_counter=self.token_counter,
             config=self.config,
         )
-        self._history_token_count = self.history_manager.get_token_count()
+        self._last_api_prompt_tokens = self.history_manager.get_last_api_prompt_tokens()
         self._history_estimated_token_count = self.history_manager.get_estimated_token_count()
 
         # 统一暴露截断器，便于工具层和测试使用相同的上下文能力
         from ..context.truncator import ObservationTruncator
-        self.truncator = ObservationTruncator(token_counter=self.token_counter)
+        from pathlib import Path
+        truncator_output_dir = str(Path("memory/tool-output").resolve())
+        self.truncator = ObservationTruncator(
+            token_counter=self.token_counter,
+            output_dir=truncator_output_dir,
+        )
 
-        # 新增：可观测性组件
+        # 新增：可观测性组件（trace_logger 按每轮 run/arun 创建，不在构造时初始化）
         from ..observability import TraceLogger
-
         self.trace_logger: Optional[TraceLogger] = None
-        if self.config.trace_enabled:
-            self.trace_logger = TraceLogger(
-                output_dir=self.config.trace_dir,
-                sanitize=self.config.trace_sanitize,
-                html_include_raw_response=self.config.trace_html_include_raw_response
-            )
-            # 记录会话开始
-            self.trace_logger.log_event(
-                "session_start",
-                {
-                    "agent_name": self.name,
-                    "agent_type": self.__class__.__name__,
-                    "config": self.config.model_dump() if hasattr(self.config, "model_dump") else self.config.dict()
-                }
-            )
 
         # 新增：Skills 知识外化组件
         from pathlib import Path
@@ -333,9 +322,77 @@ class Agent(ABC):
         """返回当前上下文使用的系统提示词。"""
         return self.system_prompt
 
+    def _build_messages(self, input_text: Optional[str] = None) -> List[Dict[str, Any]]:
+        """将历史投影为 LLM 可用的 chat messages 列表。
+
+        子类可通过覆盖 ``_get_context_system_prompt()`` 来定制 system prompt，
+        无需重写本方法。
+        """
+        return self.history_manager.build_llm_messages(
+            system_prompt=self._get_context_system_prompt(),
+            latest_user_input=input_text,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-run trace lifecycle
+    # ------------------------------------------------------------------
+
+    def _trace_session_metadata(self) -> Dict[str, Any]:
+        """子类覆盖以在 session_start 事件中添加额外字段。
+
+        CodeAgent 覆盖此方法添加 project_root / working_dir，
+        无需重写 run/arun/arun_stream 仅为了 trace 目的。
+        """
+        return {}
+
+    def _init_trace(self) -> None:
+        """为当前 run/arun/arun_stream 调用创建新的 TraceLogger。
+
+        每次调用会替换 self.trace_logger（旧实例如已 finalize 则被丢弃），
+        确保多轮对话和子代理场景下各自拥有独立的 trace 文件。
+        """
+        self.trace_logger = None
+        if not self.config.trace_enabled:
+            return
+        from ..observability import TraceLogger
+
+        self.trace_logger = TraceLogger(
+            output_dir=self.config.trace_dir,
+            sanitize=self.config.trace_sanitize,
+            html_include_raw_response=self.config.trace_html_include_raw_response,
+        )
+        self.trace_logger.log_event(
+            "session_start",
+            {
+                "agent_name": self.name,
+                "agent_type": self.__class__.__name__,
+                **self._trace_session_metadata(),
+            },
+        )
+
+    def _finalize_trace(self, status: str, **extra_payload: Any) -> None:
+        """安全地结束当前 trace 会话。
+
+        当 trace_logger 为 None 或已关闭时静默跳过（ReActAgent 成功路径中
+        已通过 _finalize_trace_session 调用 finalize，本方法作为兜底保障
+        异常路径下的 trace 完整性）。
+        """
+        if not self.trace_logger:
+            return
+        try:
+            if not self.trace_logger.jsonl_file.closed:
+                duration_payload: Dict[str, Any] = {"status": status}
+                duration_payload.update(extra_payload)
+                self.trace_logger.log_event("session_end", duration_payload)
+                self.trace_logger.finalize()
+        except Exception:
+            pass
+        finally:
+            self.trace_logger = None
+
     def _sync_history_token_count(self) -> None:
         """同步 HistoryManager 内缓存的真实 usage 与本地估算值。"""
-        self._history_token_count = self.history_manager.get_token_count()
+        self._last_api_prompt_tokens = self.history_manager.get_last_api_prompt_tokens()
         self._history_estimated_token_count = self.history_manager.get_estimated_token_count()
 
     def _append_history_message(self, message: Message, *, allow_compact: bool = True) -> None:
@@ -746,6 +803,19 @@ class Agent(ABC):
         if todo_state is not None and hasattr(tool, "import_state"):
             tool.import_state(todo_state)
 
+    def _get_enriched_session_metadata(self) -> Dict[str, Any]:
+        """构建富含 HistoryManager 状态（rounds, usage）的会话元数据。
+
+        HistoryManager.to_dict() 包含 rounds 计数和 usage 快照，
+        将其合并到 session metadata 中，确保会话恢复时不会丢失这些信息。
+        """
+        hm_state = self.history_manager.to_dict()
+        return {
+            **self._session_metadata,
+            "rounds": hm_state.get("rounds", 0),
+            "usage": hm_state.get("usage", {}),
+        }
+
     def _auto_save(self):
         """自动保存会话（静默失败）"""
         if not self.session_store:
@@ -758,7 +828,7 @@ class Agent(ABC):
                 history=self.history_manager.get_history(),
                 tool_schema_hash=self._compute_tool_schema_hash(),
                 read_cache=self._get_read_cache(),
-                metadata=self._session_metadata,
+                metadata=self._get_enriched_session_metadata(),
                 session_name="session-auto",
                 session_id=self.session_id,
                 todo_state=self._capture_todowrite_state(),
@@ -793,7 +863,7 @@ class Agent(ABC):
             history=self.history_manager.get_history(),
             tool_schema_hash=self._compute_tool_schema_hash(),
             read_cache=self._get_read_cache(),
-            metadata=self._session_metadata,
+            metadata=self._get_enriched_session_metadata(),
             session_name=session_name,
             session_id=self.session_id,
             todo_state=self._capture_todowrite_state(),
@@ -841,11 +911,12 @@ class Agent(ABC):
                 agent_print("⚠️ Tool definitions have changed.")
                 agent_print(f"  Recommendation: {tool_check['recommendation']}")
 
-        # 恢复历史
-        from .message import Message
-        self.history_manager.clear()
-        for msg_data in session_data.get("history", []):
-            self.history_manager.append(Message.from_dict(msg_data))
+        # 恢复历史（使用 HistoryManager.load_from_dict 完整恢复 rounds/usage 等元数据）
+        self.history_manager.load_from_dict({
+            "history": session_data.get("history", []),
+            "usage": session_data.get("metadata", {}).get("usage", {}),
+        })
+        self._sync_history_token_count()
 
         # 恢复元数据
         self._session_metadata = session_data.get("metadata", {})
@@ -984,8 +1055,8 @@ class Agent(ABC):
         """
         import time
 
-        # 1. 保存当前状态
-        original_history = self.history_manager.get_history().copy()
+        # 1. 保存当前状态（使用 to_dict 完整保存 rounds/usage 等元数据）
+        original_hm_state = self.history_manager.to_dict()
         original_tools = None
         original_max_steps = None
 
@@ -1031,10 +1102,9 @@ class Agent(ABC):
             if return_summary:
                 summary = self._generate_subagent_summary(task, result, metadata)
 
-            # 8. 恢复原始状态
-            self.history_manager.clear()
-            for msg in original_history:
-                self.history_manager.append(msg)
+            # 8. 恢复原始状态（使用 load_from_dict 完整恢复 rounds/usage 等元数据）
+            self.history_manager.load_from_dict(original_hm_state)
+            self._sync_history_token_count()
 
             if original_tools is not None:
                 self._restore_tools(original_tools)

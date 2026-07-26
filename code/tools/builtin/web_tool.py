@@ -697,18 +697,27 @@ class _WebToolBase(Tool):
         output_max_bytes: int,
         truncate_direction: str,
         hint_message: str,
+        output_truncator: Optional["ObservationTruncator"] = None,
     ) -> None:
         super().__init__(name=name, description=description)
         self.project_root = Path(project_root).expanduser().resolve()
         self.enabled = enabled
-        self.output_truncator = ObservationTruncator(
-            max_lines=output_max_lines,
-            max_bytes=output_max_bytes,
-            truncate_direction=truncate_direction,
-            output_dir=str(self._resolve_output_dir(output_dir)),
-            retention_days=self.DEFAULT_RETENTION_DAYS,
-            hint_message=hint_message,
-        )
+        if output_truncator is not None:
+            self.output_truncator = output_truncator
+        else:
+            self.output_truncator = ObservationTruncator(
+                max_lines=output_max_lines,
+                max_bytes=output_max_bytes,
+                truncate_direction=truncate_direction,
+                output_dir=str(self._resolve_output_dir(output_dir)),
+                retention_days=self.DEFAULT_RETENTION_DAYS,
+                hint_message=hint_message,
+            )
+        # 保存工具特定截断参数，truncate() 调用时作为覆盖传入
+        self._truncate_max_lines = output_max_lines
+        self._truncate_max_bytes = output_max_bytes
+        self._truncate_direction = truncate_direction
+        self._truncate_hint = hint_message
 
     def _resolve_output_dir(self, output_dir: Optional[str]) -> Path:
         if output_dir:
@@ -875,6 +884,10 @@ class _WebToolBase(Tool):
             tool_name=tool_name,
             output=output_text,
             metadata=metadata,
+            max_lines=self._truncate_max_lines,
+            max_bytes=self._truncate_max_bytes,
+            truncate_direction=self._truncate_direction,
+            hint_message=self._truncate_hint,
         )
         observation_truncated = bool(truncation.get("truncated"))
         full_output_path = truncation.get("full_output_path")
@@ -921,6 +934,7 @@ class WebSearchTool(_WebToolBase):
         output_max_bytes: int = OUTPUT_MAX_BYTES,
         truncate_direction: str = "head",
         search_backend: Optional[_SearchBackend] = None,
+        output_truncator: Optional["ObservationTruncator"] = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -937,6 +951,7 @@ class WebSearchTool(_WebToolBase):
             output_max_bytes=output_max_bytes,
             truncate_direction=truncate_direction,
             hint_message="Use WebFetch for a chosen URL or Read the saved output file for the full result list.",
+            output_truncator=output_truncator,
         )
         self.search_backend = search_backend or _DuckDuckGoSearchBackend()
 
@@ -1345,6 +1360,7 @@ class WebFetchTool(_WebToolBase):
         truncate_direction: str = "head_tail",
         session_factory: Optional[Callable[[], Any]] = None,
         config: Any = None,
+        output_truncator: Optional["ObservationTruncator"] = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -1360,6 +1376,7 @@ class WebFetchTool(_WebToolBase):
             output_max_bytes=output_max_bytes,
             truncate_direction=truncate_direction,
             hint_message="Use Read on the saved output file for the full fetched content when needed.",
+            output_truncator=output_truncator,
         )
         self._session_factory = session_factory
         self._session: Any = None

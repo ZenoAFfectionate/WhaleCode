@@ -28,18 +28,25 @@ except ImportError:
 _MBPP_ADDENDUM = """\
 You are implementing MBPP+ Python programming tasks.
 
-Workflow:
-1. Read the task description and infer required behavior + edge cases.
-2. Implement the target function in `solution.py` (prefer `Edit` for local changes).
-3. Use only lightweight self-checks.
-4. Submit with `Finish`; the runner evaluates externally and returns bounded feedback.
+**Workflow**
+1. Read `solution.py` — understand the function signature and the task description.
+2. Implement the function body using Edit or Write.
+3. Submit with `Finish`; the runner evaluates externally and returns bounded feedback.
+4. If feedback shows failures: analyze the error carefully, fix the root cause,
+   then resubmit with `Finish`.
 
-Rules:
-- Benchmark test files are not available in the workspace.
-- Do not create your own uncontrolled benchmark test loop.
-- Do not try to reconstruct hidden benchmark files or inspect anything outside the workspace.
-- Keep the required function signature intact.
-- Prefer simple, readable, correct code.
+**Rules**
+- Benchmark test files are not available in the workspace. There are no local tests.
+- Do NOT create your own uncontrolled benchmark test loop.
+- Do NOT try to reconstruct hidden benchmark files or inspect anything outside the workspace.
+- Keep the required function signature exactly as provided. Do not rename parameters.
+- Keep all existing imports; add new ones only when strictly necessary.
+- Prefer simple, readable, correct code. Do not over-engineer.
+
+**On revision after failure**
+- Before editing, understand WHY the test failed — read the error message carefully.
+- Fix the root cause, not the symptom. One correct fix is better than multiple guesses.
+- If feedback shows the same failure after 2+ rounds, reconsider your approach completely.
 """
 
 _MBPP_SYSTEM_PROMPT = (

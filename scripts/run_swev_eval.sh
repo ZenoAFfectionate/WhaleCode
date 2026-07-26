@@ -21,8 +21,8 @@ if [ $# -lt 1 ]; then
     echo "Usage: bash scripts/run_swev_eval.sh <predictions_file> [extra args...]"
     echo ""
     echo "Example:"
-    echo "  bash scripts/run_swev_eval.sh data/_results/swev_predictions_20260316_120000.jsonl"
-    echo "  bash scripts/run_swev_eval.sh data/_results/swev_predictions_*.jsonl --max_workers 8"
+    echo "  bash scripts/run_swev_eval.sh result/_results/swev_predictions_20260316_120000.jsonl"
+    echo "  bash scripts/run_swev_eval.sh result/_results/swev_predictions_*.jsonl --max_workers 8"
     exit 1
 fi
 

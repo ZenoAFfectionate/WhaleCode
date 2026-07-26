@@ -38,5 +38,5 @@ sys.argv = ['clev_bench'] + sys.argv[1:]
 main()
 " \
     --data-path "$BENCH_DATA_ROOT/CLEV/test.jsonl" \
-    --output-dir "$PROJECT_ROOT/data/_results" \
+    --output-dir "$PROJECT_ROOT/result/_results" \
     "$@"

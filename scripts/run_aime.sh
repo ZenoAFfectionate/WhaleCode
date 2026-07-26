@@ -87,7 +87,7 @@ from hello_agents.benchmark.aime_bench import main
 sys.argv = ['aime_bench'] + sys.argv[1:]
 main()
 " \
-        --output-dir "$PROJECT_ROOT/data/_results" \
+        --output-dir "$PROJECT_ROOT/result/_results" \
         --timeout 60 \
         --data-path "$data_path" \
         "$@" \

@@ -4,14 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WhaleCode Console</title>
-  <meta
-    name="description"
-    content="WhaleCode 智能体 Web 控制台，集成智能体交互、会话管理与数据集测试。"
-  />
+  <meta name="description" content="WhaleCode 智能体 Web 控制台：智能体交互、会话管理与数据集评测。" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
-    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
     rel="stylesheet"
   />
   <link rel="stylesheet" href="./styles.css" />
@@ -23,11 +20,7 @@
         <div class="brand-mark">W</div>
         <div>
           <strong>WhaleCode</strong>
-          <span>Agent Control Plane</span>
-        </div>
-        <div class="brand-model-strip">
-          <span class="pill"><span class="dot" id="serviceDot"></span><span id="serviceStatus">checking</span></span>
-          <span class="pill">当前模型 <strong id="activeModel">未加载</strong></span>
+          <span class="brand-tag">Agent Control Plane</span>
         </div>
       </div>
 
@@ -38,152 +31,150 @@
         </button>
         <button class="nav-item" data-view="benchmarks">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6c0-1.1 3.6-2 8-2s8 .9 8 2-3.6 2-8 2-8-.9-8-2zm0 0v6c0 1.1 3.6 2 8 2s8-.9 8-2V6M4 12v6c0 1.1 3.6 2 8 2s8-.9 8-2v-6"/></svg>
-          数据集测试
+          数据集评测
         </button>
       </nav>
 
       <section class="sessions">
         <div class="section-title">
-          <span>历史会话</span>
-          <button class="icon-button" id="refreshSessions" title="刷新会话">
+          <span class="label">历史会话</span>
+          <button class="icon-button" id="refreshSessions" title="刷新会话" aria-label="刷新会话">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6"/></svg>
           </button>
         </div>
         <div class="session-list" id="sessionList"></div>
       </section>
 
-      <section class="runtime-card">
-        <div><span>Project</span><strong id="projectRoot">Loading...</strong></div>
-        <div><span>Trace</span><strong>web/runtime/traces</strong></div>
-        <div><span>Sessions</span><strong>web/runtime/sessions</strong></div>
-      </section>
+      <div class="reactor" aria-label="服务状态">
+        <div class="reactor-line">
+          <span class="dot" id="serviceDot"></span>
+          <strong id="serviceStatus">检测中</strong>
+        </div>
+        <div class="reactor-line">
+          <span class="label">模型</span>
+          <strong id="activeModel">未加载</strong>
+        </div>
+        <div class="reactor-gpu">
+          <div class="gpu-head">
+            <span class="label">GPU 显存</span>
+            <b id="gpuReadout">—</b>
+          </div>
+          <div class="meter"><span id="gpuBar" style="width:0%"></span></div>
+        </div>
+      </div>
     </aside>
 
     <main class="main">
-      <header class="topbar agent-topbar">
-        <div class="title-block">
-          <h1 id="viewTitle"></h1>
-          <p id="viewSubtitle"></p>
-        </div>
-        <div class="model-strip"></div>
-      </header>
-
+      <!-- ===================== Agent view ===================== -->
       <section class="view active" id="agentView">
-        <section class="agent-console panel">
-          <header class="console-header">
-            <div class="console-actions">
-              <span class="status-chip runtime-hidden" id="agentRunStatus" aria-hidden="true">idle</span>
-              <button class="ghost-button compact" id="newSessionButton" type="button">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-                新会话
-              </button>
-              <button class="ghost-button compact" id="openSessionDrawer" type="button">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
-                历史
-              </button>
-            </div>
-          </header>
-
-          <div class="runtime-hidden" aria-hidden="true">
-            <strong id="detailStatus">idle</strong>
-            <strong id="detailDuration">-</strong>
-            <strong id="detailProgress">0%</strong>
-            <strong id="activeSessionName">新会话</strong>
+        <header class="vitals" id="agentVitals">
+          <div class="vital vital-status">
+            <span class="label">状态</span>
+            <strong id="vitalStatus">就绪</strong>
           </div>
-
-          <div class="chat-stream console-stream" id="chatStream">
+          <div class="vital">
+            <span class="label">步数</span>
+            <strong id="vitalStep">0</strong>
           </div>
+          <div class="vital">
+            <span class="label">用时</span>
+            <strong id="vitalElapsed">—</strong>
+          </div>
+          <div class="vital">
+            <span class="label">Tokens</span>
+            <strong id="vitalTokens">—</strong>
+          </div>
+          <div class="vitals-spacer"></div>
+          <button class="ghost-button" id="newSessionButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            新会话
+          </button>
+        </header>
 
-          <form class="composer console-composer" id="agentForm">
-            <div class="runtime-hidden" aria-hidden="true">
-              <input id="workspaceInput" type="text" />
-            </div>
-            <div class="prompt-box">
-              <textarea id="promptInput" placeholder="输入代码问题、开发任务或调试需求..."></textarea>
-              <button class="primary-button" id="runAgentButton" type="submit">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
-                运行
-              </button>
-            </div>
-          </form>
-        </section>
+        <div class="trace-stream" id="traceStream">
+          <div class="trace-inner" id="chatStream"></div>
+        </div>
 
-        <aside class="session-drawer" id="sessionDrawer" aria-hidden="true">
-          <div class="drawer-backdrop" id="closeSessionDrawer"></div>
-          <section class="drawer-panel">
-            <div class="panel-header">
-              <div>
-                <h2>历史会话</h2>
-                <p>选择会话后，下一次运行会携带该会话上下文。</p>
-              </div>
-              <button class="icon-button" id="drawerCloseButton" title="关闭历史会话">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
-              </button>
-            </div>
-            <div class="session-list drawer-session-list" id="drawerSessionList"></div>
-          </section>
-        </aside>
+        <form class="composer" id="agentForm">
+          <div class="prompt-box">
+            <textarea id="promptInput" rows="1" placeholder="输入代码问题、开发任务或调试需求…"></textarea>
+            <button class="primary-button" id="runAgentButton" type="submit">
+              运行
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+            </button>
+          </div>
+        </form>
       </section>
 
+      <!-- ===================== Benchmarks view ===================== -->
       <section class="view" id="benchmarksView">
-        <div class="bench-grid">
+        <header class="view-header">
+          <h1>数据集评测</h1>
+          <p>选择数据集，调用项目现有 benchmark 脚本，实时查看进度、日志与通过率。</p>
+        </header>
+
+        <div class="bench-body">
+          <div class="bench-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>数据集</h2>
+                  <p>可多选，后端调用对应 benchmark 脚本。</p>
+                </div>
+              </div>
+              <div class="dataset-grid" id="datasetGrid"></div>
+              <form class="bench-form" id="benchForm">
+                <label>
+                  <span class="label">模型</span>
+                  <input id="benchModel" type="text" placeholder="留空使用当前模型" />
+                </label>
+                <label>
+                  <span class="label">Limit</span>
+                  <input id="benchLimit" type="number" min="1" placeholder="小样本" />
+                </label>
+                <label>
+                  <span class="label">pass@k</span>
+                  <select id="benchPassK">
+                    <option value="pass@1">pass@1</option>
+                    <option value="pass@3">pass@3</option>
+                    <option value="pass@5">pass@5</option>
+                  </select>
+                </label>
+                <button class="primary-button" id="runBenchButton" type="submit">运行评测</button>
+              </form>
+            </section>
+
+            <aside class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>实时日志</h2>
+                  <p>benchmark 脚本 stdout。</p>
+                </div>
+              </div>
+              <div class="log-stream" id="benchLog">
+                <div class="log-empty">运行后在此实时输出。</div>
+              </div>
+            </aside>
+          </div>
+
           <section class="panel">
             <div class="panel-header">
               <div>
-                <h2>数据集选择</h2>
-                <p>多选数据集，后端调用项目现有 benchmark scripts。</p>
+                <h2>评测结果</h2>
+                <p>以通过率为头条；展开可查看用例明细与运行轨迹。</p>
               </div>
-            </div>
-            <div class="dataset-grid" id="datasetGrid"></div>
-            <form class="bench-form" id="benchForm">
-              <label>
-                <span>模型</span>
-                <input id="benchModel" type="text" placeholder="留空使用当前模型或环境变量" />
-              </label>
-              <label>
-                <span>Limit</span>
-                <input id="benchLimit" type="number" min="1" placeholder="可选，先小样本验证" />
-              </label>
-              <label>
-                <span>pass@k</span>
-                <select id="benchPassK">
-                  <option value="pass@1">pass@1</option>
-                  <option value="pass@3">pass@3</option>
-                  <option value="pass@5">pass@5</option>
+              <div class="results-toolbar">
+                <input id="historyFilter" type="search" placeholder="筛选数据集 / 模型" />
+                <select id="historySort">
+                  <option value="time">按时间倒序</option>
+                  <option value="name">按名称排序</option>
+                  <option value="rate">按通过率排序</option>
                 </select>
-              </label>
-              <button class="primary-button" id="runBenchButton" type="submit">一键运行测试</button>
-            </form>
-          </section>
-
-          <aside class="panel">
-            <div class="panel-header">
-              <div>
-                <h2>当前用例与日志</h2>
-                <p>实时输出 benchmark stdout，失败原因会保留在任务详情里。</p>
               </div>
             </div>
-            <div class="log-stream" id="benchLog"></div>
-          </aside>
+            <div class="history-table" id="historyTable"></div>
+          </section>
         </div>
-
-        <section class="panel benchmark-results-panel">
-          <div class="panel-header">
-            <div>
-              <h2>测试结果</h2>
-              <p>运行完成后自动添加结果条目；展开后可查看用例明细、正确性和运行轨迹。</p>
-            </div>
-            <div class="button-row">
-              <input id="historyFilter" type="search" placeholder="筛选数据集 / 模型 / 文件" />
-              <select id="historySort">
-                <option value="time">按时间倒序</option>
-                <option value="name">按名称排序</option>
-                <option value="size">按文件大小排序</option>
-              </select>
-            </div>
-          </div>
-          <div class="history-table" id="historyTable"></div>
-        </section>
       </section>
     </main>
   </div>

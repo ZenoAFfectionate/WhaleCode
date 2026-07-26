@@ -94,8 +94,8 @@ except ImportError:
     from runtime.config import BenchmarkRuntimeConfig
 
 
-_DEFAULT_RESULTS_DIR = _PROJECT_ROOT / "data" / "_results"
-_DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "data" / "_trajectory"
+_DEFAULT_RESULTS_DIR = _PROJECT_ROOT / "result" / "_results"
+_DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "result" / "_trajectory"
 __all__ = [
     "BENCHMARK_BASE_SYSTEM_PROMPT",
     "BenchmarkCodeAgent",
@@ -122,10 +122,37 @@ class BenchmarkCodeAgent(CodeAgent):
         self.benchmark_events: List[Dict[str, Any]] = []
         self._benchmark_required_tool_choice = False
         self._benchmark_protocol_errors = 0
+        self._benchmark_consecutive_code_writes = 0
+        self._benchmark_verification_loop_detected = False
         super().__init__(*args, **kwargs)
 
     def _console(self, message: str = "", *, end: str = "\n", flush: bool = False) -> None:
         return
+
+    def _apply_builtin_tool_prompt(self, messages: list) -> None:
+        """Override: in benchmark mode, the agent MUST call Finish to submit.
+
+        The default builtin-tool instruction says "you may answer in plain text",
+        which is correct for interactive CLI use but wrong for benchmarks —
+        the evaluation runner only processes ``Finish`` tool calls.
+        """
+        instruction = (
+            "Builtin control tools are available.\n"
+            "- Use Thought to record concise reasoning or planning when helpful.\n"
+            "- Use normal tools to gather information and perform work.\n"
+            "- IMPORTANT: You MUST call Finish to submit your final answer.\n"
+            "  Do NOT answer in plain text — only Finish tool calls are\n"
+            "  processed by the evaluation system. Plain text answers will be\n"
+            "  treated as incomplete and the task will fail.\n"
+            "- Call Finish alone after all other tool work is complete."
+        )
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content", "")
+            message["content"] = f"{content}\n\n{instruction}" if content else instruction
+            return
+        messages.insert(0, {"role": "system", "content": instruction})
 
     def _render_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         full_payload = _json_safe_full(payload)
@@ -160,6 +187,7 @@ class BenchmarkCodeAgent(CodeAgent):
         fallback_text: str = "",
         reasoning_content: Optional[str] = None,
         reasoning_source: Optional[str] = None,
+        state: Optional[Any] = None,
     ) -> tuple[bool, Optional[str], Optional[str]]:
         if self._benchmark_required_tool_choice and structured_output is None:
             self._benchmark_protocol_errors += 1
@@ -200,7 +228,58 @@ class BenchmarkCodeAgent(CodeAgent):
             fallback_text=fallback_text,
             reasoning_content=reasoning_content,
             reasoning_source=reasoning_source,
+            state=state,
         )
+
+    def _update_stagnation_state(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        result_content: str,
+        current_step: int,
+        state: Any,
+        *,
+        tool_arguments: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Extend stagnation detection to catch benchmark-specific verification loops.
+
+        The base stagnation detector only catches repeated failed edits and
+        identical test results.  In benchmark mode the most common stuck pattern
+        is the *verification loop*: the model keeps writing new .py files and
+        running them, each producing slightly different output, without ever
+        calling Finish.  This method adds a counter that triggers stagnation
+        after 6 consecutive code writes without a finalising tool call.
+        """
+        super()._update_stagnation_state(
+            tool_name, tool_call_id, result_content, current_step, state, tool_arguments=tool_arguments
+        )
+
+        # --- verification-loop detection -----------------------------------
+        if tool_name == "Write":
+            path = ""
+            if isinstance(tool_arguments, dict):
+                path = str(tool_arguments.get("path") or tool_arguments.get("file_path") or "")
+            if path.endswith(".py"):
+                self._benchmark_consecutive_code_writes += 1
+            # Writing a non-Python file resets the counter (e.g. .txt, .md)
+            elif path:
+                self._benchmark_consecutive_code_writes = 0
+        elif tool_name == "Finish":
+            self._benchmark_consecutive_code_writes = 0
+        elif tool_name not in ("Edit", "Read", "Bash", "TodoWrite", "Thought"):
+            # An unrelated tool call resets the counter
+            self._benchmark_consecutive_code_writes = 0
+
+        if self._benchmark_consecutive_code_writes >= 6:
+            self._benchmark_verification_loop_detected = True
+            state.stagnation_detected = True
+            self._render_event(
+                "stagnation_detected",
+                {
+                    "reason": f"Verification loop: {self._benchmark_consecutive_code_writes} consecutive .py writes without Finish",
+                    "step": current_step,
+                },
+            )
 
 
 def _run_task_in_subprocess(
@@ -361,7 +440,7 @@ class BenchmarkRunner(ABC):
         a completed no-tool response by the ReAct loop.
         """
         effective_kwargs = dict(run_kwargs or {})
-        effective_kwargs.setdefault("tool_choice", "required")
+        effective_kwargs.setdefault("tool_choice", "auto")
         return effective_kwargs
 
     def _run_agent_prompt(
@@ -448,6 +527,12 @@ class BenchmarkRunner(ABC):
         config = self._configure_agent_config(config)
 
         llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
+        # Cap per-request output tokens (reasoning + content). Without this,
+        # reasoning models can spend the whole task budget in one generation.
+        # Override with BENCH_LLM_MAX_TOKENS; set it to 0 to disable the cap.
+        max_tokens = int(os.getenv("BENCH_LLM_MAX_TOKENS", "16384"))
+        if max_tokens > 0:
+            llm_kwargs["max_tokens"] = max_tokens
         if self.model:
             llm_kwargs["model"] = self.model
         if self.base_url:

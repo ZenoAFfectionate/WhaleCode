@@ -11,8 +11,8 @@
 #   bash scripts/run_swev.sh --filter 'django__.*'      # Regex filter by instance_id
 #   bash scripts/run_swev.sh --slice 0:50               # Slice after filtering/shuffle
 #   bash scripts/run_swev.sh --repo-cache-dir /tmp/repos  # Cache cloned repos
-#   bash scripts/run_swev.sh --resume data/_results/prev.jsonl  # Resume from crash
-#   bash scripts/run_swev.sh --preds-path data/_results/preds.json  # Skip IDs already predicted
+#   bash scripts/run_swev.sh --resume result/_results/prev.jsonl  # Resume from crash
+#   bash scripts/run_swev.sh --preds-path result/_results/preds.json  # Skip IDs already predicted
 #   bash scripts/run_swev.sh --task-timeout 1800           # 30min per task
 
 set -euo pipefail
@@ -47,8 +47,8 @@ sys.argv = ['swev_bench'] + sys.argv[1:]
 main()
 " \
     --data-path "$BENCH_DATA_ROOT/SWEV/test.jsonl" \
-    --output-dir "$PROJECT_ROOT/data/_results" \
-    --repo-cache-dir "$PROJECT_ROOT/data/_repo_cache" \
+    --output-dir "$PROJECT_ROOT/result/_results" \
+    --repo-cache-dir "$PROJECT_ROOT/result/_repo_cache" \
     --workers "${SWEV_WORKERS:-1}" \
     --max-steps 128 \
     "$@"

@@ -808,6 +808,79 @@ def run_benchmark_job(job: Job, payload: dict[str, Any]) -> None:
         jobs.emit(job.id, "failed", {"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
 
 
+def _case_passed(record: Any) -> bool | None:
+    """Best-effort verdict for a single benchmark case record."""
+    if not isinstance(record, dict):
+        return None
+    for key in ("passed", "correct", "success", "is_correct", "ok"):
+        if key in record:
+            value = record[key]
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in {"passed", "pass", "ok", "success", "true"}
+    status = record.get("status")
+    if isinstance(status, str):
+        if status.strip().lower() in {"passed", "pass", "ok", "success"}:
+            return True
+        if status.strip().lower() in {"failed", "fail", "error"}:
+            return False
+    return None
+
+
+def _summarize_records(records: list[Any]) -> dict[str, Any]:
+    """Compute passed/total/pass_rate from a list of case records."""
+    passed = 0
+    total = 0
+    for record in records:
+        verdict = _case_passed(record)
+        if verdict is None:
+            continue
+        total += 1
+        if verdict:
+            passed += 1
+    if not total:
+        return {}
+    return {"passed": passed, "total": total, "failed": total - passed, "pass_rate": round(passed / total, 4)}
+
+
+def _history_summary(path: Path) -> dict[str, Any]:
+    """Extract a lightweight summary (incl. pass rate) for a result artifact.
+
+    Works for both ``.json`` (dict with explicit fields or an embedded records
+    list, or a bare list) and ``.jsonl`` (one case per line). The previous
+    implementation only handled ``.json`` dicts, so real ``.jsonl`` runs never
+    surfaced a pass rate.
+    """
+    try:
+        if path.suffix == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                summary = {k: data.get(k) for k in ("benchmark", "model", "pass_rate", "passed", "total", "failed") if k in data}
+                if "passed" not in summary or "total" not in summary:
+                    for key in ("cases", "items", "results", "details", "samples", "records", "examples"):
+                        value = data.get(key)
+                        if isinstance(value, list):
+                            summary.update(_summarize_records(value))
+                            break
+                return summary
+            if isinstance(data, list):
+                return _summarize_records(data)
+            return {}
+        records: list[Any] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[:5000]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+        return _summarize_records(records)
+    except Exception:
+        return {}
+
+
 def load_benchmark_history() -> list[dict[str, Any]]:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     records = []
@@ -820,13 +893,9 @@ def load_benchmark_history() -> list[dict[str, Any]]:
             "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
             "size_bytes": path.stat().st_size,
         }
-        if path.suffix == ".json":
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    item["summary"] = {k: data.get(k) for k in ("benchmark", "model", "pass_rate", "passed", "total", "failed") if k in data}
-            except Exception:
-                pass
+        summary = _history_summary(path)
+        if summary:
+            item["summary"] = summary
         records.append(item)
     return records
 

@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 try:
-    from .base import BenchmarkRunner, _PROJECT_ROOT
+    from .base import BENCHMARK_BASE_SYSTEM_PROMPT, BenchmarkRunner, _PROJECT_ROOT
 except ImportError:
-    from base import BenchmarkRunner, _PROJECT_ROOT
+    from base import BENCHMARK_BASE_SYSTEM_PROMPT, BenchmarkRunner, _PROJECT_ROOT
 
 
 _VALID_AIME_YEARS = {"24", "25", "26"}
@@ -60,49 +60,67 @@ class AIMEBenchmark(BenchmarkRunner):
 
     Workflow per task:
     1. Create a temp workspace.
-    2. Present the math problem and let the agent reason directly.
-    3. Optionally allow scratch exploration in the workspace.
-    4. Extract the final integer answer from model output text.
+    2. Present the math problem; agent writes Python code to solve it.
+    3. Agent runs the code, verifies correctness via constraint checking,
+       and submits via Finish.
+    4. Extract the final integer answer from the Finish output.
     5. Compare with the expected answer and record pass / fail.
     """
 
     benchmark_name = "aime"
     _VALIDATION_SOURCE = "finish_answer"
-    _RETRY_MAX_TOKENS = 128
+    _RETRY_MAX_TOKENS = 2048  # enough for a direct Finish call or a brief strategy pivot
     _BOXED_ANSWER_RE = re.compile(r"\\boxed\{\s*(-?\d+)\s*\}", flags=re.IGNORECASE)
     _FINAL_ANSWER_RE = re.compile(r"Final answer is\s+(-?\d+)\.", flags=re.IGNORECASE)
 
     _MATH_SYSTEM_PROMPT = """\
-You are an expert AIME competition math solver.
+## AIME Math Benchmark — Code-First Problem Solving
 
-Objective:
-- Maximize answer correctness on olympiad-style problems.
-- Produce a final integer answer in the exact required format.
+You are solving AIME competition math problems. Code execution is your primary
+tool — write programs to compute answers. Mathematical reasoning is essential
+for correct modeling, but the final answer must come from running code.
 
-Tool protocol (mandatory):
-1. Start with a Thought tool call to state your plan.
-2. Use Bash only for short arithmetic checks when needed.
-3. Before concluding, use Thought again for a concise verification note.
-4. Conclude by calling Finish exactly once.
-5. Do not provide the final answer in plain assistant text.
+### Strategy Guide
 
-Reasoning protocol:
-1. Identify what is being asked and define symbols/constraints clearly.
-2. Build a mathematically sound solution path before computing.
-3. Keep steps concise but explicit: equations, transformations, and key logic.
-4. Use Bash only for short arithmetic checks, not as a replacement for reasoning.
-5. Before finalizing, run a quick verification pass:
-   - Check algebra/sign mistakes.
-   - Check counting/combinatorics edge cases.
-   - Check that the result satisfies problem constraints.
-   - If needed, confirm by a second method or substitution.
+- Algebra / word problems: set up equations, solve with fractions.Fraction.
+- Geometry: use coordinates, law of cosines, power of a point. Prefer
+  fractions.Fraction over floating point.
+- Combinatorics: use itertools to enumerate all configurations, filter, count.
+- Number theory: use modular arithmetic, search, gcd, factorization.
 
-Answer policy:
-- Prefer a short, clean derivation over verbose narration.
-- The Finish tool's `answer` field must be exactly one boxed integer: `\\boxed{N}`.
-- N must be an integer in [0, 999].
-- Do not output multiple boxed answers.
-- Do not add any trailing text.
+### Workflow
+
+1. **Analyze** — understand the problem mathematically. Identify the correct
+   strategy. A wrong mathematical model wastes far more time than careful
+   analysis. Take the time you need to get the math right.
+
+2. **Write → Bash** — create a self-contained `solve.py`, then IMMEDIATELY
+   run it with `python solve.py`. NEVER write code without running it.
+   If the output is clearly unreasonable (e.g. not in [0, 999], far from
+   expected magnitude), your mathematical model is likely wrong — rethink
+   the approach rather than tweaking code details.
+
+3. **Verify** — before submitting, do a proper check of your answer:
+   - Is the mathematical model correct for the problem?
+   - Does the code correctly implement that model?
+   - Does the answer satisfy obvious constraints from the problem?
+   A single thorough check is enough. Skipping verification risks
+   submitting a wrong answer; endless re-verification wastes time.
+
+4. **Finish** — call Finish with `\\boxed{N}` where N is your integer answer.
+   No extra text, no multiple boxed values.
+
+### Critical Rules
+
+- ALWAYS write and run Python code to compute answers. Never submit a guess
+  without code execution.
+- Verify your answer with one solid pass — check both the math and the
+  code. Then commit. Neither blind submission nor endless re-checking
+  produces good results.
+- If your approach isn't working after 2-3 code attempts, step back and
+  try a completely different strategy rather than tweaking code details.
+- If you cannot get a valid integer after genuine effort, submit your
+  best answer anyway rather than running out of time.
 """
 
     def __init__(self, *args, year: Optional[str] = None, max_submission_rounds: int = 3, **kwargs):
@@ -113,9 +131,14 @@ Answer policy:
             self.year = _infer_year_from_path(self.data_path)
         if self.year is not None:
             self.benchmark_name = f"aime_{self.year}"
+        # Cap agent steps: no AIME solution in our data exceeded 33 steps;
+        # 48 is generous while preventing the 128-step verification-loop
+        # runaway seen with aime25_12 (7 .py files, never called Finish).
+        if self.max_steps > 48:
+            self.max_steps = 48
 
     def _get_system_prompt(self):
-        return self._MATH_SYSTEM_PROMPT
+        return BENCHMARK_BASE_SYSTEM_PROMPT + "\n\n---\n\n" + self._MATH_SYSTEM_PROMPT
 
     def _configure_agent_config(self, config: Any) -> Any:
         config = super()._configure_agent_config(config)
@@ -123,25 +146,6 @@ Answer policy:
         config.skills_auto_register = False
         config.todowrite_enabled = False
         return config
-
-    def _register_agent_tools(self, *, registry: Any, workspace: Path, agent: Any) -> None:
-        """AIME keeps a minimal tool surface while enforcing Thought/Finish control tools."""
-        from hello_agents.agents.react_agent import (
-            FINISH_TOOL_DESCRIPTION,
-            FINISH_TOOL_NAME,
-            THOUGHT_TOOL_DESCRIPTION,
-            THOUGHT_TOOL_NAME,
-            _FinishTool,
-            _ThoughtTool,
-        )
-        from hello_agents.tools.builtin.bash import BashTool
-
-        ws = str(workspace)
-        if registry.get_tool(THOUGHT_TOOL_NAME) is None:
-            registry.register_tool(_ThoughtTool(THOUGHT_TOOL_DESCRIPTION))
-        if registry.get_tool(FINISH_TOOL_NAME) is None:
-            registry.register_tool(_FinishTool(FINISH_TOOL_DESCRIPTION))
-        registry.register_tool(BashTool(project_root=ws, working_dir=ws))
 
     def _load_tasks(self) -> List[Dict[str, Any]]:
         prefix = f"AIME_{self.year}" if self.year else "AIME"
@@ -177,14 +181,23 @@ Answer policy:
 
     @staticmethod
     def _retry_prompt(problem: str, round_idx: int) -> str:
+        """Rounds 2-3 retry prompts: first nudge to submit or rethink, then final
+        push to submit whatever answer is available."""
+        del problem
+        if round_idx == 2:
+            return (
+                "Your previous response did not include a Finish tool call.\n\n"
+                "If your code produced a reasonable integer answer (0-999), call\n"
+                "Finish now with: \\\\boxed{N} where N is that integer.\n\n"
+                "If your code did NOT produce a reasonable answer, your mathematical\n"
+                "model may be incorrect. Try a different approach — then call Finish\n"
+                "with your best integer answer."
+            )
+        # Final round — just submit
         return (
-            f"Previous attempt #{round_idx - 1} did not follow the required output format.\n"
-            f"Use tools only (tool_choice is required).\n"
-            f"Call Thought briefly, then call Finish once.\n"
-            f"In Finish, set answer to exactly: \\\\boxed{{N}}\n"
-            f"where N is an integer in [0, 999].\n"
-            f"No extra text.\n\n"
-            f"Problem:\n{problem}\n"
+            "This is your FINAL attempt. You MUST call Finish now with your best\n"
+            "integer answer as: \\\\boxed{N} where N is in [0, 999].\n"
+            "Submit whatever you have — an approximate answer is better than nothing."
         )
 
     def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -201,22 +214,27 @@ Answer policy:
         try:
             agent = self._create_agent(workspace)
             initial_prompt = (
-                f"Solve this AIME problem with competition-grade rigor.\n\n"
+                f"Solve this AIME problem by writing and running Python code.\n\n"
                 f"Problem:\n{problem}\n\n"
-                f"Execution checklist:\n"
-                f"1. Call Thought first with your plan.\n"
-                f"2. Restate the target quantity and key constraints.\n"
-                f"3. Derive the solution step by step with correct math.\n"
-                f"4. Use Bash only for quick arithmetic validation if needed.\n"
-                f"5. Call Thought for a short self-check.\n"
-                f"6. Call Finish exactly once with the final answer.\n\n"
-                f"Tool/output requirements:\n"
-                f"- You must use tools; do not answer directly in assistant text.\n"
-                f"- When you are ready, call `Finish` with the final answer only.\n"
-                f"- The Finish `answer` must be exactly one boxed integer: `\\boxed{{N}}`.\n"
-                f"- N must be in [0, 999].\n"
-                f"- Do not output multiple boxed values.\n"
-                f"- Do not include trailing text.\n"
+                f"Workflow:\n"
+                f"1. Analyze — understand the mathematics and choose the right\n"
+                f"   strategy. Getting the math right is more important than speed.\n"
+                f"2. Write → Bash — create solve.py, then IMMEDIATELY run it.\n"
+                f"   If output is unreasonable (not in [0, 999] or clearly wrong\n"
+                f"   magnitude), first reconsider your mathematical approach, then\n"
+                f"   fix the code and re-run.\n"
+                f"3. Verify — do a proper check: is the math correct? Does the\n"
+                f"   code faithfully implement it? Does the answer make sense?\n"
+                f"   One thorough check is enough.\n"
+                f"4. Finish — submit the integer answer as \\boxed{{N}}.\n\n"
+                f"Submission:\n"
+                f"- Verify your answer before submitting: check both the mathematical\n"
+                f"  model and the code. One solid pass is sufficient — skipping\n"
+                f"  verification risks wrong answers, but endless re-checking\n"
+                f"  wastes time.\n"
+                f"- If the answer seems unreasonable, your math model is likely\n"
+                f"  wrong — try a different strategy.\n"
+                f"- Call Finish with answer = `\\boxed{{N}}`. No extra text.\n"
             )
             start = time.time()
             actual_answer: Optional[int] = None

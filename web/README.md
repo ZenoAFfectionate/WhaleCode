@@ -6,7 +6,7 @@ WhaleCode agent infrastructure instead of serving a static showcase only.
 ## Run
 
 ```bash
-cd /home/kemove/CodeingAgent/Whale_Code
+cd /home/kemove/CodeingAgent/WhaleCode
 python3 web/server.py --host 127.0.0.1 --port 8765
 ```
 

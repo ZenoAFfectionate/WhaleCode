@@ -1,4 +1,4 @@
-from typing import Optional, Iterator, TYPE_CHECKING, List, Dict, AsyncGenerator
+from typing import Optional, Iterator, TYPE_CHECKING, Dict, AsyncGenerator
 import json
 
 from ..core.agent import Agent
@@ -66,32 +66,16 @@ class SimpleAgent(Agent):
             Final response
         """
         from datetime import datetime
-        from ..observability import TraceLogger
 
         session_start_time = datetime.now()
-
-        # Create a new TraceLogger for each run (avoids issues with closed files during multi-turn dialogues)
-        trace_logger = None
-        if self.config.trace_enabled:
-            trace_logger = TraceLogger(
-                output_dir=self.config.trace_dir,
-                sanitize=self.config.trace_sanitize,
-                html_include_raw_response=self.config.trace_html_include_raw_response
-            )
-            trace_logger.log_event(
-                "session_start",
-                {
-                    "agent_name": self.name,
-                    "agent_type": self.__class__.__name__,
-                }
-            )
+        self._init_trace()
 
         # Build the message list
         messages = self._build_messages(input_text)
 
         # Log user message
-        if trace_logger:
-            trace_logger.log_event(
+        if self.trace_logger:
+            self.trace_logger.log_event(
                 "message_written",
                 {"role": "user", "content": input_text}
             )
@@ -105,19 +89,11 @@ class SimpleAgent(Agent):
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(response_text, "assistant"))
 
-            if trace_logger:
-                duration = (datetime.now() - session_start_time).total_seconds()
-                trace_logger.log_event(
-                    "session_end",
-                    {
-                        "duration": duration,
-                        "final_answer": response_text,
-                        "status": "success",
-                        "usage": llm_response.usage if hasattr(llm_response, 'usage') else {},
-                        "latency_ms": llm_response.latency_ms if hasattr(llm_response, 'latency_ms') else 0
-                    }
-                )
-                trace_logger.finalize()
+            self._finalize_trace(
+                "success",
+                duration=(datetime.now() - session_start_time).total_seconds(),
+                final_answer=response_text,
+            )
 
             return response_text
 
@@ -128,14 +104,14 @@ class SimpleAgent(Agent):
         def _on_event(name, payload):
             if name == "tool_call":
                 steps_holder["n"] += 1
-            if not trace_logger:
+            if not self.trace_logger:
                 return
             if name == "tool_call":
-                trace_logger.log_event("tool_call", payload)
+                self.trace_logger.log_event("tool_call", payload)
             elif name == "tool_result":
-                trace_logger.log_event("tool_result", payload)
+                self.trace_logger.log_event("tool_result", payload)
             elif name == "llm_error":
-                trace_logger.log_event(
+                self.trace_logger.log_event(
                     "error",
                     {"error_type": "LLM_ERROR", "message": payload.get("error", "")},
                 )
@@ -156,27 +132,14 @@ class SimpleAgent(Agent):
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(final_response, "assistant"))
 
-        if trace_logger:
-            duration = (datetime.now() - session_start_time).total_seconds()
-            trace_logger.log_event(
-                "session_end",
-                {
-                    "duration": duration,
-                    "total_steps": steps_holder["n"],
-                    "final_answer": final_response,
-                    "status": "success"
-                }
-            )
-            trace_logger.finalize()
+        self._finalize_trace(
+            "success",
+            duration=(datetime.now() - session_start_time).total_seconds(),
+            total_steps=steps_holder["n"],
+            final_answer=final_response,
+        )
 
         return final_response
-
-    def _build_messages(self, input_text: str) -> List[Dict[str, str]]:
-        """Build a model-compatible transcript from persisted history."""
-        return self.history_manager.build_llm_messages(
-            system_prompt=self.system_prompt,
-            latest_user_input=input_text,
-        )
 
     def add_tool(self, tool, auto_expand: bool = True) -> None:
         """
@@ -216,25 +179,39 @@ class SimpleAgent(Agent):
     def stream_run(self, input_text: str, **kwargs) -> Iterator[str]:
         """
         Run the Agent in streaming mode
-        
+
         Args:
             input_text: User input
             **kwargs: Additional parameters
-            
+
         Yields:
             Agent response chunks
         """
+        from datetime import datetime
+
+        session_start_time = datetime.now()
+        self._init_trace()
+
         messages = self._build_messages(input_text)
-        
+        if self.trace_logger:
+            self.trace_logger.log_event("message_written", {"role": "user", "content": input_text})
+
         # Stream call to LLM
         full_response = ""
-        for chunk in self.llm.stream_invoke(messages, **kwargs):
-            full_response += chunk
-            yield chunk
-        
-        # Save the complete conversation to history
-        self.add_message(Message(input_text, "user"))
-        self.add_message(Message(full_response, "assistant"))
+        try:
+            for chunk in self.llm.stream_invoke(messages, **kwargs):
+                full_response += chunk
+                yield chunk
+        finally:
+            # Save the complete conversation to history
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(full_response, "assistant"))
+
+            self._finalize_trace(
+                "success",
+                duration=(datetime.now() - session_start_time).total_seconds(),
+                final_answer=full_response,
+            )
 
     async def arun_stream(
         self,
@@ -259,6 +236,11 @@ class SimpleAgent(Agent):
         Yields:
             StreamEvent: Streaming events
         """
+        from datetime import datetime
+
+        session_start_time = datetime.now()
+        self._init_trace()
+
         # Send start event
         yield StreamEvent.create(
             StreamEventType.AGENT_START,
@@ -292,7 +274,20 @@ class SimpleAgent(Agent):
             self.add_message(Message(input_text, "user"))
             self.add_message(Message(full_response, "assistant"))
 
+            self._finalize_trace(
+                "success",
+                duration=(datetime.now() - session_start_time).total_seconds(),
+                final_answer=full_response,
+            )
+
         except Exception as e:
+            self._finalize_trace(
+                "error",
+                duration=(datetime.now() - session_start_time).total_seconds(),
+                error_type=type(e).__name__,
+                message=str(e),
+            )
+
             # Send error event
             yield StreamEvent.create(
                 StreamEventType.ERROR,

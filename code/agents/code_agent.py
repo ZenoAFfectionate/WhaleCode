@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..core.config import Config
 from ..core.llm import HelloAgentsLLM
-from ..observability.trace_logger import TraceLogger
 from ..tools.registry import ToolRegistry
 from .react_agent import ReActAgent
 
@@ -59,8 +58,6 @@ class CodeAgent(ReActAgent):
         self.working_dir = initial_working_dir
 
         effective_config = _copy_config(config)
-        self._trace_enabled = bool(effective_config.trace_enabled)
-        effective_config.trace_enabled = False
         effective_config.todowrite_enabled = bool(
             register_default_tools and enable_task_tool and effective_config.todowrite_enabled
         )
@@ -76,7 +73,13 @@ class CodeAgent(ReActAgent):
             max_steps=max_steps,
         )
 
-        self.config.trace_enabled = self._trace_enabled
+        # 将标配的 truncator output_dir 修正为 project_root 下的绝对路径，
+        # 确保所有工具共用同一个截断器输出目录（truncate_for_context 的
+        # 第二层截断能正确找到工具第一层保存的全量输出）。
+        shared_output_dir = self.project_root / "memory" / "tool-output"
+        self.truncator.output_dir = shared_output_dir
+        shared_output_dir.mkdir(parents=True, exist_ok=True)
+
         self.max_steps = max_steps
 
         self.interactive = interactive
@@ -137,17 +140,29 @@ class CodeAgent(ReActAgent):
             )
         )
         self.tool_registry.register_tool(
-            BashTool(project_root=str(self.project_root), working_dir=str(self.working_dir), config=self.config)
+            BashTool(
+                project_root=str(self.project_root),
+                working_dir=str(self.working_dir),
+                config=self.config,
+                output_truncator=self.truncator,
+            )
         )
         self.tool_registry.register_tool(AskUserTool(interactive=self.interactive))
 
         if WebSearchTool.is_enabled_by_default():
             self.tool_registry.register_tool(
-                WebSearchTool(project_root=str(self.project_root))
+                WebSearchTool(
+                    project_root=str(self.project_root),
+                    output_truncator=self.truncator,
+                )
             )
         if WebFetchTool.is_enabled_by_default():
             self.tool_registry.register_tool(
-                WebFetchTool(project_root=str(self.project_root), config=self.config)
+                WebFetchTool(
+                    project_root=str(self.project_root),
+                    config=self.config,
+                    output_truncator=self.truncator,
+                )
             )
         if enable_task_tool and self.config.todowrite_enabled and self.tool_registry.get_tool("TodoWrite") is None:
             self._register_todowrite_tool()
@@ -164,6 +179,17 @@ class CodeAgent(ReActAgent):
         for tool in self.tool_registry.get_all_tools():
             if hasattr(tool, "working_dir"):
                 tool.working_dir = new_working_dir
+
+    # ------------------------------------------------------------------
+    # Trace customization — 仅覆盖 hook，无需重写 run/arun/arun_stream
+    # ------------------------------------------------------------------
+
+    def _trace_session_metadata(self) -> Dict[str, Any]:
+        """向 session_start 事件中注入 workspace 路径信息。"""
+        return {
+            "project_root": str(self.project_root),
+            "working_dir": str(self.working_dir),
+        }
 
     # ------------------------------------------------------------------
     # Context compaction (public API)
@@ -202,56 +228,6 @@ class CodeAgent(ReActAgent):
             "All file paths must stay within the workspace root."
         )
         return "\n\n".join(system_parts)
-
-    def _build_workspace_messages(self, input_text: Optional[str] = None):
-        """兼容旧调用点，实际复用共享的 HistoryManager 投影逻辑。"""
-        return self._build_messages(input_text)
-
-    def _finalize_trace_safe(self, status: str, message: str) -> None:
-        """Q-1/Q-5: DRY the trace-cleanup logic used by both interrupt and error paths."""
-        if not self.trace_logger:
-            return
-        try:
-            if not self.trace_logger.jsonl_file.closed:
-                self.trace_logger.log_event(
-                    "session_end", {"status": status, "message": message}
-                )
-                self.trace_logger.finalize()
-        except Exception as exc:
-            # Don't let a trace-write failure mask the original error.
-            from ..core.logging import agent_print
-            agent_print(f"[{self.name}] trace finalize failed ({status}): {exc}")
-
-    def run(self, input_text: str, **kwargs) -> str:
-        """Run with the shared ReActAgent contract and CodeAgent tracing metadata."""
-        self.trace_logger = None
-
-        if self._trace_enabled:
-            self.trace_logger = TraceLogger(
-                output_dir=self.config.trace_dir,
-                sanitize=self.config.trace_sanitize,
-                html_include_raw_response=self.config.trace_html_include_raw_response,
-            )
-            self.trace_logger.log_event(
-                "session_start",
-                {
-                    "agent_name": self.name,
-                    "agent_type": self.__class__.__name__,
-                    "project_root": str(self.project_root),
-                    "working_dir": str(self.working_dir),
-                },
-            )
-
-        try:
-            return super().run(input_text, **kwargs)
-        except KeyboardInterrupt:
-            self._finalize_trace_safe("interrupted", "run aborted by interruption")
-            raise
-        except Exception:
-            self._finalize_trace_safe("error", "run aborted by exception")
-            raise
-        finally:
-            self.trace_logger = None
 
     def _create_subagent(self, agent_type: str = "code") -> "CodeAgent":
         """Create a fresh sub-agent with isolated tool state."""

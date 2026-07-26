@@ -50,15 +50,26 @@ class ObservationTruncator:
         tool_name: str,
         output: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        max_lines: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+        truncate_direction: Optional[str] = None,
+        hint_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         start = time.time()
         self._cleanup_old_outputs()
+
+        # 允许调用方按工具类型覆盖截断参数（便于共享同一 truncator 实例）
+        effective_max_lines = max(1, int(max_lines)) if max_lines is not None else self.max_lines
+        effective_max_bytes = max(256, int(max_bytes)) if max_bytes is not None else self.max_bytes
+        effective_direction = truncate_direction if truncate_direction else self.truncate_direction
+        effective_hint = hint_message if hint_message is not None else self.hint_message
 
         text = output or ""
         lines, total_bytes = self._text_metrics(text)
         full_output_path = self._existing_output_path(metadata)
 
-        if len(lines) <= self.max_lines and total_bytes <= self.max_bytes:
+        if len(lines) <= effective_max_lines and total_bytes <= effective_max_bytes:
             return self._build_passthrough_result(
                 text,
                 lines=lines,
@@ -67,13 +78,13 @@ class ObservationTruncator:
                 start_time=start,
             )
 
-        preview_info = self._build_preview(text)
+        preview_info = self._build_preview(text, effective_max_lines, effective_max_bytes, effective_direction)
         reused_output = bool(full_output_path)
         if not full_output_path:
             full_output_path = self._save_full_output(tool_name, text, metadata)
 
         preview = preview_info["preview"].rstrip("\n")
-        notice = self._build_notice(preview_info, full_output_path)
+        notice = self._build_notice(preview_info, full_output_path, hint_message=effective_hint)
         display_preview = "\n\n".join(part for part in (preview, notice) if part)
         stats = self._build_stats(
             original_lines=len(lines),
@@ -201,7 +212,12 @@ class ObservationTruncator:
             "stats": stats,
         }
 
-    def _build_notice(self, preview_info: Dict[str, Any], full_output_path: str) -> str:
+    def _build_notice(
+        self,
+        preview_info: Dict[str, Any],
+        full_output_path: str,
+        hint_message: Optional[str] = None,
+    ) -> str:
         return "\n".join(
             [
                 (
@@ -209,7 +225,7 @@ class ObservationTruncator:
                     f"{preview_info['omitted_lines']} line(s) / {preview_info['omitted_bytes']} byte(s)]"
                 ),
                 f"Full output saved to: {full_output_path}",
-                self.hint_message,
+                hint_message if hint_message is not None else self.hint_message,
             ]
         )
 
@@ -251,18 +267,27 @@ class ObservationTruncator:
             "time_ms": int((time.time() - start_time) * 1000),
         }
 
-    def _build_preview(self, text: str) -> Dict[str, Any]:
+    def _build_preview(
+        self,
+        text: str,
+        max_lines: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+        direction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        effective_max_lines = max_lines if max_lines is not None else self.max_lines
+        effective_max_bytes = max_bytes if max_bytes is not None else self.max_bytes
+        effective_direction = direction if direction else self.truncate_direction
         lines, total_bytes = self._text_metrics(text)
 
-        if self.truncate_direction == "tail":
-            preview = self._collect_lines(lines, self.max_lines, self.max_bytes, from_tail=True)
-        elif self.truncate_direction == "head_tail":
-            preview = self._collect_head_tail(lines, self.max_lines, self.max_bytes)
+        if effective_direction == "tail":
+            preview = self._collect_lines(lines, effective_max_lines, effective_max_bytes, from_tail=True)
+        elif effective_direction == "head_tail":
+            preview = self._collect_head_tail(lines, effective_max_lines, effective_max_bytes)
         else:
-            preview = self._collect_lines(lines, self.max_lines, self.max_bytes)
+            preview = self._collect_lines(lines, effective_max_lines, effective_max_bytes)
 
         if not preview["lines"] and text:
-            raw_preview = self._truncate_raw_text(text)
+            raw_preview = self._truncate_raw_text(text, effective_max_bytes, effective_direction)
             raw_lines, raw_bytes = self._text_metrics(raw_preview)
             if not raw_lines and raw_preview:
                 raw_lines = [raw_preview]
@@ -370,16 +395,23 @@ class ObservationTruncator:
             "source_line_count": head["source_line_count"] + tail["source_line_count"],
         }
 
-    def _truncate_raw_text(self, text: str) -> str:
+    def _truncate_raw_text(
+        self,
+        text: str,
+        max_bytes: Optional[int] = None,
+        direction: Optional[str] = None,
+    ) -> str:
+        effective_max_bytes = max_bytes if max_bytes is not None else self.max_bytes
+        effective_direction = direction if direction else self.truncate_direction
         payload = text.encode("utf-8")
-        if self.truncate_direction == "tail":
-            return payload[-self.max_bytes :].decode("utf-8", errors="ignore")
-        if self.truncate_direction == "head_tail" and len(payload) > self.max_bytes:
-            half = max(1, self.max_bytes // 2)
+        if effective_direction == "tail":
+            return payload[-effective_max_bytes:].decode("utf-8", errors="ignore")
+        if effective_direction == "head_tail" and len(payload) > effective_max_bytes:
+            half = max(1, effective_max_bytes // 2)
             head = payload[:half].decode("utf-8", errors="ignore")
             tail = payload[-half:].decode("utf-8", errors="ignore")
             return f"{head}\n{self.gap_marker}\n{tail}"
-        return payload[: self.max_bytes].decode("utf-8", errors="ignore")
+        return payload[:effective_max_bytes].decode("utf-8", errors="ignore")
 
     def _existing_output_path(self, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:

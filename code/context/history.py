@@ -150,18 +150,6 @@ class HistoryManager:
         self._estimated_history_token_count = 0
         self._recorded_usage = self._empty_usage_snapshot()
 
-    def set_token_counter(self, token_counter: "TokenCounter") -> None:
-        """绑定现有 TokenCounter，并重算缓存 token 数。"""
-        self.token_counter = token_counter
-        self._estimated_history_token_count = self._count_messages(self._history)
-
-    def set_config(self, config: Any) -> None:
-        """绑定 Config，便于直接从 HistoryManager 驱动压缩。"""
-        self.config = config
-        self.compression_threshold = float(
-            getattr(config, "compression_threshold", self.compression_threshold)
-        )
-
     def append(self, message: Message) -> None:
         """追加消息（只追加，不编辑）。"""
         self._history.append(message)
@@ -172,22 +160,32 @@ class HistoryManager:
         """获取历史副本。"""
         return self._history.copy()
 
-    def get_messages(self) -> List[Message]:
-        """兼容文档中的 get_messages() 名称。"""
-        return self.get_history()
-
     def clear(self) -> None:
         """清空历史。"""
         self._history.clear()
         self._estimated_history_token_count = 0
         self._recorded_usage = self._empty_usage_snapshot()
 
-    def get_token_count(self) -> int:
-        """返回最近一次真实记录到的 prompt token 数。"""
+    def get_last_api_prompt_tokens(self) -> int:
+        """返回最近一次 LLM API 返回的真实 prompt token 数。
+
+        与 ``get_estimated_token_count()`` 的区别：
+        - 本方法返回 API response 中记录的真实值（来自 record_usage）
+        - get_estimated_token_count() 返回本地 TokenCounter 的估算值
+        当 SimpleAgent 未调用 record_usage 时，本方法始终返回 0。
+        """
         return int(self._recorded_usage.get("prompt_tokens", 0) or 0)
 
+    # 向后兼容别名
+    get_token_count = get_last_api_prompt_tokens
+
     def get_estimated_token_count(self) -> int:
-        """返回基于本地 TokenCounter 的历史估算值。"""
+        """返回基于本地 TokenCounter 的历史估算值。
+
+        与 ``get_last_api_prompt_tokens()`` 的区别：
+        - get_last_api_prompt_tokens() 返回 API response 中记录的真实值
+        - 本方法返回本地 TokenCounter 的估算值（始终可用，但不精确）
+        """
         return self._estimated_history_token_count
 
     def get_usage_snapshot(self) -> Dict[str, Any]:
@@ -251,36 +249,6 @@ class HistoryManager:
         self._history = [summary_msg, *retained_history]
         self._estimated_history_token_count = self._count_messages(self._history)
         self._mark_usage_stale()
-
-    def build_summary(
-        self,
-        *,
-        llm: Any,
-        history: Optional[Sequence[Message]] = None,
-        focus: Optional[str] = None,
-    ) -> str:
-        """仅生成 smart summary 文本，不直接改写历史。"""
-        source = self._resolve_history(history)
-        split = self.get_compression_split(source)
-        if split is None:
-            raise ValueError("Not enough completed rounds to summarize.")
-
-        to_compress, _retained = split
-        summary_messages = self._messages_for_summary(to_compress)
-        if not summary_messages:
-            raise ValueError("No eligible history remains after filtering summary input.")
-
-        summary = self._summarize_messages(
-            summary_messages,
-            self._serialize_messages(summary_messages),
-            llm,
-            focus,
-            transcript_path="[unavailable]",
-        )
-        return (
-            f"{summary}\n\n---\n"
-            f"(Compressed, retaining the most recent {self._default_preserve_recent_rounds()} complete rounds)"
-        )
 
     def build_summary_message(
         self,
@@ -483,17 +451,42 @@ class HistoryManager:
         latest_prompt_tokens: Optional[int] = None,
         focus: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """统一压缩入口：先微压缩，再按阈值决定是否生成 summary。"""
+        """统一压缩入口：先微压缩，再按阈值决定是否生成 summary。
+
+        优先尝试 LLM 驱动的 compact_with_llm；失败时回退到轻量级
+        compress() 以避免历史无限增长（compress 不需要 LLM，零成本，
+        但摘要质量低于 compact_with_llm 的结构化提炼）。
+        """
         self.micro_compact_tool_results()
         if not self.should_compress(
             latest_prompt_tokens=latest_prompt_tokens,
             system_prompt=system_prompt,
         ):
             return None
+
+        before_tokens = self.estimate_tokens(system_prompt=system_prompt)
         try:
-            return self.compact_with_llm(llm=llm, system_prompt=system_prompt, focus=focus)
+            result = self.compact_with_llm(llm=llm, system_prompt=system_prompt, focus=focus)
+            if result is not None:
+                return result
         except Exception:
-            return None
+            pass
+
+        # LLM 压缩不可用或失败 → 回退到简单 compress（零 LLM 成本）
+        fallback_summary = (
+            f"{self.SUMMARY_HEADING}\n"
+            "[Automatic compaction — LLM summarization unavailable. "
+            "Earlier conversation history has been archived. "
+            "Recent messages are preserved verbatim below.]"
+        )
+        self.compress(fallback_summary)
+        after_tokens = self.estimate_tokens(system_prompt=system_prompt)
+        return {
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "saved_tokens": before_tokens - after_tokens,
+            "fallback": True,
+        }
 
     def compact_with_llm(
         self,

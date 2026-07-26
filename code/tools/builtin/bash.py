@@ -736,6 +736,7 @@ class BashTool(Tool):
         project_root: str = ".",
         working_dir: Optional[str] = None,
         config: Any = None,
+        output_truncator: Optional["ObservationTruncator"] = None,
     ):
         super().__init__(
             name=name,
@@ -749,12 +750,15 @@ class BashTool(Tool):
         )
         self.project_root = Path(project_root).expanduser().resolve()
         self.working_dir = ensure_working_dir(self.project_root, working_dir)
-        self.output_truncator = ObservationTruncator(
-            max_lines=self.OUTPUT_PREVIEW_MAX_LINES,
-            max_bytes=self.OUTPUT_PREVIEW_MAX_BYTES,
-            truncate_direction="head",
-            output_dir=str(self.project_root / "memory" / "tool-output"),
-        )
+        if output_truncator is not None:
+            self.output_truncator = output_truncator
+        else:
+            self.output_truncator = ObservationTruncator(
+                max_lines=self.OUTPUT_PREVIEW_MAX_LINES,
+                max_bytes=self.OUTPUT_PREVIEW_MAX_BYTES,
+                truncate_direction="head",
+                output_dir=str(self.project_root / "memory" / "tool-output"),
+            )
 
         # 建议-6: prefer Config fields when available; env vars as fallback.
         def _bool_cfg(field: str, env: str, default: bool) -> bool:
@@ -1274,6 +1278,9 @@ class BashTool(Tool):
                 "exit_code": exit_code,
                 "event_count": event_stream.event_count(),
             },
+            max_lines=self.OUTPUT_PREVIEW_MAX_LINES,
+            max_bytes=self.OUTPUT_PREVIEW_MAX_BYTES,
+            truncate_direction="head",
         )
         preview_text = truncation.get("display_preview", truncation.get("preview", output_text))
         truncated = truncation.get("truncated", False)

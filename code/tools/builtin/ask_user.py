@@ -29,6 +29,7 @@ class AskUserTool(Tool):
                 "Do NOT use for greetings, casual conversation, or when you "
                 "already have enough context to respond or act."
             ),
+            category="interactive",
         )
         self._interactive = bool(interactive)
 

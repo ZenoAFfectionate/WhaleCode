@@ -197,8 +197,9 @@ class _WorkspaceFileTool(Tool):
         working_dir: Optional[str] = None,
         registry: Optional["ToolRegistry"] = None,
         config: Any = None,
+        category: str = "general",
     ):
-        super().__init__(name=name, description=description, expandable=False)
+        super().__init__(name=name, description=description, expandable=False, category=category)
         self.project_root = Path(project_root).expanduser().resolve()
         self.working_dir = ensure_working_dir(self.project_root, working_dir)
         self.registry = registry
@@ -428,6 +429,102 @@ class _WorkspaceFileTool(Tool):
 
         return None
 
+    def _list_directory(self, *, full_path: Path, offset: int, limit: int) -> ToolResponse:
+        try:
+            raw_entries = list(full_path.iterdir())
+        except PermissionError:
+            return ToolResponse.error(
+                code=ToolErrorCode.ACCESS_DENIED,
+                message=f"No permission to access directory '{self._display_path(full_path)}'",
+            )
+
+        raw_entries.sort(key=lambda item: (not item.is_dir(), item.name.lower()))
+        total_entries = len(raw_entries)
+        if offset > total_entries and not (offset == 0 and total_entries == 0):
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_PARAM,
+                message=f"Offset {offset} is out of range for this directory ({total_entries} entries)",
+            )
+
+        total_files = 0
+        total_dirs = 0
+        entries = []
+        for entry in raw_entries:
+            is_dir = entry.is_dir()
+            total_dirs += int(is_dir)
+            total_files += int(not is_dir)
+            stat_result = None
+            if not is_dir:
+                try:
+                    stat_result = entry.stat()
+                except OSError:
+                    stat_result = None
+            try:
+                mtime = entry.stat().st_mtime
+                mtime_text = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                mtime_text = "?"
+
+            size_text = "<DIR>" if is_dir else (self._format_size(stat_result.st_size) if stat_result else "?")
+            entries.append(
+                {
+                    "name": entry.name,
+                    "type": "directory" if is_dir else "file",
+                    "size": size_text,
+                    "mtime": mtime_text,
+                    "path": self._display_path(entry),
+                }
+            )
+
+        selected_entries = entries[offset : offset + limit]
+        truncated = offset + len(selected_entries) < total_entries
+        rel_path = self._display_path(full_path)
+
+        if not selected_entries and total_entries == 0:
+            body = "[empty directory]"
+        else:
+            body_lines = []
+            for entry in selected_entries:
+                marker = "[DIR]" if entry["type"] == "directory" else "[FILE]"
+                body_lines.append(
+                    f"{marker:<6} {entry['name']:<40} {entry['size']:>10} {entry['mtime']}"
+                )
+            body = "\n".join(body_lines) if body_lines else "[no entries in requested window]"
+
+        text_lines = [
+            f"Directory: {rel_path}",
+            _format_range(offset, len(selected_entries), total_entries, "Entry range"),
+            f"Totals: directories={total_dirs}, files={total_files}",
+            "",
+            body,
+        ]
+        if truncated:
+            text_lines.extend(["", f"Use offset={offset + len(selected_entries)} to continue."])
+
+        data = {
+            "path": rel_path,
+            "entries": selected_entries,
+            "total_entries": total_entries,
+            "total_files": total_files,
+            "total_dirs": total_dirs,
+            "is_directory": True,
+            "offset": offset,
+            "limit": limit,
+            "truncated": truncated,
+            "next_offset": offset + len(selected_entries) if truncated else None,
+        }
+        response_factory = ToolResponse.partial if truncated else ToolResponse.success
+        return response_factory(text="\n".join(text_lines), data=data)
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024.0:
+                return f"{value:.1f}{unit}"
+            value /= 1024.0
+        return f"{value:.1f}TB"
+
 
 class ReadTool(_WorkspaceFileTool):
     """Read a text file or inspect a directory."""
@@ -448,6 +545,7 @@ class ReadTool(_WorkspaceFileTool):
             project_root=project_root,
             working_dir=working_dir,
             registry=registry,
+            category="readonly",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -592,104 +690,7 @@ class ReadTool(_WorkspaceFileTool):
                 message=f"Failed to read file: {exc}",
             )
 
-    def _list_directory(self, *, full_path: Path, offset: int, limit: int) -> ToolResponse:
-        try:
-            raw_entries = list(full_path.iterdir())
-        except PermissionError:
-            return ToolResponse.error(
-                code=ToolErrorCode.ACCESS_DENIED,
-                message=f"No permission to access directory '{self._display_path(full_path)}'",
-            )
-
-        raw_entries.sort(key=lambda item: (not item.is_dir(), item.name.lower()))
-        total_entries = len(raw_entries)
-        if offset > total_entries and not (offset == 0 and total_entries == 0):
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"Offset {offset} is out of range for this directory ({total_entries} entries)",
-            )
-
-        total_files = 0
-        total_dirs = 0
-        entries = []
-        for entry in raw_entries:
-            is_dir = entry.is_dir()
-            total_dirs += int(is_dir)
-            total_files += int(not is_dir)
-            stat_result = None
-            if not is_dir:
-                try:
-                    stat_result = entry.stat()
-                except OSError:
-                    stat_result = None
-            try:
-                mtime = entry.stat().st_mtime
-                mtime_text = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            except OSError:
-                mtime_text = "?"
-
-            size_text = "<DIR>" if is_dir else (self._format_size(stat_result.st_size) if stat_result else "?")
-            entries.append(
-                {
-                    "name": entry.name,
-                    "type": "directory" if is_dir else "file",
-                    "size": size_text,
-                    "mtime": mtime_text,
-                    "path": self._display_path(entry),
-                }
-            )
-
-        selected_entries = entries[offset : offset + limit]
-        truncated = offset + len(selected_entries) < total_entries
-        rel_path = self._display_path(full_path)
-
-        if not selected_entries and total_entries == 0:
-            body = "[empty directory]"
-        else:
-            body_lines = []
-            for entry in selected_entries:
-                marker = "[DIR]" if entry["type"] == "directory" else "[FILE]"
-                body_lines.append(
-                    f"{marker:<6} {entry['name']:<40} {entry['size']:>10} {entry['mtime']}"
-                )
-            body = "\n".join(body_lines) if body_lines else "[no entries in requested window]"
-
-        text_lines = [
-            f"Directory: {rel_path}",
-            _format_range(offset, len(selected_entries), total_entries, "Entry range"),
-            f"Totals: directories={total_dirs}, files={total_files}",
-            "",
-            body,
-        ]
-        if truncated:
-            text_lines.extend(["", f"Use offset={offset + len(selected_entries)} to continue."])
-
-        data = {
-            "path": rel_path,
-            "entries": selected_entries,
-            "total_entries": total_entries,
-            "total_files": total_files,
-            "total_dirs": total_dirs,
-            "is_directory": True,
-            "offset": offset,
-            "limit": limit,
-            "truncated": truncated,
-            "next_offset": offset + len(selected_entries) if truncated else None,
-        }
-        response_factory = ToolResponse.partial if truncated else ToolResponse.success
-        return response_factory(text="\n".join(text_lines), data=data)
-
-    @staticmethod
-    def _format_size(size: int) -> str:
-        value = float(size)
-        for unit in ("B", "KB", "MB", "GB"):
-            if value < 1024.0:
-                return f"{value:.1f}{unit}"
-            value /= 1024.0
-        return f"{value:.1f}TB"
-
-
-class ListFilesTool(ReadTool):
+class ListFilesTool(_WorkspaceFileTool):
     """Directory listing tool using the historical LS name."""
 
     def __init__(
@@ -698,11 +699,16 @@ class ListFilesTool(ReadTool):
         working_dir: Optional[str] = None,
         registry: Optional["ToolRegistry"] = None,
     ):
-        super().__init__(project_root=project_root, working_dir=working_dir, registry=registry)
-        self.name = "LS"
-        self.description = (
-            "List files and folders inside a directory. Prefer this over Read when you need "
-            "to understand project structure, discover file names, or decide what to inspect next."
+        super().__init__(
+            name="LS",
+            description=(
+                "List files and folders inside a directory. Prefer this over Read when you need "
+                "to understand project structure, discover file names, or decide what to inspect next."
+            ),
+            project_root=project_root,
+            working_dir=working_dir,
+            registry=registry,
+            category="readonly",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -784,6 +790,7 @@ class WriteTool(_WorkspaceFileTool):
             working_dir=working_dir,
             registry=registry,
             config=config,
+            category="write",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -1027,6 +1034,7 @@ class DeleteTool(_WorkspaceFileTool):
             project_root=project_root,
             working_dir=working_dir,
             registry=registry,
+            category="write",
         )
         self.trash_root = (self.project_root / "memory" / ".delete_trash").resolve()
 
@@ -1299,6 +1307,7 @@ class EditTool(_WorkspaceFileTool):
             project_root=project_root,
             working_dir=working_dir,
             registry=registry,
+            category="write",
             config=config,
         )
 

@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import queue
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -290,6 +291,7 @@ def _run_task_in_subprocess(
     task_id: str,
 ) -> None:
     """Execute ``runner._run_task`` and send a serializable payload back."""
+    os.setpgid(0, 0)  # create independent process group for clean tree-kill on timeout
     try:
         runner._current_task_id = task_id
         runner._progress_queue = progress_queue
@@ -317,6 +319,10 @@ class BenchmarkRunner(ABC):
     """
 
     benchmark_name: str = "base"
+
+    # Runtime sandbox profile used when recording summary metadata.
+    # Docker-based benchmarks should override this (e.g. ``"repo_docker"``).
+    runtime_profile: str = "python_strict"
 
     # ========== 1. Configuration & Data Loading ==========
 
@@ -579,7 +585,9 @@ class BenchmarkRunner(ABC):
         evaluate_submission: Callable[[int, str], Dict[str, Any]],
         retry_prompt_builder: Callable[[int, str], str],
         run_kwargs_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = None,
-        error_extra_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = None,
+        error_extra_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = (
+            lambda round_idx: {"submission_rounds": round_idx}
+        ),
     ) -> Dict[str, Any]:
         """Run repeated controlled submissions with bounded evaluator feedback."""
         total_rounds = max(1, int(max_rounds))
@@ -702,11 +710,21 @@ class BenchmarkRunner(ABC):
             self._handle_progress_update(update)
 
         if timed_out and process.is_alive():
-            process.terminate()
+            # Kill entire process group (child called os.setpgid(0,0) on entry).
+            # Falls back gracefully when PG info is unavailable.
+            child_pid = process.pid
+            try:
+                child_pgid = os.getpgid(child_pid) if child_pid else None
+                if child_pgid is not None and child_pgid != os.getpgid(0):
+                    os.killpg(child_pgid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except (ProcessLookupError, OSError):
+                try:
+                    process.kill()
+                except Exception:
+                    pass
             process.join(timeout=5)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=5)
             timeout_result = {
                 "task_id": resolved_task_id,
                 "passed": False,
@@ -1029,7 +1047,7 @@ class BenchmarkRunner(ABC):
             "trajectory_dir": str(self.trajectory_dir),
             "resumed_from": resume if resume else None,
             "benchmark_runtime": BenchmarkRuntimeConfig.from_env(
-                profile="python_strict"
+                profile=self.runtime_profile
             ).to_metadata(),
         }
 

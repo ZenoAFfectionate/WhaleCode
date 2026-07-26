@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from .artifacts import BenchmarkArtifactStore
-from .base import EvalRequest, EvalResult, EvalStatus
+from .base import BenchmarkExecutionEnvironment, EvalRequest, EvalResult, EvalStatus
 from .config import BenchmarkRuntimeConfig
 from .feedback import append_artifact_hint
 
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - direct script execution
     )
 
 
-class PythonSubprocessEnvironment:
+class PythonSubprocessEnvironment(BenchmarkExecutionEnvironment):
     """Run Python benchmark evaluators in a bounded subprocess group."""
 
     def __init__(
@@ -56,6 +56,10 @@ class PythonSubprocessEnvironment:
         command_args = list(request.command or [])
         code_for_artifact = request.code
         try:
+            # Dispatch execution mode:
+            #   command=None  → stdin  mode: code piped to ``python -``
+            #   command=()    → file  mode: code in temp .py, stdin passed to file
+            #   command=[...] → command mode: no code, just run command
             if request.code is not None and request.command is None:
                 command_args = ["-"]
                 input_text = request.code
@@ -67,6 +71,11 @@ class PythonSubprocessEnvironment:
                 input_text = request.stdin
 
             command = [sys.executable, *command_args]
+            base_metrics = {
+                "command": command,
+                "visibility": request.visibility,
+                "runtime_config": self.config.to_metadata(),
+            }
             start = time.time()
             proc = subprocess.Popen(
                 command,
@@ -93,11 +102,7 @@ class PythonSubprocessEnvironment:
                     returncode=returncode,
                     elapsed_s=elapsed,
                     timeout_s=timeout,
-                    metrics={
-                        "command": command,
-                        "visibility": request.visibility,
-                        "runtime_config": self.config.to_metadata(),
-                    },
+                    metrics=base_metrics,
                 )
                 return self._with_artifacts(request, result, code_for_artifact, limits)
             except subprocess.TimeoutExpired:
@@ -115,11 +120,7 @@ class PythonSubprocessEnvironment:
                     returncode=-9,
                     elapsed_s=round(time.time() - start, 3),
                     timeout_s=timeout,
-                    metrics={
-                        "command": command,
-                        "visibility": request.visibility,
-                        "runtime_config": self.config.to_metadata(),
-                    },
+                    metrics=base_metrics,
                 )
                 return self._with_artifacts(request, result, code_for_artifact, limits)
         except Exception as exc:

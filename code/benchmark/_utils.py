@@ -33,6 +33,25 @@ except Exception:
 _MINIMAL_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP")
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read *name* from the environment as an int, falling back to *default*."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read *name* from the environment as a bool, falling back to *default*."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _safe_name(value: Any) -> str:
     text = str(value or "").strip()
     text = re.sub(r"[^\w.\-]+", "_", text)

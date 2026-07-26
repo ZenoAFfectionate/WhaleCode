@@ -53,7 +53,8 @@ When to use:
 - When professional knowledge not possessed by the model is needed
 
 Note: After loading a skill, please strictly follow the skill instructions to complete the user task.""",
-            expandable=False
+            expandable=False,
+            category="readonly",
         )
         self.skill_loader = skill_loader
 

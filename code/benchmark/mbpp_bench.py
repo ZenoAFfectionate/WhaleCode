@@ -234,7 +234,6 @@ class MBPPPlusBenchmark(BenchmarkRunner):
                 prompt_history=prompt_history,
                 evaluate_submission=_evaluate_submission,
                 retry_prompt_builder=_retry_prompt,
-                error_extra_builder=lambda round_idx: {"submission_rounds": round_idx},
             )
             agent_response = loop["agent_response"]
             if loop["early_result"] is not None:

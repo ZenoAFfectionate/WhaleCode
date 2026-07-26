@@ -675,13 +675,27 @@ class BashTool(Tool):
         "vim",
         "vi",
         "nano",
+        "emacs",
+        "micro",
         "less",
         "more",
+        "most",
         "top",
         "htop",
+        "btop",
+        "atop",
         "watch",
         "tmux",
         "screen",
+        "dialog",
+        "whiptail",
+        "fzf",
+        "peco",
+        "ncdu",
+        "mutt",
+        "neomutt",
+        "irssi",
+        "weechat",
     }
     PRIVILEGED_COMMANDS: Set[str] = {"sudo", "su", "doas"}
     DESTRUCTIVE_COMMANDS: Set[str] = {
@@ -747,6 +761,7 @@ class BashTool(Tool):
                 "(LS), code search (Grep), and file editing (Edit/Write/Delete) when they fit the task. "
                 "Commands that exceed block_until_ms are moved to background and tracked by terminal files."
             ),
+            category="dangerous",
         )
         self.project_root = Path(project_root).expanduser().resolve()
         self.working_dir = ensure_working_dir(self.project_root, working_dir)

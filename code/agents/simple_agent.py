@@ -163,7 +163,9 @@ class SimpleAgent(Agent):
     def remove_tool(self, tool_name: str) -> bool:
         """Remove a tool (convenience method)"""
         if self.tool_registry:
-            return self.tool_registry.unregister_tool(tool_name)
+            existed = self.tool_registry.get_tool(tool_name) is not None
+            self.tool_registry.unregister(tool_name)
+            return existed
         return False
 
     def list_tools(self) -> list:

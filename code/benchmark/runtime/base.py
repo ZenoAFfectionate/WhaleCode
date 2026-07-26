@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Protocol, Sequence
+from typing import Any, Dict, Literal, Optional, Protocol, Sequence, runtime_checkable
 
 
 EvalStatus = Literal["passed", "failed", "timeout", "security_blocked", "error"]
@@ -28,10 +28,17 @@ class EvalRequest:
     visibility: EvalVisibility = "hidden"
 
     def __post_init__(self) -> None:
-        if self.code is None and self.command is None:
-            raise ValueError("EvalRequest requires either code or command.")
         if self.timeout_s <= 0:
             raise ValueError("EvalRequest.timeout_s must be positive.")
+
+        has_code = self.code is not None and self.code.strip()
+        has_command = self.command is not None and len(self.command) > 0
+        if not has_code and not has_command:
+            raise ValueError(
+                "EvalRequest requires non-empty code or command. "
+                f"Got code={self.code!r}, command={self.command!r}."
+            )
+
         object.__setattr__(self, "cwd", Path(self.cwd))
 
 
@@ -55,6 +62,7 @@ class EvalResult:
         return (self.stdout + self.stderr).strip()
 
 
+@runtime_checkable
 class BenchmarkExecutionEnvironment(Protocol):
     """Protocol implemented by benchmark execution backends."""
 

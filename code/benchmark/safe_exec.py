@@ -21,9 +21,9 @@ except ImportError:  # pragma: no cover - platform dependent
     _resource = None
 
 try:
-    from ._utils import build_minimal_child_env
+    from ._utils import build_minimal_child_env, _env_int
 except ImportError:  # pragma: no cover - direct script execution
-    from _utils import build_minimal_child_env
+    from _utils import build_minimal_child_env, _env_int
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,7 @@ class UnsafeBenchmarkCodeError(ValueError):
 
 
 _BLOCKED_IMPORT_ROOTS = {
+    # Network / IPC — must never run in evaluator sandbox
     "ftplib",
     "http",
     "paramiko",
@@ -68,6 +69,11 @@ _BLOCKED_IMPORT_ROOTS = {
     "socket",
     "subprocess",
     "urllib",
+    # Blacklist bypass — can dynamically import blocked modules
+    "importlib",
+    # Arbitrary code execution — pickle, ctypes, code-object manipulation
+    "pickle",
+    "ctypes",
 }
 _BLOCKED_BUILTIN_CALLS = {"__import__", "compile", "eval", "exec", "open"}
 _BLOCKED_ATTR_CALLS = {
@@ -195,16 +201,6 @@ def validate_python_source_safe(source: str, *, filename: str = "solution.py") -
                 raise UnsafeBenchmarkCodeError(
                     f"Unsafe benchmark submission: reading os.environ is not allowed in {filename}."
                 )
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
 
 
 def default_benchmark_limits(timeout_s: int) -> BenchmarkSandboxLimits:
@@ -363,13 +359,20 @@ def run_python_code_with_stdin(
     limits: Optional[BenchmarkSandboxLimits] = None,
     artifact_stem: Optional[str] = None,
 ) -> SafePythonResult:
-    """Write *code* to a temporary file and pass *stdin_text* to that file."""
+    """Write *code* to a temporary file and pass *stdin_text* to that file.
+
+    NOTE: ``command=()`` (empty tuple) is an intentional sentinel.
+    It signals *file mode* to PythonSubprocessEnvironment: code goes to
+    a temp .py file, and *stdin_text* is fed as stdin to that file.
+    This is NOT the same as ``command=None``, which selects *stdin mode*
+    where code is piped directly to ``python -``.
+    """
 
     timeout = max(1, int(timeout))
     EvalRequest, environment = _python_environment()
     request = EvalRequest(
         code=code,
-        command=(),
+        command=(),  # sentinel: file mode (≠ None which is stdin mode)
         cwd=Path(cwd),
         stdin=stdin_text,
         timeout_s=timeout,

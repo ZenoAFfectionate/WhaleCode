@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+try:
+    from .._utils import _json_safe_full as _json_safe
+except ImportError:  # pragma: no cover - direct script execution
+    from _utils import _json_safe_full as _json_safe  # type: ignore
+
 
 @dataclass(frozen=True)
 class BenchmarkArtifactStore:
@@ -81,23 +86,18 @@ class BenchmarkArtifactStore:
 
 def _remove_tree(path: Path) -> None:
     for child in path.iterdir():
-        if child.is_dir():
-            _remove_tree(child)
-        else:
-            child.unlink(missing_ok=True)
-    path.rmdir()
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-    return repr(value)
+        try:
+            if child.is_dir():
+                _remove_tree(child)
+            else:
+                child.chmod(0o644)
+                child.unlink(missing_ok=True)
+        except (PermissionError, OSError):
+            continue
+    try:
+        path.rmdir()
+    except OSError:
+        pass
 
 
 __all__ = ["BenchmarkArtifactStore"]

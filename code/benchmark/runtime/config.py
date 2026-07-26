@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, Literal
+
+try:
+    from .._utils import _env_bool, _env_int
+except ImportError:  # pragma: no cover - direct script execution
+    from _utils import _env_bool, _env_int  # type: ignore
 
 
 BenchmarkRuntimeProfile = Literal["python_strict", "repo_docker", "terminal_docker"]
@@ -24,13 +28,7 @@ class BenchmarkRuntimeConfig:
 
     @classmethod
     def for_profile(cls, profile: BenchmarkRuntimeProfile) -> "BenchmarkRuntimeConfig":
-        if profile == "repo_docker":
-            return cls(
-                profile=profile,
-                max_processes=4096,
-                file_size_bytes=1024 * 1024 * 1024,
-            )
-        if profile == "terminal_docker":
+        if profile in ("repo_docker", "terminal_docker"):
             return cls(
                 profile=profile,
                 max_processes=4096,
@@ -82,23 +80,6 @@ class BenchmarkRuntimeConfig:
             max_processes=self.max_processes,
             file_size_bytes=self.file_size_bytes,
         )
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return int(default)
-    try:
-        return int(str(raw).strip())
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 __all__ = ["BenchmarkRuntimeConfig", "BenchmarkRuntimeProfile"]

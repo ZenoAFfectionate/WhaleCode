@@ -247,7 +247,11 @@ class ToolRegistry:
             tool = self._tools[name]
             try:
                 parameters = self._normalize_tool_parameters(input_text)
-                response = tool.run_with_timing(parameters)
+                validation_error = tool._validate_against_schema(parameters)
+                if validation_error is not None:
+                    response = validation_error
+                else:
+                    response = tool.run_with_timing(parameters)
             except Exception as exc:
                 response = self._tool_exception_response(name, input_text, exc)
 
@@ -277,7 +281,11 @@ class ToolRegistry:
             tool = self._tools[name]
             try:
                 parameters = self._normalize_tool_parameters(input_text)
-                response = await tool.arun_with_timing(parameters)
+                validation_error = tool._validate_against_schema(parameters)
+                if validation_error is not None:
+                    response = validation_error
+                else:
+                    response = await tool.arun_with_timing(parameters)
             except Exception as exc:
                 response = self._tool_exception_response(name, input_text, exc)
         elif name in self._functions:
@@ -318,6 +326,15 @@ class ToolRegistry:
     def get_all_tools(self) -> list[Tool]:
         """Get all Tool objects"""
         return list(self._tools.values())
+
+    def get_tool_category(self, name: str) -> str:
+        """Get the category of a registered tool, or 'general' if unknown."""
+        tool = self._tools.get(name)
+        return tool.category if tool else "general"
+
+    def get_tool_categories(self) -> dict[str, str]:
+        """Get name→category mapping for all registered tools."""
+        return {name: tool.category for name, tool in self._tools.items()}
 
     def clear(self):
         """Clear all tools"""

@@ -9,15 +9,13 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from .artifacts import BenchmarkArtifactStore
-from .base import EvalRequest, EvalResult
+from .base import BenchmarkExecutionEnvironment, EvalRequest, EvalResult
 from .config import BenchmarkRuntimeConfig
 
 
 @dataclass(frozen=True)
 class DockerCommandRunner:
     """Small adapter around subprocess.run for easy unit-test faking."""
-
-    executable: str = "docker"
 
     def run(
         self,
@@ -35,7 +33,7 @@ class DockerCommandRunner:
         )
 
 
-class DockerExecutionEnvironment:
+class DockerExecutionEnvironment(BenchmarkExecutionEnvironment):
     """Execute already-formed Docker/Compose commands with EvalResult semantics."""
 
     def __init__(

@@ -6,13 +6,13 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..base import Tool, ToolParameter
+from ..base import ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
-from ._code_utils import ensure_working_dir, relative_display, resolve_path
+from .file_tools import _WorkspaceFileTool
 
 
-class GlobTool(Tool):
+class GlobTool(_WorkspaceFileTool):
     """Find files via ripgrep-backed file enumeration."""
 
     MAX_RESULTS = 100
@@ -39,9 +39,10 @@ class GlobTool(Tool):
                 "naming convention, or directory structure. Results are limited to 100 files and "
                 "sorted by modification time (newest first)."
             ),
+            project_root=project_root,
+            working_dir=working_dir,
+            category="readonly",
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = ensure_working_dir(self.project_root, working_dir)
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -74,7 +75,7 @@ class GlobTool(Tool):
             )
 
         try:
-            root = resolve_path(self.project_root, self.working_dir, raw_path)
+            root = self._resolve_path(raw_path)
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
@@ -106,7 +107,7 @@ class GlobTool(Tool):
                 message=f"Glob search failed: {exc}",
             )
 
-        rel_root = relative_display(self.project_root, root)
+        rel_root = self._display_path(root)
         lines = []
         if rel_paths:
             lines.extend(rel_paths)
@@ -172,7 +173,7 @@ class GlobTool(Tool):
                 mtime = full_path.stat().st_mtime
             except OSError:
                 mtime = 0.0
-            matches.append((relative_display(self.project_root, full_path), mtime))
+            matches.append((self._display_path(full_path), mtime))
 
         try:
             process.communicate(timeout=1)

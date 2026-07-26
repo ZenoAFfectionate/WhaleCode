@@ -6,28 +6,26 @@ from typing import Any, Dict, Optional
 from collections import defaultdict
 from ..core.logging import agent_print
 from .response import ToolResponse, ToolStatus
-
-
-# Only genuine tool *faults* should trip the breaker. Model/user mistakes such
-# as INVALID_PARAM / ACCESS_DENIED / NOT_FOUND / CONFLICT / BINARY_FILE are the
-# tool correctly rejecting bad input and must NOT disable the tool (see 重要-1).
-FAULT_ERROR_CODES = frozenset(
-    {
-        "INTERNAL_ERROR",
-        "EXECUTION_ERROR",
-        "TIMEOUT",
-        "NETWORK_ERROR",
-        "API_ERROR",
-    }
-)
+from .errors import ToolErrorCode
 
 
 def _is_fault_response(response: ToolResponse) -> bool:
-    """True only when a response represents a real tool fault (not a rejection)."""
+    """True only when a response represents a real tool fault (not a rejection).
+
+    Uses ``ToolErrorCode.is_fault`` so the definition of "fault" lives in a
+    single place — the error-code enum itself — instead of requiring a
+    separate frozenset that can drift out of sync (重要-7).
+    """
     if response.status != ToolStatus.ERROR:
         return False
     code = (response.error_info or {}).get("code")
-    return code in FAULT_ERROR_CODES
+    if code is None:
+        return False
+    try:
+        return ToolErrorCode(code).is_fault
+    except ValueError:
+        # Unknown error code — treat as a fault to be safe.
+        return True
 
 
 class CircuitBreaker:

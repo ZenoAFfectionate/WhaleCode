@@ -498,6 +498,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
     """
 
     benchmark_name = "swev"
+    runtime_profile = "repo_docker"
 
     def __init__(
         self,

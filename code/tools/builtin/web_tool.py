@@ -698,8 +698,9 @@ class _WebToolBase(Tool):
         truncate_direction: str,
         hint_message: str,
         output_truncator: Optional["ObservationTruncator"] = None,
+        category: str = "network",
     ) -> None:
-        super().__init__(name=name, description=description)
+        super().__init__(name=name, description=description, category=category)
         self.project_root = Path(project_root).expanduser().resolve()
         self.enabled = enabled
         if output_truncator is not None:

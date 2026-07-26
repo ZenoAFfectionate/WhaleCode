@@ -8,11 +8,11 @@ context compaction, auto-save, and explicit session restore.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
 
 from ..base import Tool, ToolParameter
 from ..errors import ToolErrorCode
@@ -225,10 +225,11 @@ class TodoWriteTool(Tool):
                 "- Legacy action-based parameters are not supported."
             ),
             expandable=False,
+            category="write",
         )
         root = Path(project_root).expanduser().resolve()
         self.store = TodoSessionStore(root / persistence_dir)
-        self.session_id = session_id or f"local-{uuid4().hex[:8]}"
+        self.session_id = session_id or hashlib.sha256(str(root).encode()).hexdigest()[:12]
 
     def bind_session(self, session_id: str) -> None:
         self.session_id = session_id

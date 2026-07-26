@@ -571,6 +571,10 @@ class LCB6Benchmark(BenchmarkRunner):
         return self._load_jsonl_tasks(task_transform=transform)
 
     def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        # LCB6 uses a custom submission loop instead of _run_controlled_submission_rounds
+        # because it needs cumulative step-budget tracking: each round passes
+        # ``start_step`` to _run_agent_prompt, and the loop checks whether the total
+        # step budget has been exhausted between rounds.
         task_id = task["task_id"]
         title = task.get("question_title", "")
         question = task.get("question_content", "")

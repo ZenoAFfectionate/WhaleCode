@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..base import Tool, ToolParameter
+from ..base import ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
-from ._code_utils import ensure_working_dir, relative_display, resolve_path
+from .file_tools import _WorkspaceFileTool
 
 
 @dataclass
@@ -28,7 +28,7 @@ class GrepMatch:
         return {"path": self.path, "line": self.line, "text": self.text}
 
 
-class GrepTool(Tool):
+class GrepTool(_WorkspaceFileTool):
     """Search code with ripgrep."""
 
     MAX_RESULTS = 100
@@ -55,9 +55,10 @@ class GrepTool(Tool):
                 "Search code with a regex pattern using ripgrep. Results are limited to 100 matches. "
                 "Use `include` to narrow the search when you already know the relevant file types."
             ),
+            project_root=project_root,
+            working_dir=working_dir,
+            category="readonly",
         )
-        self.project_root = Path(project_root).expanduser().resolve()
-        self.working_dir = ensure_working_dir(self.project_root, working_dir)
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -103,7 +104,7 @@ class GrepTool(Tool):
             )
 
         try:
-            root = resolve_path(self.project_root, self.working_dir, raw_path)
+            root = self._resolve_path(raw_path)
         except ValueError:
             return ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
@@ -145,7 +146,7 @@ class GrepTool(Tool):
         truncated = total_matches > self.MAX_RESULTS
         final_matches = matches[: self.MAX_RESULTS]
 
-        rel_root = relative_display(self.project_root, root)
+        rel_root = self._display_path(root)
         data = {
             "pattern": pattern,
             "path": rel_root,
@@ -294,7 +295,7 @@ class GrepTool(Tool):
         path_obj = Path(path_text)
         if not path_obj.is_absolute():
             path_obj = path_obj.resolve()
-        return relative_display(self.project_root, path_obj)
+        return self._display_path(path_obj)
 
     @staticmethod
     def _looks_like_regex_error(stderr_text: str) -> bool:

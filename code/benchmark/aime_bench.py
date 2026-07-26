@@ -180,10 +180,9 @@ for correct modeling, but the final answer must come from running code.
         return None
 
     @staticmethod
-    def _retry_prompt(problem: str, round_idx: int) -> str:
+    def _retry_prompt(round_idx: int) -> str:
         """Rounds 2-3 retry prompts: first nudge to submit or rethink, then final
         push to submit whatever answer is available."""
-        del problem
         if round_idx == 2:
             return (
                 "Your previous response did not include a Finish tool call.\n\n"
@@ -254,7 +253,7 @@ for correct modeling, but the final answer must come from running code.
                 }
 
             def retry_prompt_builder(round_idx: int, _feedback: str) -> str:
-                return self._retry_prompt(problem, round_idx)
+                return self._retry_prompt(round_idx)
 
             def run_kwargs_builder(round_idx: int) -> Optional[Dict[str, Any]]:
                 if round_idx <= 1:

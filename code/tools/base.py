@@ -62,17 +62,19 @@ class Tool(ABC):
     - Supports structured status, data, and error information
     """
 
-    def __init__(self, name: str, description: str, expandable: bool = False):
+    def __init__(self, name: str, description: str, expandable: bool = False, category: str = "general"):
         """Initialize the tool
 
         Args:
             name: Tool name
             description: Tool description
             expandable: Whether it can be expanded into multiple sub-tools
+            category: Tool category for filtering (readonly/write/dangerous/interactive/network/general)
         """
         self.name = name
         self.description = description
         self.expandable = expandable
+        self.category = category
 
     @abstractmethod
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
@@ -96,49 +98,36 @@ class Tool(ABC):
         """Get tool parameter definitions"""
         pass
 
-    def run_with_timing(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """Execute the tool and automatically add time statistics and context information
-
-        This method will:
-        1. Record the execution start time
-        2. Call the run() method
-        3. Calculate execution time and add to stats
-        4. Add parameters to context
-
-        Args:
-            parameters: Tool parameter dictionary
-
-        Returns:
-            ToolResponse: Response object containing time statistics
-        """
-        start_time = time.time()
-
-        try:
-            response = self.run(parameters)
-        except Exception as e:
-            # Catch unhandled exceptions, convert to error response
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            return ToolResponse.error(
-                code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Unhandled exception occurred during tool execution: {str(e)}",
-                stats={"time_ms": elapsed_ms},
-                context={"params_input": parameters, "tool_name": self.name}
-            )
-
+    def _augment_timing_response(self, start_time: float, parameters: Dict[str, Any], response: ToolResponse) -> ToolResponse:
+        """Add elapsed time, parameter and tool-name metadata to a response."""
         elapsed_ms = int((time.time() - start_time) * 1000)
-
-        # Add time statistics
         if response.stats is None:
             response.stats = {}
         response.stats["time_ms"] = elapsed_ms
-
-        # Add context
         if response.context is None:
             response.context = {}
         response.context["params_input"] = parameters
         response.context["tool_name"] = self.name
-
         return response
+
+    def _build_timing_error_response(self, start_time: float, parameters: Dict[str, Any], exc: Exception) -> ToolResponse:
+        """Build an error response for an unhandled exception during timed execution."""
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return ToolResponse.error(
+            code=ToolErrorCode.INTERNAL_ERROR,
+            message=f"Unhandled exception occurred during tool execution: {str(exc)}",
+            stats={"time_ms": elapsed_ms},
+            context={"params_input": parameters, "tool_name": self.name},
+        )
+
+    def run_with_timing(self, parameters: Dict[str, Any]) -> ToolResponse:
+        """Execute the tool and automatically add time statistics and context information."""
+        start_time = time.time()
+        try:
+            response = self.run(parameters)
+        except Exception as e:
+            return self._build_timing_error_response(start_time, parameters, e)
+        return self._augment_timing_response(start_time, parameters, response)
 
     async def arun(self, parameters: Dict[str, Any]) -> ToolResponse:
         """Asynchronously execute the tool
@@ -159,41 +148,13 @@ class Tool(ABC):
         )
 
     async def arun_with_timing(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """Asynchronously execute the tool and automatically add time statistics
-
-        Args:
-            parameters: Tool parameter dictionary
-
-        Returns:
-            ToolResponse: Response object containing time statistics
-        """
+        """Asynchronously execute the tool and automatically add time statistics."""
         start_time = time.time()
-
         try:
             response = await self.arun(parameters)
         except Exception as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            return ToolResponse.error(
-                code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Unhandled exception occurred during tool execution: {str(e)}",
-                stats={"time_ms": elapsed_ms},
-                context={"params_input": parameters, "tool_name": self.name}
-            )
-
-        elapsed_ms = int((time.time() - start_time) * 1000)
-
-        # Add time statistics
-        if response.stats is None:
-            response.stats = {}
-        response.stats["time_ms"] = elapsed_ms
-
-        # Add context
-        if response.context is None:
-            response.context = {}
-        response.context["params_input"] = parameters
-        response.context["tool_name"] = self.name
-
-        return response
+            return self._build_timing_error_response(start_time, parameters, e)
+        return self._augment_timing_response(start_time, parameters, response)
 
     def get_expanded_tools(self) -> Optional[List['Tool']]:
         """Get the list of expanded sub-tools
@@ -222,9 +183,73 @@ class Tool(ABC):
         return tools if tools else None
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
-        """Validate parameters"""
+        """Validate parameters — checks required fields exist"""
         required_params = [p.name for p in self.get_parameters() if p.required]
         return all(param in parameters for param in required_params)
+
+    def _validate_against_schema(self, parameters: Dict[str, Any]) -> Optional[ToolResponse]:
+        """Validate parameters against the declared schema from get_parameters().
+
+        Checks required fields and basic type compatibility.  This is a first-pass
+        check; tools may still perform deeper validation inside ``run()``.
+
+        Returns None on success, or a ToolResponse error on failure.
+        """
+        schema = {p.name: p for p in self.get_parameters()}
+
+        # Check required parameters
+        for p in self.get_parameters():
+            if p.required and p.name not in parameters:
+                return ToolResponse.error(
+                    code=ToolErrorCode.INVALID_PARAM,
+                    message=f"Missing required parameter: {p.name}",
+                )
+
+        # Check types of provided parameters
+        for name, value in parameters.items():
+            if name not in schema:
+                continue  # Allow extra parameters
+            expected = schema[name]
+            expected_type = expected.type
+
+            if expected_type == "string":
+                if not isinstance(value, str):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected string, got {type(value).__name__}.",
+                    )
+            elif expected_type == "integer":
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected integer, got {type(value).__name__}.",
+                    )
+            elif expected_type == "number":
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected number, got {type(value).__name__}.",
+                    )
+            elif expected_type == "boolean":
+                if not isinstance(value, bool):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected boolean, got {type(value).__name__}.",
+                    )
+            elif expected_type == "array":
+                if not isinstance(value, (list, str)):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected array, got {type(value).__name__}.",
+                    )
+            elif expected_type == "object":
+                if not isinstance(value, (dict, str)):
+                    return ToolResponse.error(
+                        code=ToolErrorCode.INVALID_PARAM,
+                        message=f"Invalid parameter `{name}`: expected object, got {type(value).__name__}.",
+                    )
+
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format"""
@@ -235,54 +260,6 @@ class Tool(ABC):
                 param.model_dump() if hasattr(param, "model_dump") else param.dict()
                 for param in self.get_parameters()
             ]
-        }
-
-    def to_openai_schema(self) -> Dict[str, Any]:
-        """Convert to OpenAI function calling schema format
-
-        Used for FunctionCallAgent, enabling the tool to be used by native OpenAI function calling
-
-        Returns:
-            Schema that complies with the OpenAI function calling standard
-        """
-        parameters = self.get_parameters()
-
-        # Build properties
-        properties = {}
-        required = []
-
-        for param in parameters:
-            # Basic property definition
-            prop = {
-                "type": param.type,
-                "description": param.description
-            }
-
-            # If there is a default value, add it to the description (OpenAI schema does not support the default field)
-            if param.default is not None:
-                prop["description"] = f"{param.description} (Default: {param.default})"
-
-            # If it is an array type, add items definition
-            if param.type == "array":
-                prop["items"] = {"type": "string"}  # Default string array
-
-            properties[param.name] = prop
-
-            # Collect required parameters
-            if param.required:
-                required.append(param.name)
-
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }
-            }
         }
 
     def __str__(self) -> str:

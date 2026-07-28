@@ -11,7 +11,7 @@ from ..tools.registry import ToolRegistry
 from .react_agent import ReActAgent
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_CODE_AGENT_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "system_prompt.md"
+_CODE_AGENT_PROMPT_FILE = _PROJECT_ROOT / "code" / "prompts" / "system_prompt.md"
 CODE_AGENT_SYSTEM_PROMPT: str = _CODE_AGENT_PROMPT_FILE.read_text(encoding="utf-8")
 
 # 重要-4: give the coding agent a finite default step budget so a model that

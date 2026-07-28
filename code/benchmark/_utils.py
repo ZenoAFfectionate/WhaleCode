@@ -209,7 +209,7 @@ def truncate_feedback(
 
 def build_benchmark_system_prompt(project_root: Path) -> str:
     """Derive the benchmark system prompt from the canonical system prompt file."""
-    prompt_file = project_root / "prompts" / "system_prompt.md"
+    prompt_file = project_root / "code" / "prompts" / "system_prompt.md"
     text = prompt_file.read_text(encoding="utf-8")
 
     text = re.sub(r"\n### User Interaction\n.*?(?=\n###|\n##|\Z)", "", text, flags=re.DOTALL)

@@ -54,13 +54,6 @@
           <span class="label">模型</span>
           <strong id="activeModel">未加载</strong>
         </div>
-        <div class="reactor-gpu">
-          <div class="gpu-head">
-            <span class="label">GPU 显存</span>
-            <b id="gpuReadout">—</b>
-          </div>
-          <div class="meter"><span id="gpuBar" style="width:0%"></span></div>
-        </div>
       </div>
     </aside>
 
@@ -89,6 +82,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
             新会话
           </button>
+          <button class="ghost-button danger-button" id="cancelAgentButton" type="button" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+            取消运行
+          </button>
         </header>
 
         <div class="trace-stream" id="traceStream">
@@ -96,6 +93,7 @@
         </div>
 
         <form class="composer" id="agentForm">
+          <div class="resume-banner" id="resumeBanner" hidden></div>
           <div class="prompt-box">
             <textarea id="promptInput" rows="1" placeholder="输入代码问题、开发任务或调试需求…"></textarea>
             <button class="primary-button" id="runAgentButton" type="submit">
@@ -141,6 +139,7 @@
                   </select>
                 </label>
                 <button class="primary-button" id="runBenchButton" type="submit">运行评测</button>
+                <button class="ghost-button danger-button" id="cancelBenchButton" type="button" hidden>取消评测</button>
               </form>
             </section>
 

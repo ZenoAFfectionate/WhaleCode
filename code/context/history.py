@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_SUMMARY_PROMPT_FILE = _PROJECT_ROOT / "prompts" / "summary_prompt.md"
+_SUMMARY_PROMPT_FILE = _PROJECT_ROOT / "code" / "prompts" / "summary_prompt.md"
 _FULL_OUTPUT_PATH_PATTERNS = (
     re.compile(r"^full_output_path:\s*(.+)$", re.MULTILINE),
     re.compile(r"^Full output saved to:\s*(.+)$", re.MULTILINE),

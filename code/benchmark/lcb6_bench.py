@@ -571,10 +571,8 @@ class LCB6Benchmark(BenchmarkRunner):
         return self._load_jsonl_tasks(task_transform=transform)
 
     def _run_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        # LCB6 uses a custom submission loop instead of _run_controlled_submission_rounds
-        # because it needs cumulative step-budget tracking: each round passes
-        # ``start_step`` to _run_agent_prompt, and the loop checks whether the total
-        # step budget has been exhausted between rounds.
+        # LCB6 uses a custom submission loop instead of _run_controlled_submission_rounds.
+        # Each round gets a fresh 64-step budget so early rounds don't starve later ones.
         task_id = task["task_id"]
         title = task.get("question_title", "")
         question = task.get("question_content", "")
@@ -631,22 +629,9 @@ class LCB6Benchmark(BenchmarkRunner):
             evaluation = None
             last_feedback = None
             rounds_used = 0
-            cumulative_steps = 0
-            total_step_budget = max(int(getattr(agent, "max_steps", 0) or 0), 0)
 
             for round_idx in range(1, self.max_submission_rounds + 1):
                 rounds_used = round_idx
-                if total_step_budget > 0 and cumulative_steps >= total_step_budget:
-                    evaluation = {
-                        "passed": False,
-                        "output": (
-                            f"Step budget exhausted after {cumulative_steps}/{total_step_budget} steps "
-                            "before another controlled submission could start."
-                        ),
-                        "public_passed": 0,
-                        "private_passed": 0,
-                    }
-                    break
 
                 prompt = initial_prompt if round_idx == 1 else (
                     f"Controlled evaluation feedback for submission round {round_idx - 1}:\n\n"
@@ -666,17 +651,10 @@ class LCB6Benchmark(BenchmarkRunner):
                     task_id=task_id,
                     prompt_text=prompt,
                     start_time=start,
-                    run_kwargs={"start_step": cumulative_steps},
                     error_extra={
                         "mode": mode,
                         "submission_rounds": round_idx,
-                        "steps_used": cumulative_steps,
-                        "step_budget": total_step_budget,
                     },
-                )
-                cumulative_steps = max(
-                    cumulative_steps,
-                    int(getattr(agent, "_current_step", cumulative_steps) or cumulative_steps),
                 )
                 if error_result is not None:
                     result = error_result
@@ -692,8 +670,6 @@ class LCB6Benchmark(BenchmarkRunner):
                         extra={
                             "mode": mode,
                             "submission_rounds": round_idx,
-                            "steps_used": cumulative_steps,
-                            "step_budget": total_step_budget,
                         },
                     )
                     return result
@@ -711,12 +687,6 @@ class LCB6Benchmark(BenchmarkRunner):
                 )
                 if evaluation["passed"]:
                     break
-                if total_step_budget > 0 and cumulative_steps >= total_step_budget:
-                    evaluation["output"] = (
-                        f"{evaluation['output']}\n\n"
-                        f"Step budget exhausted after {cumulative_steps}/{total_step_budget} steps."
-                    )
-                    break
 
                 last_feedback = truncate_feedback(evaluation["output"], max_lines=80, max_chars=12000)
 
@@ -731,8 +701,6 @@ class LCB6Benchmark(BenchmarkRunner):
                     extra={
                         "mode": mode,
                         "submission_rounds": 0,
-                        "steps_used": cumulative_steps,
-                        "step_budget": total_step_budget,
                     },
                 )
                 return result
@@ -758,8 +726,6 @@ class LCB6Benchmark(BenchmarkRunner):
                     "public_passed": evaluation["public_passed"],
                     "private_passed": evaluation["private_passed"],
                     "submission_rounds": rounds_used,
-                    "steps_used": cumulative_steps,
-                    "step_budget": total_step_budget,
                 },
             )
             return result
@@ -789,10 +755,11 @@ def main() -> None:
         default_temperature=1.0,
         default_max_steps=96,
         default_timeout=120,
+        default_max_tokens=32768,
         include_task_timeout=True,
-        default_task_timeout=1200,
+        default_task_timeout=1800,
     )
-    parser.add_argument("--max-submission-rounds", type=int, default=3)
+    parser.add_argument("--max-submission-rounds", type=int, default=5)
     args = parser.parse_args()
 
     bench = LCB6Benchmark(
@@ -800,7 +767,7 @@ def main() -> None:
         max_submission_rounds=args.max_submission_rounds,
         **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume, fresh=args.fresh)
 
 
 if __name__ == "__main__":

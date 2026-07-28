@@ -10,7 +10,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SWEBENCH_ROOT="${SWEBENCH_ROOT:-/home/kemove/LLM_Projects/SWE-bench}"
 SWEV_DATASET_NAME="${SWEV_DATASET_NAME:-princeton-nlp/SWE-bench_Verified}"
 SWEV_SPLIT="${SWEV_SPLIT:-test}"
 SWEV_EVAL_WORKERS="${SWEV_EVAL_WORKERS:-4}"
@@ -39,9 +38,9 @@ if ! docker info > /dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -d "$SWEBENCH_ROOT/swebench" ]; then
-    echo "ERROR: SWE-bench repo not found at $SWEBENCH_ROOT"
-    echo "Clone it: git clone https://github.com/SWE-bench/SWE-bench.git $SWEBENCH_ROOT"
+# Verify swebench is importable (pip install swebench)
+if ! python -c "from swebench.harness import run_evaluation" 2>/dev/null; then
+    echo "ERROR: swebench is not installed. Run: pip install swebench"
     exit 1
 fi
 
@@ -52,10 +51,7 @@ RUN_ID="whale-code-$(date +%Y%m%d_%H%M%S)"
 echo "=== SWE-bench Docker Evaluation ==="
 echo "  Predictions: $PREDICTIONS_FILE"
 echo "  Run ID:      $RUN_ID"
-echo "  SWE-bench:   $SWEBENCH_ROOT"
 echo ""
-
-export PYTHONPATH="$SWEBENCH_ROOT:${PYTHONPATH:-}"
 
 python -m swebench.harness.run_evaluation \
     --dataset_name "$SWEV_DATASET_NAME" \

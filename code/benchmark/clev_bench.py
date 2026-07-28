@@ -26,82 +26,29 @@ except ImportError:
 
 
 _CLEV_ADDENDUM = """\
-You are an expert Python programmer. Your task is to implement all methods in a \
-Python class by reading the skeleton (signatures + docstrings) and writing \
-complete, correct method bodies.
+You are an expert Python programmer. Implement ALL methods in the provided class skeleton (`solution.py`) according to their docstrings. Do NOT modify class name, method signatures, or docstrings. Keep existing imports; add new ones as needed.
+
+**Critical: File I/O**
+NEVER use bare `open()`. The security checker rejects it. Always use `io.open()`:
+    import io, json
+    with io.open("file.txt", "r") as f: data = f.read()
+Also blocked: `eval/exec/compile/__import__`, `Path.read_text/write_text`, `os.system/os.popen`, and imports of `socket/subprocess/requests/urllib/http/ftplib`. Libraries like `sqlite3/PIL/openpyxl/PyPDF2/csv` work normally.
 
 **Workflow**
-1. Read `solution.py` — understand every method signature, docstring, `__init__`, and imports.
-2. Implement every method according to its docstring.
-3. Submit with `Finish`; hidden tests run on the evaluator side and return bounded feedback.
-4. Revise `solution.py` based on feedback and resubmit.
-5. Note: the workspace contains only `solution.py` — there are no local tests to run,
-   so the only informative verification is submitting via `Finish`.
-6. Total time budget is ~1200s across all rounds. After round 3, submit your best
-   effort even if imperfect. A partial pass is better than a timeout.
+1. Read the skeleton → understand every method and docstring.
+2. Implement all methods. Tests are hidden; submit via `Finish` to get feedback.
+3. Revise based on feedback and re-submit. Fix ALL failing tests per round, not one at a time.
+4. After round 6, submit your best effort — partial pass > timeout. ~1200s total budget.
 
-**Rules**
-- You MUST implement every method. Never refuse or say you cannot.
-- Do NOT modify the class name, method signatures, or docstrings.
-- Keep all existing imports; add new imports if needed.
-- Update `__init__` if your implementations require additional instance attributes.
+**Reading Feedback**
+- `[SECURITY]`: you used a blocked call → replace (e.g. `open()` → `io.open()`). Never retry a blocked approach.
+- `AssertionError X != Y`: X is your output, Y is expected. Follow docstrings literally (case sensitivity, sentinel returns, exact shapes).
+- Same test failing after 2+ rounds → your diagnosis is wrong. Re-read feedback context lines.
 
-**How hidden tests run (IMPORTANT)**
-The hidden unittest code is APPENDED to your `solution.py` and executed as ONE
-module. Consequences:
-- Imports in `solution.py` are visible to the tests. If feedback shows
-  `NameError: name 'X' is not defined` raised inside TEST code, the fix is to
-  add the missing import (e.g. `from PIL import ImageChops`) to `solution.py`,
-  even if your own code never uses X. Do NOT dismiss it as a test bug.
-- Tests create REAL files (json / xlsx / sqlite / images) in the working
-  directory and expect your methods to actually read/write them. NEVER stub
-  file I/O out with try/except-return-default — that guarantees failure.
-
-**Static security check on solution.py (source-level only, not a runtime sandbox)**
-Your solution SOURCE is rejected with `[SECURITY]` if it contains:
-- calls to bare builtins `open()`, `eval()`, `exec()`, `compile()`, `__import__()`
-- `Path(...).read_text/write_text/open/touch/unlink/mkdir/...`
-- imports of `socket`, `subprocess`, `requests`, `urllib`, `http`, `ftplib`, `paramiko`
-- `os.system`, `os.popen`, `os.remove`, `os.environ` and similar os calls
-Everything else runs normally at runtime. For file I/O use `io.open()` — it is
-allowed and fully functional:
-    import io, json
-    with io.open(self.cookies_file, 'r') as f:
-        data = json.load(f)
-Libraries like `sqlite3`, `openpyxl`, `PIL`, `csv` work normally (their internal
-file I/O is fine); only your own source is checked.
-
-**Correctness heuristics (apply on the FIRST pass)**
-- Follow the docstring TEXT literally, including side notes like
-  "strictly case sensitive". Examples show the EXACT return shape:
-  a DB row is a tuple like ('user1', 'pass1'), not a string; a matrix over
-  data is len(data) x len(data); etc.
-- Do NOT add behavior the docstring doesn't ask for: no case-folding, no
-  `str()`/`.strip()` wrappers, no graceful fallbacks. "Return False if there is
-  no current song" means return False even when the playlist is non-empty.
-- Methods receiving a dict usually must validate it first: if the argument is
-  not a dict or a required key is missing, return the sentinel the tests imply
-  (False, -1, None, or an error string) and leave state unchanged. Hidden tests
-  probe lists and missing keys.
-- When a method stores received data, store exactly what the examples show
-  (often the FULL dict, not a reduced key->value form).
-- Zero-variance / division-by-zero statistics cases usually return None.
-- Do NOT modify values in place when examples show appending a new element.
-
-**Reading feedback**
-- In `AssertionError: A != B`, A is what YOUR code returned, B is the expected
-  value (tests call assertEqual(actual, expected)).
-- `[SECURITY]` means the static check rejected your source; tests never ran.
-  Replace the flagged call (e.g. `open()` -> `io.open()`). Do NOT delete the
-  functionality, and do NOT try another blocked approach.
-- If the same test fails 2+ rounds, your diagnosis is wrong — re-read the
-  failing test's context lines and fix the ROOT cause. Fix ALL failing tests in
-  one revision, not one test per round.
-
-**API Freshness**
-- Use current library APIs, e.g. PyPDF2 `PdfReader`/`PdfWriter` (NOT the
-  deprecated `PdfFileReader`/`PdfFileWriter`). Prefer the API that does not
-  trigger a DeprecationWarning.
+**Sanity Checks (apply on first pass)**
+- Dict arguments: validate type/keys first; return sentinel (False/-1/None) on bad input.
+- Store data exactly as docstring examples show. Do not add case-folding/`str()`/`.strip()` unless asked.
+- Use current library APIs: e.g. PyPDF2 `PdfReader` (NOT deprecated `PdfFileReader`).
 """
 
 _CLEV_SYSTEM_PROMPT = (
@@ -317,7 +264,7 @@ class ClassEvalBenchmark(BenchmarkRunner):
 
     benchmark_name = "classeval"
 
-    def __init__(self, *args, max_submission_rounds: int = 5, **kwargs):
+    def __init__(self, *args, max_submission_rounds: int = 8, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_submission_rounds = max(1, int(max_submission_rounds))
 
@@ -360,7 +307,7 @@ class ClassEvalBenchmark(BenchmarkRunner):
                 f"Timeout:\n"
                 f"- ~1200s total budget. There are no local tests to run — the only informative\n"
                 f"  verification is submitting via Finish.\n"
-                f"- After round 3, submit best effort even if imperfect.\n"
+                f"- After round 6, submit best effort even if imperfect.\n"
             )
 
             start = time.time()
@@ -397,10 +344,10 @@ class ClassEvalBenchmark(BenchmarkRunner):
                         f"re-examine your assumptions.\n"
                     )
 
-                # Timeout nudge after round 3
+                # Timeout nudge after round 5
                 timeout_nudge = ""
-                if round_idx >= 4:
-                    timeout_nudge = f"⏰ Round {round_idx - 1}/5. Submit best effort soon to avoid timeout.\n"
+                if round_idx >= 6:
+                    timeout_nudge = f"⏰ Round {round_idx - 1}/8. Submit best effort soon to avoid timeout.\n"
 
                 # Trim long feedback but always keep the SUMMARY block (printed
                 # first) so the agent sees the full list of failing tests.
@@ -493,10 +440,11 @@ def main():
         default_temperature=1.0,
         default_max_steps=128,
         default_timeout=120,
+        default_max_tokens=32768,
         include_task_timeout=True,
         default_task_timeout=1200,
     )
-    parser.add_argument("--max-submission-rounds", type=int, default=5)
+    parser.add_argument("--max-submission-rounds", type=int, default=8)
     args = parser.parse_args()
 
     bench = ClassEvalBenchmark(
@@ -505,7 +453,7 @@ def main():
         **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
 
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume, fresh=args.fresh)
 
 
 if __name__ == "__main__":

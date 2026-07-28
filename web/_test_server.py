@@ -29,6 +29,7 @@ sys.modules["hello_agents.tools.registry"].ToolRegistry = type("ToolRegistry", (
 
 spec = importlib.util.spec_from_file_location("whale_server", WEB / "server.py")
 server = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = server
 spec.loader.exec_module(server)
 
 failures = []

@@ -131,11 +131,10 @@ for correct modeling, but the final answer must come from running code.
             self.year = _infer_year_from_path(self.data_path)
         if self.year is not None:
             self.benchmark_name = f"aime_{self.year}"
-        # Cap agent steps: no AIME solution in our data exceeded 33 steps;
-        # 48 is generous while preventing the 128-step verification-loop
-        # runaway seen with aime25_12 (7 .py files, never called Finish).
-        if self.max_steps > 48:
-            self.max_steps = 48
+        # Cap at 64: AIME solutions average ~33 steps; 64 is generous
+        # enough for complex problems while preventing runaway loops.
+        if self.max_steps > 64:
+            self.max_steps = 64
 
     def _get_system_prompt(self):
         return BENCHMARK_BASE_SYSTEM_PROMPT + "\n\n---\n\n" + self._MATH_SYSTEM_PROMPT
@@ -374,7 +373,7 @@ def main():
         data_path=str(data_path),
         **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume, fresh=args.fresh)
 
 
 if __name__ == "__main__":

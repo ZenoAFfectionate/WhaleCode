@@ -400,7 +400,7 @@ def main():
         max_submission_rounds=args.max_submission_rounds,
         **BenchmarkRunner.runner_kwargs_from_args(args, include_task_timeout=True),
     )
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume, fresh=args.fresh)
 
 
 if __name__ == "__main__":

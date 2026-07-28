@@ -1,1561 +1,2951 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WhaleCode | Agent Console</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta
     name="description"
-    content="WhaleCode 智能体 Web 控制台，支持对话式代码任务、运行详情、vLLM 模型管理与数据集测试。"
+    content="WhaleCode showcase — a production-grade coding agent framework built on HelloAgent and upgraded for real repository work, safe tools, context engineering, and benchmark evaluation."
   />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap"
-    rel="stylesheet"
-  />
+  <title>WhaleCode — Production-Grade Coding Agent Showcase</title>
   <style>
     :root {
-      --bg: #070b14;
-      --bg-soft: #0b1220;
-      --panel: rgba(15, 23, 42, 0.78);
-      --panel-strong: #111827;
-      --panel-muted: #0f172a;
-      --line: #243047;
-      --line-soft: rgba(148, 163, 184, 0.16);
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --muted-2: #64748b;
-      --blue: #3b82f6;
-      --blue-strong: #2563eb;
-      --cyan: #22d3ee;
-      --green: #22c55e;
-      --amber: #f59e0b;
-      --red: #ef4444;
-      --purple: #a78bfa;
-      --shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
-      --radius: 18px;
+      color-scheme: dark;
+      --bg: #050914;
+      --bg-2: #08162a;
+      --panel: rgba(11, 24, 45, 0.78);
+      --panel-strong: rgba(15, 33, 62, 0.94);
+      --panel-soft: rgba(255, 255, 255, 0.055);
+      --text: #eef7ff;
+      --muted: #a5b8d5;
+      --subtle: #6f86aa;
+      --line: rgba(155, 190, 255, 0.22);
+      --line-strong: rgba(120, 207, 255, 0.5);
+      --cyan: #46d5ff;
+      --blue: #6a8dff;
+      --violet: #a476ff;
+      --mint: #54f0b4;
+      --amber: #ffd166;
+      --rose: #ff6f91;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+      --radius-xl: 32px;
+      --radius-lg: 24px;
+      --radius-md: 18px;
       --radius-sm: 12px;
-      --sidebar: 284px;
-      --topbar: 72px;
+      --max: 1180px;
+      --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
     }
 
     * {
       box-sizing: border-box;
     }
 
-    html,
+    html {
+      scroll-behavior: smooth;
+    }
+
     body {
       margin: 0;
-      min-height: 100%;
-      background:
-        linear-gradient(135deg, rgba(37, 99, 235, 0.14), transparent 36%),
-        radial-gradient(circle at 88% 6%, rgba(34, 211, 238, 0.12), transparent 24%),
-        linear-gradient(180deg, #050812 0%, #08111f 54%, #070b14 100%);
+      min-height: 100vh;
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.6;
       color: var(--text);
-      font-family: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(70, 213, 255, 0.23), transparent 34rem),
+        radial-gradient(circle at 82% 8%, rgba(164, 118, 255, 0.24), transparent 33rem),
+        radial-gradient(circle at 65% 48%, rgba(84, 240, 180, 0.12), transparent 34rem),
+        linear-gradient(145deg, #030712 0%, var(--bg) 46%, #071425 100%);
       overflow-x: hidden;
     }
 
-    button,
-    input,
-    textarea,
-    select {
-      font: inherit;
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -3;
+      pointer-events: none;
+      content: "";
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+      background-size: 72px 72px;
+      mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.95), transparent 78%);
     }
 
-    button {
-      cursor: pointer;
+    body::after {
+      position: fixed;
+      inset: -25%;
+      z-index: -2;
+      pointer-events: none;
+      content: "";
+      background:
+        conic-gradient(from 140deg, transparent, rgba(70, 213, 255, 0.08), transparent 32%),
+        conic-gradient(from 320deg, transparent, rgba(164, 118, 255, 0.08), transparent 28%);
+      filter: blur(70px);
+      animation: aurora 18s ease-in-out infinite alternate;
     }
 
-    .app-shell {
-      min-height: 100vh;
-      display: grid;
-      grid-template-columns: var(--sidebar) minmax(0, 1fr);
+    @keyframes aurora {
+      from {
+        transform: rotate(0deg) scale(1);
+      }
+      to {
+        transform: rotate(12deg) scale(1.08);
+      }
     }
 
-    .sidebar {
-      position: sticky;
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    img {
+      display: block;
+      max-width: 100%;
+    }
+
+    code {
+      padding: 0.12rem 0.34rem;
+      border: 1px solid rgba(120, 207, 255, 0.2);
+      border-radius: 0.45rem;
+      color: #cfefff;
+      background: rgba(70, 213, 255, 0.08);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .page-progress {
+      position: fixed;
       top: 0;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-      padding: 18px;
-      border-right: 1px solid var(--line-soft);
-      background: rgba(5, 10, 20, 0.88);
-      backdrop-filter: blur(16px);
+      left: 0;
+      z-index: 100;
+      width: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--violet), var(--mint));
+      box-shadow: 0 0 28px rgba(70, 213, 255, 0.8);
     }
 
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-height: 38px;
-    }
-
-    .brand-mark {
-      width: 38px;
-      height: 38px;
-      border-radius: 12px;
-      display: grid;
-      place-items: center;
-      color: #fff;
-      background: linear-gradient(135deg, var(--blue), var(--cyan));
-      box-shadow: 0 16px 36px rgba(37, 99, 235, 0.35);
-      font-family: "Space Grotesk", sans-serif;
-      font-weight: 700;
-    }
-
-    .brand-title {
-      display: grid;
-      gap: 2px;
-    }
-
-    .brand-title strong {
-      font-family: "Space Grotesk", sans-serif;
-      letter-spacing: 0.01em;
-    }
-
-    .brand-title span {
-      color: var(--muted);
-      font-size: 0.78rem;
+    .shell {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
     }
 
     .nav {
-      display: grid;
-      gap: 8px;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(5, 9, 20, 0.72);
+      backdrop-filter: blur(22px);
     }
 
-    .nav-button,
-    .ghost-button,
-    .primary-button,
-    .icon-button {
-      border: 0;
-      color: var(--text);
-      transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, opacity 0.18s ease;
-    }
-
-    .nav-button {
-      width: 100%;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 11px 12px;
-      border: 1px solid transparent;
-      border-radius: 12px;
-      background: transparent;
-      color: var(--muted);
-      text-align: left;
-    }
-
-    .nav-button svg {
-      flex: 0 0 auto;
-    }
-
-    .nav-button.active,
-    .nav-button:hover {
-      color: var(--text);
-      border-color: rgba(59, 130, 246, 0.28);
-      background: rgba(59, 130, 246, 0.12);
-    }
-
-    .session-panel {
-      min-height: 0;
-      display: flex;
-      flex: 1;
-      flex-direction: column;
-      gap: 10px;
-      padding-top: 10px;
-      border-top: 1px solid var(--line-soft);
-    }
-
-    .section-kicker {
+    .nav-inner {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      color: var(--muted-2);
-      font-size: 0.75rem;
-      font-weight: 700;
+      gap: 1rem;
+      min-height: 76px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.8rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      background:
+        radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.28), transparent 38%),
+        linear-gradient(135deg, rgba(70, 213, 255, 0.92), rgba(106, 141, 255, 0.88) 52%, rgba(164, 118, 255, 0.9));
+      box-shadow: 0 16px 36px rgba(70, 213, 255, 0.28);
+    }
+
+    .brand-mark svg {
+      width: 25px;
+      height: 25px;
+      fill: #06101f;
+    }
+
+    .brand small {
+      display: block;
+      margin-top: -0.3rem;
+      color: var(--subtle);
+      font-size: 0.72rem;
+      font-weight: 600;
       letter-spacing: 0.08em;
       text-transform: uppercase;
     }
 
-    .session-list {
-      display: grid;
-      gap: 8px;
-      overflow: auto;
-      padding-right: 2px;
-    }
-
-    .session-item {
-      display: grid;
-      grid-template-columns: 1fr auto;
+    .nav-links {
+      display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 10px;
-      border: 1px solid var(--line-soft);
-      border-radius: 12px;
-      background: rgba(15, 23, 42, 0.48);
-    }
-
-    .session-item.active {
-      border-color: rgba(34, 211, 238, 0.34);
-      background: rgba(34, 211, 238, 0.08);
-    }
-
-    .session-name {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      gap: 0.35rem;
+      color: var(--muted);
       font-size: 0.9rem;
+      font-weight: 650;
     }
 
-    .session-meta {
-      margin-top: 3px;
-      color: var(--muted-2);
-      font-size: 0.74rem;
+    .nav-links a {
+      padding: 0.58rem 0.78rem;
+      border-radius: 999px;
+      transition:
+        color 180ms var(--ease),
+        background 180ms var(--ease);
     }
 
-    .icon-button {
-      width: 30px;
-      height: 30px;
-      display: grid;
-      place-items: center;
-      border-radius: 9px;
-      background: rgba(148, 163, 184, 0.08);
-      color: var(--muted);
-    }
-
-    .icon-button:hover {
-      background: rgba(239, 68, 68, 0.14);
-      color: #fecaca;
-    }
-
-    .sidebar-footer {
-      display: grid;
-      gap: 8px;
-      padding: 12px;
-      border: 1px solid var(--line-soft);
-      border-radius: var(--radius-sm);
-      background: linear-gradient(180deg, rgba(59, 130, 246, 0.10), rgba(15, 23, 42, 0.42));
-    }
-
-    .mini-metric {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      color: var(--muted);
-      font-size: 0.8rem;
-    }
-
-    .mini-metric strong {
+    .nav-links a:hover {
       color: var(--text);
-      font-family: "JetBrains Mono", monospace;
-      font-size: 0.82rem;
+      background: rgba(255, 255, 255, 0.08);
     }
 
-    .main {
-      min-width: 0;
-      display: grid;
-      grid-template-rows: var(--topbar) minmax(0, 1fr);
+    .nav-links a.active {
+      color: #06101f;
+      background: linear-gradient(135deg, rgba(70, 213, 255, 0.95), rgba(84, 240, 180, 0.92));
+      box-shadow: 0 10px 26px rgba(70, 213, 255, 0.16);
     }
 
-    .topbar {
-      position: sticky;
-      top: 0;
-      z-index: 5;
+    .nav-actions {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      padding: 14px 22px;
-      border-bottom: 1px solid var(--line-soft);
-      background: rgba(7, 11, 20, 0.78);
-      backdrop-filter: blur(18px);
+      gap: 0.7rem;
     }
 
-    .topbar-title {
-      min-width: 0;
-    }
-
-    .topbar-title h1 {
-      margin: 0;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: clamp(1.2rem, 2vw, 1.6rem);
-      letter-spacing: -0.02em;
-    }
-
-    .topbar-title p {
-      margin: 3px 0 0;
-      color: var(--muted);
-      font-size: 0.86rem;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .model-strip {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-
-    .pill {
+    .language-switcher {
       display: inline-flex;
       align-items: center;
-      gap: 7px;
-      min-height: 32px;
-      padding: 7px 10px;
-      border: 1px solid var(--line-soft);
+      gap: 0.2rem;
+      padding: 0.2rem;
+      border: 1px solid rgba(255, 255, 255, 0.13);
       border-radius: 999px;
-      background: rgba(15, 23, 42, 0.64);
+      background: rgba(255, 255, 255, 0.06);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+
+    .language-option {
+      min-width: 48px;
+      padding: 0.42rem 0.62rem;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
       color: var(--muted);
-      font-size: 0.82rem;
-      white-space: nowrap;
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 850;
+      letter-spacing: 0.03em;
+      transition:
+        color 180ms var(--ease),
+        background 180ms var(--ease),
+        box-shadow 180ms var(--ease);
     }
 
-    .dot {
-      width: 8px;
-      height: 8px;
-      flex: 0 0 auto;
-      border-radius: 999px;
-      background: var(--green);
-      box-shadow: 0 0 18px rgba(34, 197, 94, 0.8);
+    .language-option:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.08);
     }
 
-    .dot.warning {
-      background: var(--amber);
-      box-shadow: 0 0 18px rgba(245, 158, 11, 0.72);
+    .language-option.active {
+      color: #06101f;
+      background: linear-gradient(135deg, var(--cyan), var(--mint));
+      box-shadow: 0 10px 24px rgba(70, 213, 255, 0.2);
     }
 
-    .dot.error {
-      background: var(--red);
-      box-shadow: 0 0 18px rgba(239, 68, 68, 0.72);
+    html[lang="zh-CN"] body {
+      font-family:
+        Inter, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", ui-sans-serif,
+        system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
-    .page {
-      display: none;
-      min-width: 0;
-      padding: 22px;
+    html[lang="zh-CN"] h1,
+    html[lang="zh-CN"] h2,
+    html[lang="zh-CN"] h3 {
+      letter-spacing: -0.045em;
     }
 
-    .page.active {
-      display: block;
-    }
-
-    .agent-layout {
-      height: calc(100vh - var(--topbar) - 44px);
-      min-height: 700px;
+    .hero {
+      position: relative;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 360px;
-      gap: 18px;
+      grid-template-columns: minmax(0, 1.05fr) minmax(330px, 0.95fr);
+      align-items: center;
+      gap: 2.6rem;
+      padding: 7.2rem 0 4.6rem;
     }
 
-    .panel {
-      border: 1px solid var(--line-soft);
-      border-radius: var(--radius);
-      background: var(--panel);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(18px);
+    .hero::before {
+      position: absolute;
+      top: 6.5rem;
+      right: 5%;
+      z-index: -1;
+      width: 340px;
+      height: 340px;
+      content: "";
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(70, 213, 255, 0.18), transparent 68%);
+      filter: blur(8px);
     }
 
-    .chat-panel {
-      min-width: 0;
+    .tool-showcase {
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 1rem;
+      padding-top: 0;
+    }
+
+    .tool-showcase-card {
+      position: relative;
       overflow: hidden;
+      padding: 1.15rem;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-xl);
+      background:
+        radial-gradient(circle at 8% 20%, rgba(70, 213, 255, 0.14), transparent 36%),
+        radial-gradient(circle at 92% 80%, rgba(84, 240, 180, 0.12), transparent 30%),
+        rgba(255, 255, 255, 0.045);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
     }
 
-    .panel-head {
+    .tool-showcase-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line-soft);
+      gap: 1rem;
+      margin-bottom: 1rem;
     }
 
-    .panel-head h2,
-    .panel-title {
+    .tool-showcase-head .kicker {
       margin: 0;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 1rem;
-      letter-spacing: -0.01em;
+      white-space: nowrap;
     }
 
-    .panel-head p {
-      margin: 4px 0 0;
+    .tool-showcase-head p {
+      max-width: 720px;
+      margin: 0;
       color: var(--muted);
-      font-size: 0.84rem;
+      font-size: 0.96rem;
+      text-align: right;
     }
 
-    .chat-stream {
-      overflow: auto;
-      padding: 18px;
-      display: grid;
-      align-content: start;
-      gap: 14px;
+    .tool-marquee {
+      position: relative;
+      overflow: hidden;
+      border-radius: 999px;
+      mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
     }
 
-    .message {
-      display: grid;
-      gap: 8px;
-      max-width: 840px;
-    }
-
-    .message.user {
-      justify-self: end;
-      width: min(760px, 88%);
-    }
-
-    .message.agent {
-      justify-self: start;
-      width: min(860px, 94%);
-    }
-
-    .message-label {
+    .tool-track {
       display: flex;
+      width: max-content;
+      gap: 0.62rem;
+      animation: tool-scroll 26s linear infinite;
+    }
+
+    .tool-marquee:hover .tool-track {
+      animation-play-state: paused;
+    }
+
+    .tool-pill {
+      display: inline-flex;
       align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 0.78rem;
+      gap: 0.42rem;
+      padding: 0.58rem 0.82rem;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 999px;
+      color: #dcecff;
+      background: rgba(255, 255, 255, 0.065);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+      font-size: 0.84rem;
+      font-weight: 850;
+      white-space: nowrap;
     }
 
-    .bubble {
-      border: 1px solid var(--line-soft);
-      border-radius: 18px;
-      padding: 14px;
-      background: rgba(15, 23, 42, 0.72);
-      line-height: 1.62;
+    .tool-pill::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      content: "";
+      background: var(--mint);
+      box-shadow: 0 0 16px rgba(84, 240, 180, 0.72);
     }
 
-    .message.user .bubble {
-      color: #eff6ff;
-      border-color: rgba(59, 130, 246, 0.32);
-      background: linear-gradient(135deg, rgba(37, 99, 235, 0.78), rgba(34, 211, 238, 0.28));
+    @keyframes tool-scroll {
+      from {
+        transform: translate3d(0, 0, 0);
+      }
+      to {
+        transform: translate3d(-50%, 0, 0);
+      }
     }
 
-    .code-block {
-      margin-top: 10px;
-      padding: 12px;
-      overflow: auto;
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      border-radius: 12px;
-      background: #060a12;
-      color: #dbeafe;
-      font-family: "JetBrains Mono", monospace;
-      font-size: 0.8rem;
-      line-height: 1.58;
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.42rem 0.72rem;
+      margin-bottom: 1.2rem;
+      border: 1px solid rgba(70, 213, 255, 0.28);
+      border-radius: 999px;
+      color: #cdefff;
+      background: rgba(70, 213, 255, 0.08);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      font-size: 0.86rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
     }
 
-    .run-summary {
+    .pulse {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--mint);
+      box-shadow: 0 0 0 7px rgba(84, 240, 180, 0.13), 0 0 24px rgba(84, 240, 180, 0.85);
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      max-width: 12ch;
+      margin-bottom: 1.4rem;
+      font-size: clamp(3.7rem, 8vw, 7.8rem);
+      line-height: 0.87;
+      letter-spacing: -0.09em;
+    }
+
+    .gradient-text {
+      color: transparent;
+      background: linear-gradient(90deg, #f8fcff 0%, #73dcff 38%, #a476ff 70%, #54f0b4 100%);
+      background-clip: text;
+      -webkit-background-clip: text;
+    }
+
+    .hero-copy {
+      max-width: 680px;
+      margin-bottom: 2rem;
+      color: #c5d7ee;
+      font-size: clamp(1.05rem, 1.55vw, 1.24rem);
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.9rem;
+      margin-bottom: 2.2rem;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.55rem;
+      min-height: 48px;
+      padding: 0.85rem 1.15rem;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      font-weight: 800;
+      transition:
+        transform 180ms var(--ease),
+        border-color 180ms var(--ease),
+        background 180ms var(--ease),
+        box-shadow 180ms var(--ease);
+    }
+
+    .button.primary {
+      border-color: rgba(70, 213, 255, 0.42);
+      background: linear-gradient(135deg, rgba(70, 213, 255, 0.95), rgba(106, 141, 255, 0.9));
+      color: #06101f;
+      box-shadow: 0 18px 50px rgba(70, 213, 255, 0.25);
+    }
+
+    .button:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255, 255, 255, 0.34);
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .button.primary:hover {
+      background: linear-gradient(135deg, rgba(84, 240, 180, 0.96), rgba(70, 213, 255, 0.92));
+      box-shadow: 0 20px 58px rgba(84, 240, 180, 0.22);
+    }
+
+    .hero-meta {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 12px;
+      gap: 0.8rem;
+      max-width: 650px;
     }
 
-    .summary-card,
-    .metric-card,
-    .model-card,
-    .dataset-card,
-    .history-row {
-      border: 1px solid var(--line-soft);
-      border-radius: var(--radius-sm);
-      background: rgba(15, 23, 42, 0.55);
+    .mini-stat {
+      padding: 0.92rem 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+      backdrop-filter: blur(16px);
     }
 
-    .summary-card {
-      padding: 10px;
+    .mini-stat strong {
+      display: block;
+      font-size: 1.24rem;
+      line-height: 1.1;
+      letter-spacing: -0.04em;
     }
 
-    .summary-label {
-      color: var(--muted-2);
-      font-size: 0.74rem;
-      font-weight: 700;
-      letter-spacing: 0.06em;
+    .mini-stat span {
+      display: block;
+      margin-top: 0.3rem;
+      color: var(--subtle);
+      font-size: 0.82rem;
+      font-weight: 650;
+    }
+
+    .hero-card {
+      position: relative;
+      padding: 1px;
+      border-radius: var(--radius-xl);
+      background:
+        linear-gradient(140deg, rgba(70, 213, 255, 0.5), rgba(164, 118, 255, 0.12), rgba(84, 240, 180, 0.42)),
+        rgba(255, 255, 255, 0.08);
+      box-shadow: var(--shadow);
+    }
+
+    @keyframes float-card {
+      from {
+        transform: translate3d(0, 0, 0);
+      }
+      to {
+        transform: translate3d(0, -10px, 0);
+      }
+    }
+
+    .runtime-card {
+      position: relative;
+      overflow: hidden;
+      padding: 1.1rem;
+      border-radius: calc(var(--radius-xl) - 1px);
+      background:
+        linear-gradient(180deg, rgba(10, 24, 47, 0.97), rgba(5, 10, 22, 0.96)),
+        var(--panel);
+      animation: float-card 7s ease-in-out infinite alternate;
+    }
+
+    .runtime-card::after {
+      position: absolute;
+      right: -85px;
+      bottom: -95px;
+      width: 220px;
+      height: 220px;
+      content: "";
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(70, 213, 255, 0.26), transparent 68%);
+      filter: blur(6px);
+    }
+
+    .window-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.6rem 0.65rem 0.95rem;
+      color: var(--subtle);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
       text-transform: uppercase;
     }
 
-    .summary-value {
-      margin-top: 5px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-family: "JetBrains Mono", monospace;
-      font-size: 0.9rem;
-    }
-
-    .composer {
-      display: grid;
-      gap: 12px;
-      padding: 16px;
-      border-top: 1px solid var(--line-soft);
-      background: rgba(7, 11, 20, 0.55);
-    }
-
-    textarea {
-      width: 100%;
-      min-height: 92px;
-      resize: vertical;
-      border: 1px solid var(--line-soft);
-      border-radius: 14px;
-      outline: none;
-      padding: 13px 14px;
-      background: rgba(2, 6, 23, 0.72);
-      color: var(--text);
-      line-height: 1.5;
-    }
-
-    textarea:focus,
-    select:focus,
-    input:focus {
-      border-color: rgba(59, 130, 246, 0.78);
-      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
-    }
-
-    .composer-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
-    .quick-prompts {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    .ghost-button,
-    .primary-button {
-      min-height: 38px;
+    .dots {
       display: inline-flex;
+      gap: 0.42rem;
+    }
+
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--rose);
+    }
+
+    .dot:nth-child(2) {
+      background: var(--amber);
+    }
+
+    .dot:nth-child(3) {
+      background: var(--mint);
+    }
+
+    .agent-flow {
+      position: relative;
+      display: grid;
+      gap: 0.75rem;
+      padding: 0.75rem;
+    }
+
+    .flow-row {
+      position: relative;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
       align-items: center;
-      justify-content: center;
-      gap: 8px;
-      border-radius: 12px;
-      padding: 9px 12px;
-      font-weight: 700;
-      white-space: nowrap;
+      gap: 0.7rem;
+      padding: 0.88rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 17px;
+      background: rgba(255, 255, 255, 0.052);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
     }
 
-    .ghost-button {
-      border: 1px solid var(--line-soft);
-      background: rgba(148, 163, 184, 0.08);
-      color: var(--muted);
-    }
-
-    .ghost-button:hover {
-      color: var(--text);
-      border-color: rgba(148, 163, 184, 0.32);
-      background: rgba(148, 163, 184, 0.14);
-    }
-
-    .primary-button {
-      border: 1px solid rgba(59, 130, 246, 0.62);
-      background: linear-gradient(135deg, var(--blue-strong), #06b6d4);
-      color: #fff;
-      box-shadow: 0 16px 34px rgba(37, 99, 235, 0.28);
-    }
-
-    .primary-button:disabled,
-    .ghost-button:disabled {
-      cursor: not-allowed;
-      opacity: 0.55;
-    }
-
-    .details-panel {
-      min-width: 0;
+    .flow-icon {
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
-      overflow: hidden;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border-radius: 13px;
+      background: rgba(70, 213, 255, 0.12);
+      color: var(--cyan);
+      font-size: 1.05rem;
+      font-weight: 900;
     }
 
-    .details-body {
-      overflow: auto;
-      padding: 16px;
-      display: grid;
-      align-content: start;
-      gap: 12px;
+    .flow-row:nth-child(2) .flow-icon {
+      background: rgba(164, 118, 255, 0.13);
+      color: #cbb8ff;
     }
 
-    details {
-      border: 1px solid var(--line-soft);
-      border-radius: 14px;
-      background: rgba(2, 6, 23, 0.32);
-      overflow: hidden;
+    .flow-row:nth-child(3) .flow-icon {
+      background: rgba(84, 240, 180, 0.12);
+      color: var(--mint);
     }
 
-    details[open] {
-      border-color: rgba(59, 130, 246, 0.24);
+    .flow-row:nth-child(4) .flow-icon {
+      background: rgba(255, 209, 102, 0.12);
+      color: var(--amber);
     }
 
-    summary {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 12px 13px;
-      cursor: pointer;
-      list-style: none;
-      color: var(--text);
-      font-weight: 700;
+    .flow-row h3 {
+      margin: 0 0 0.12rem;
+      font-size: 0.98rem;
+      letter-spacing: -0.02em;
     }
 
-    summary::-webkit-details-marker {
-      display: none;
-    }
-
-    .detail-content {
-      border-top: 1px solid var(--line-soft);
-      padding: 12px;
-      color: var(--muted);
-      font-size: 0.88rem;
-      line-height: 1.58;
-    }
-
-    .trace-list {
-      display: grid;
-      gap: 8px;
+    .flow-row p {
       margin: 0;
-      padding: 0;
-      list-style: none;
+      color: var(--subtle);
+      font-size: 0.82rem;
+      line-height: 1.35;
     }
 
-    .trace-list li {
-      display: grid;
-      gap: 4px;
-      padding: 9px;
-      border-radius: 10px;
-      background: rgba(15, 23, 42, 0.58);
-    }
-
-    .mono {
-      font-family: "JetBrains Mono", monospace;
-      font-size: 0.8rem;
-    }
-
-    .status-tag {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      min-height: 26px;
-      padding: 4px 8px;
+    .badge {
+      padding: 0.3rem 0.55rem;
+      border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 999px;
-      border: 1px solid rgba(34, 197, 94, 0.28);
-      background: rgba(34, 197, 94, 0.09);
-      color: #86efac;
-      font-size: 0.76rem;
-      font-weight: 700;
+      color: #d9eaff;
+      background: rgba(255, 255, 255, 0.07);
+      font-size: 0.72rem;
+      font-weight: 850;
       white-space: nowrap;
     }
 
-    .status-tag.pending {
-      border-color: rgba(245, 158, 11, 0.28);
-      background: rgba(245, 158, 11, 0.09);
-      color: #fcd34d;
+    .terminal {
+      position: relative;
+      z-index: 1;
+      margin: 0.95rem 0.75rem 0.2rem;
+      padding: 1.05rem;
+      border: 1px solid rgba(84, 240, 180, 0.18);
+      border-radius: 19px;
+      background: rgba(2, 8, 18, 0.72);
+      color: #b9ffdf;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.82rem;
+      box-shadow: inset 0 0 42px rgba(84, 240, 180, 0.035);
     }
 
-    .status-tag.error {
-      border-color: rgba(239, 68, 68, 0.28);
-      background: rgba(239, 68, 68, 0.09);
-      color: #fca5a5;
+    .terminal div + div {
+      margin-top: 0.35rem;
+    }
+
+    .terminal .muted-line {
+      color: #7b95b8;
+    }
+
+    section {
+      padding: 4.7rem 0;
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 0.85fr) minmax(300px, 0.7fr);
+      gap: 2.2rem;
+      align-items: end;
+      margin-bottom: 1.7rem;
+    }
+
+    .kicker {
+      margin-bottom: 0.65rem;
+      color: var(--cyan);
+      font-size: 0.78rem;
+      font-weight: 900;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      margin-bottom: 0;
+      font-size: clamp(2.2rem, 4.6vw, 4.2rem);
+      line-height: 0.98;
+      letter-spacing: -0.07em;
+    }
+
+    .section-head p {
+      margin-bottom: 0.18rem;
+      color: var(--muted);
+      font-size: 1.02rem;
     }
 
     .grid {
       display: grid;
-      gap: 18px;
+      gap: 1rem;
     }
 
-    .grid.two {
-      grid-template-columns: minmax(0, 1fr) 380px;
-    }
-
-    .grid.three {
+    .grid-3 {
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
-    .metric-card {
-      padding: 15px;
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .metric-label {
-      color: var(--muted);
-      font-size: 0.82rem;
+    .card {
+      position: relative;
+      overflow: hidden;
+      min-height: 100%;
+      padding: 1.35rem;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.035)),
+        rgba(7, 16, 31, 0.72);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
     }
 
-    .metric-value {
-      margin-top: 8px;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 1.7rem;
-      font-weight: 700;
+    .card::before {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 1px;
+      content: "";
+      background: linear-gradient(90deg, transparent, rgba(70, 213, 255, 0.72), transparent);
+      opacity: 0;
+      transition: opacity 220ms var(--ease);
+    }
+
+    .card:hover::before {
+      opacity: 1;
+    }
+
+    .card:hover {
+      border-color: rgba(70, 213, 255, 0.25);
+      transform: translateY(-1px);
+      transition:
+        border-color 180ms var(--ease),
+        transform 180ms var(--ease);
+    }
+
+    .icon-chip {
+      display: inline-grid;
+      width: 44px;
+      height: 44px;
+      margin-bottom: 1rem;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 16px;
+      background: rgba(70, 213, 255, 0.1);
+      color: var(--cyan);
+      font-weight: 950;
+    }
+
+    .card:nth-child(2n) .icon-chip {
+      background: rgba(164, 118, 255, 0.1);
+      color: #cbb8ff;
+    }
+
+    .card:nth-child(3n) .icon-chip {
+      background: rgba(84, 240, 180, 0.1);
+      color: var(--mint);
+    }
+
+    .card h3 {
+      margin-bottom: 0.55rem;
+      font-size: 1.14rem;
+      line-height: 1.18;
       letter-spacing: -0.03em;
     }
 
-    .metric-foot {
-      margin-top: 7px;
-      color: var(--muted-2);
-      font-size: 0.78rem;
-    }
-
-    .model-grid,
-    .dataset-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-
-    .model-card,
-    .dataset-card {
-      padding: 14px;
-      transition: border-color 0.18s ease, background-color 0.18s ease;
-    }
-
-    .model-card.active,
-    .dataset-card.selected {
-      border-color: rgba(34, 211, 238, 0.42);
-      background: rgba(34, 211, 238, 0.08);
-    }
-
-    .model-card h3,
-    .dataset-card h3 {
-      margin: 0;
-      font-family: "Space Grotesk", sans-serif;
-      font-size: 0.98rem;
-    }
-
-    .model-card p,
-    .dataset-card p {
-      margin: 8px 0 0;
+    .card p {
+      margin-bottom: 0;
       color: var(--muted);
-      font-size: 0.84rem;
-      line-height: 1.48;
+      font-size: 0.96rem;
     }
 
-    .card-meta {
+    .feature-list {
+      display: grid;
+      gap: 0.65rem;
+      padding: 0;
+      margin: 1rem 0 0;
+      list-style: none;
+    }
+
+    .feature-list li {
       display: flex;
-      gap: 7px;
-      flex-wrap: wrap;
-      margin-top: 12px;
+      gap: 0.58rem;
+      color: var(--muted);
+      font-size: 0.93rem;
     }
 
-    .progress {
-      height: 9px;
-      overflow: hidden;
+    .feature-list li::before {
+      flex: 0 0 auto;
+      width: 8px;
+      height: 8px;
+      margin-top: 0.56rem;
+      border-radius: 50%;
+      content: "";
+      background: linear-gradient(135deg, var(--cyan), var(--mint));
+      box-shadow: 0 0 18px rgba(70, 213, 255, 0.6);
+    }
+
+    .foundation {
+      position: relative;
+      padding: 1px;
+      border-radius: var(--radius-xl);
+      background: linear-gradient(135deg, rgba(70, 213, 255, 0.34), rgba(164, 118, 255, 0.16), rgba(84, 240, 180, 0.28));
+      box-shadow: var(--shadow);
+    }
+
+    .foundation-inner {
+      display: grid;
+      grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
+      gap: 1rem;
+      padding: 1rem;
+      border-radius: calc(var(--radius-xl) - 1px);
+      background: rgba(5, 10, 22, 0.87);
+      backdrop-filter: blur(22px);
+    }
+
+    .foundation-aside {
+      padding: 1.5rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-lg);
+      background:
+        radial-gradient(circle at 20% 12%, rgba(70, 213, 255, 0.18), transparent 45%),
+        rgba(255, 255, 255, 0.045);
+    }
+
+    .foundation-aside h3 {
+      margin-bottom: 0.85rem;
+      font-size: 1.55rem;
+      letter-spacing: -0.04em;
+    }
+
+    .foundation-aside p {
+      margin-bottom: 1.2rem;
+      color: var(--muted);
+    }
+
+    .stacked-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+    }
+
+    .stacked-tags span {
+      padding: 0.4rem 0.62rem;
+      border: 1px solid rgba(255, 255, 255, 0.11);
       border-radius: 999px;
-      background: rgba(148, 163, 184, 0.14);
+      color: #dcecff;
+      background: rgba(255, 255, 255, 0.06);
+      font-size: 0.8rem;
+      font-weight: 800;
     }
 
-    .progress span {
+    .upgrade-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+    }
+
+    .upgrade {
+      padding: 1.2rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .upgrade small {
       display: block;
-      width: var(--value, 0%);
-      height: 100%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--blue), var(--cyan));
-      transition: width 0.3s ease;
+      margin-bottom: 0.42rem;
+      color: var(--cyan);
+      font-weight: 900;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
     }
 
-    .control-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
+    .upgrade h3 {
+      margin-bottom: 0.45rem;
+      font-size: 1.05rem;
     }
 
-    .form-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr auto;
-      gap: 10px;
-      align-items: end;
-    }
-
-    label {
-      display: grid;
-      gap: 7px;
+    .upgrade p {
+      margin-bottom: 0;
       color: var(--muted);
-      font-size: 0.78rem;
-      font-weight: 700;
+      font-size: 0.92rem;
     }
 
-    select,
-    input {
-      width: 100%;
-      min-height: 40px;
-      border: 1px solid var(--line-soft);
-      border-radius: 12px;
-      outline: none;
-      padding: 9px 10px;
-      background: rgba(2, 6, 23, 0.72);
-      color: var(--text);
-    }
-
-    .history-list {
+    .architecture-panel {
       display: grid;
-      gap: 10px;
+      grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
+      gap: 1rem;
+      align-items: stretch;
     }
 
-    .history-row {
+    .system-map {
+      position: relative;
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr 0.9fr auto;
-      gap: 12px;
-      align-items: center;
-      padding: 12px;
-      color: var(--muted);
-      font-size: 0.84rem;
+      min-height: 560px;
+      padding: 1.2rem;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-xl);
+      background:
+        radial-gradient(circle at 50% 50%, rgba(70, 213, 255, 0.16), transparent 28%),
+        radial-gradient(circle at 18% 18%, rgba(164, 118, 255, 0.16), transparent 34%),
+        radial-gradient(circle at 84% 78%, rgba(84, 240, 180, 0.12), transparent 34%),
+        rgba(255, 255, 255, 0.045);
+      box-shadow: var(--shadow);
+      isolation: isolate;
     }
 
-    .history-row strong {
+    .system-map::before {
+      position: absolute;
+      inset: 12%;
+      z-index: -1;
+      content: "";
+      border: 1px dashed rgba(120, 207, 255, 0.18);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 68px rgba(120, 207, 255, 0.025),
+        0 0 0 136px rgba(164, 118, 255, 0.018);
+      animation: orbit-pulse 5.8s ease-in-out infinite alternate;
+    }
+
+    @keyframes orbit-pulse {
+      from {
+        transform: scale(0.98);
+        opacity: 0.7;
+      }
+      to {
+        transform: scale(1.03);
+        opacity: 1;
+      }
+    }
+
+    .system-core {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      z-index: 3;
+      display: grid;
+      width: 190px;
+      height: 190px;
+      place-items: center;
+      padding: 1.1rem;
+      border: 1px solid rgba(70, 213, 255, 0.42);
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.22), transparent 34%),
+        linear-gradient(135deg, rgba(70, 213, 255, 0.22), rgba(164, 118, 255, 0.15)),
+        rgba(5, 10, 22, 0.94);
+      box-shadow:
+        0 24px 80px rgba(70, 213, 255, 0.22),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      text-align: center;
+      transform: translate(-50%, -50%);
+    }
+
+    .system-core strong {
       display: block;
-      color: var(--text);
-      margin-bottom: 3px;
+      font-size: 1.18rem;
+      line-height: 1.05;
+      letter-spacing: -0.04em;
     }
 
-    .case-panel {
-      display: grid;
-      gap: 10px;
-    }
-
-    .case-row {
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 10px;
-      align-items: start;
-      padding: 10px;
-      border: 1px solid var(--line-soft);
-      border-radius: 12px;
-      background: rgba(2, 6, 23, 0.28);
-    }
-
-    .case-row p {
-      margin: 3px 0 0;
+    .system-core span {
+      display: block;
+      margin-top: 0.45rem;
       color: var(--muted);
       font-size: 0.82rem;
+      font-weight: 750;
+    }
+
+    .map-node {
+      position: absolute;
+      z-index: 2;
+      width: min(240px, 42%);
+      padding: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-md);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.035)),
+        rgba(5, 10, 22, 0.84);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+      transition:
+        transform 220ms var(--ease),
+        border-color 220ms var(--ease),
+        background 220ms var(--ease);
+    }
+
+    .map-node:hover {
+      border-color: rgba(70, 213, 255, 0.34);
+      background:
+        linear-gradient(180deg, rgba(70, 213, 255, 0.105), rgba(255, 255, 255, 0.04)),
+        rgba(5, 10, 22, 0.9);
+      transform: translateY(-4px);
+    }
+
+    .map-node:nth-of-type(1) {
+      top: 6%;
+      left: 7%;
+    }
+
+    .map-node:nth-of-type(2) {
+      top: 8%;
+      right: 7%;
+    }
+
+    .map-node:nth-of-type(3) {
+      bottom: 8%;
+      right: 8%;
+    }
+
+    .map-node:nth-of-type(4) {
+      bottom: 8%;
+      left: 7%;
+    }
+
+    .map-node small {
+      display: inline-flex;
+      margin-bottom: 0.52rem;
+      color: var(--cyan);
+      font-size: 0.72rem;
+      font-weight: 950;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .map-node h3 {
+      margin-bottom: 0.35rem;
+      font-size: 1rem;
+      letter-spacing: -0.03em;
+    }
+
+    .map-node p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.86rem;
       line-height: 1.45;
     }
 
-    .spinner {
-      width: 15px;
-      height: 15px;
+    .map-link {
+      position: absolute;
+      z-index: 1;
+      display: block;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(70, 213, 255, 0.54), transparent);
+      transform-origin: left center;
+      opacity: 0.66;
+    }
+
+    .map-link.one {
+      top: 38%;
+      left: 25%;
+      width: 30%;
+      transform: rotate(24deg);
+    }
+
+    .map-link.two {
+      top: 38%;
+      right: 25%;
+      width: 30%;
+      transform: rotate(-24deg);
+    }
+
+    .map-link.three {
+      bottom: 34%;
+      right: 25%;
+      width: 30%;
+      transform: rotate(24deg);
+    }
+
+    .map-link.four {
+      bottom: 34%;
+      left: 25%;
+      width: 30%;
+      transform: rotate(-24deg);
+    }
+
+    .image-frame {
+      position: relative;
+      overflow: hidden;
+      min-height: 100%;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-xl);
+      background: rgba(255, 255, 255, 0.055);
+      box-shadow: var(--shadow);
+      cursor: zoom-in;
+      isolation: isolate;
+    }
+
+    .image-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0.96;
+      transition: transform 600ms var(--ease);
+    }
+
+    .image-frame:hover img {
+      transform: scale(1.025);
+    }
+
+    .image-frame::before {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      content: "";
+      background:
+        linear-gradient(135deg, rgba(70, 213, 255, 0.14), transparent 32%),
+        linear-gradient(315deg, rgba(84, 240, 180, 0.12), transparent 38%);
+      opacity: 0;
+      transition: opacity 260ms var(--ease);
+    }
+
+    .image-frame:hover::before,
+    .image-frame:focus-visible::before {
+      opacity: 1;
+    }
+
+    .image-frame:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 4px;
+    }
+
+    .zoom-hint {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      z-index: 3;
+      padding: 0.48rem 0.72rem;
+      border: 1px solid rgba(255, 255, 255, 0.18);
       border-radius: 999px;
-      border: 2px solid rgba(255, 255, 255, 0.24);
-      border-top-color: #fff;
-      animation: spin 0.78s linear infinite;
+      color: var(--text);
+      background: rgba(5, 10, 22, 0.72);
+      backdrop-filter: blur(16px);
+      cursor: zoom-in;
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 850;
+      opacity: 0;
+      transform: translateY(-6px);
+      transition:
+        opacity 220ms var(--ease),
+        transform 220ms var(--ease),
+        background 220ms var(--ease);
     }
 
-    @keyframes spin {
-      to {
-        transform: rotate(360deg);
-      }
+    .image-frame:hover .zoom-hint,
+    .image-frame:focus-visible .zoom-hint {
+      opacity: 1;
+      transform: translateY(0);
     }
 
-    @media (max-width: 1180px) {
-      .agent-layout,
-      .grid.two {
-        height: auto;
-        min-height: 0;
+    .zoom-hint:hover {
+      background: rgba(70, 213, 255, 0.22);
+    }
+
+    .process {
+      display: grid;
+      gap: 0.8rem;
+    }
+
+    .process-step {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.85rem;
+      padding: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .num {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 12px;
+      background: rgba(70, 213, 255, 0.12);
+      color: var(--cyan);
+      font-size: 0.85rem;
+      font-weight: 950;
+    }
+
+    .process-step h3 {
+      margin-bottom: 0.22rem;
+      font-size: 1rem;
+    }
+
+    .process-step p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .spotlight {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      gap: 1rem;
+      align-items: stretch;
+    }
+
+    .big-card {
+      padding: 1.65rem;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: var(--radius-xl);
+      background:
+        radial-gradient(circle at 20% 0%, rgba(70, 213, 255, 0.16), transparent 38%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.035)),
+        rgba(5, 10, 22, 0.76);
+      box-shadow: var(--shadow);
+    }
+
+    .big-card h3 {
+      margin-bottom: 0.7rem;
+      font-size: 1.45rem;
+      letter-spacing: -0.04em;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+      margin-top: 1.2rem;
+    }
+
+    .metric {
+      padding: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 0.2rem;
+      color: var(--text);
+      font-size: clamp(1.5rem, 3.2vw, 2.2rem);
+      line-height: 1;
+      letter-spacing: -0.06em;
+    }
+
+    .metric span {
+      color: var(--subtle);
+      font-size: 0.84rem;
+      font-weight: 750;
+    }
+
+    .benchmark-card {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .loop {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 0.55rem;
+      margin-top: 1.3rem;
+    }
+
+    .loop-node {
+      position: relative;
+      min-height: 88px;
+      padding: 0.82rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .loop-node:not(:last-child)::after {
+      position: absolute;
+      top: 50%;
+      right: -0.46rem;
+      z-index: 2;
+      content: "→";
+      color: var(--cyan);
+      font-weight: 900;
+      transform: translateY(-50%);
+    }
+
+    .loop-node b {
+      display: block;
+      margin-bottom: 0.2rem;
+      font-size: 0.9rem;
+    }
+
+    .loop-node span {
+      color: var(--subtle);
+      font-size: 0.78rem;
+      line-height: 1.25;
+    }
+
+    .table-wrap {
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+    }
+
+    th,
+    td {
+      padding: 0.86rem 0.95rem;
+      text-align: left;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.075);
+    }
+
+    th {
+      color: #dff4ff;
+      background: rgba(70, 213, 255, 0.09);
+      font-size: 0.76rem;
+      font-weight: 950;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    td {
+      color: var(--muted);
+    }
+
+    td:first-child {
+      color: var(--text);
+      font-weight: 850;
+    }
+
+    .pass {
+      color: var(--mint);
+      font-weight: 950;
+    }
+
+    .gallery {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 1rem;
+    }
+
+    .gallery-stack {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .demo-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      gap: 1rem;
+    }
+
+    .demo-stack {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .visual-card {
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: var(--radius-xl);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.035)),
+        rgba(5, 10, 22, 0.78);
+      box-shadow: var(--shadow);
+    }
+
+    .mock-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.92rem 1rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(5, 10, 22, 0.66);
+    }
+
+    .mock-title {
+      color: #dff4ff;
+      font-size: 0.82rem;
+      font-weight: 900;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .mock-body {
+      padding: 1rem;
+    }
+
+    .web-console-grid {
+      display: grid;
+      grid-template-columns: 0.78fr 1.22fr;
+      gap: 0.8rem;
+      min-height: 360px;
+    }
+
+    .mock-sidebar,
+    .mock-main {
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .mock-sidebar {
+      display: grid;
+      gap: 0.62rem;
+      align-content: start;
+      padding: 0.8rem;
+    }
+
+    .mock-menu-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.7rem;
+      padding: 0.68rem 0.75rem;
+      border-radius: 14px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.045);
+      font-size: 0.84rem;
+      font-weight: 800;
+    }
+
+    .mock-menu-item.active {
+      color: #06101f;
+      background: linear-gradient(135deg, var(--cyan), var(--mint));
+    }
+
+    .mock-main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 0.75rem;
+      padding: 0.9rem;
+    }
+
+    .prompt-box {
+      padding: 0.85rem;
+      border: 1px solid rgba(70, 213, 255, 0.18);
+      border-radius: 15px;
+      color: #dcecff;
+      background: rgba(70, 213, 255, 0.07);
+      font-size: 0.9rem;
+    }
+
+    .event-stream {
+      display: grid;
+      gap: 0.55rem;
+      align-content: start;
+    }
+
+    .event-line {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 0.65rem;
+      align-items: center;
+      padding: 0.62rem 0.72rem;
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.045);
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .event-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--mint);
+      box-shadow: 0 0 16px rgba(84, 240, 180, 0.7);
+    }
+
+    .event-line strong {
+      color: var(--text);
+    }
+
+    .event-line em {
+      color: var(--subtle);
+      font-style: normal;
+      font-weight: 800;
+    }
+
+    .mock-command {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8rem;
+      padding: 0.72rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 14px;
+      background: rgba(2, 8, 18, 0.62);
+      color: #b9ffdf;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.82rem;
+    }
+
+    .cli-screen {
+      min-height: 250px;
+      padding: 1rem;
+      border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+      background: rgba(2, 8, 18, 0.82);
+      color: #b9ffdf;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.83rem;
+      line-height: 1.7;
+    }
+
+    .cli-screen .dim {
+      color: #6f86aa;
+    }
+
+    .cli-screen .accent {
+      color: var(--cyan);
+    }
+
+    .trajectory-mini {
+      display: grid;
+      gap: 0.75rem;
+      padding: 1rem;
+    }
+
+    .trajectory-step {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 0.72rem;
+      align-items: center;
+      padding: 0.76rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .trajectory-step span:first-child {
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: 11px;
+      color: var(--cyan);
+      background: rgba(70, 213, 255, 0.1);
+      font-size: 0.78rem;
+      font-weight: 950;
+    }
+
+    .trajectory-step strong {
+      display: block;
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+
+    .trajectory-step small {
+      color: var(--subtle);
+      font-weight: 750;
+    }
+
+    .trajectory-step code {
+      font-size: 0.75rem;
+    }
+
+    .caption {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1rem 1.08rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      background: rgba(5, 10, 22, 0.72);
+      font-size: 0.88rem;
+    }
+
+    .caption b {
+      color: var(--text);
+    }
+
+    .implementation {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      gap: 1rem;
+    }
+
+    .code-panel {
+      overflow: hidden;
+      border: 1px solid rgba(84, 240, 180, 0.16);
+      border-radius: var(--radius-xl);
+      background: rgba(2, 8, 18, 0.86);
+      box-shadow: var(--shadow);
+    }
+
+    .code-panel pre {
+      overflow-x: auto;
+      margin: 0;
+      padding: 1.4rem;
+      color: #cde9ff;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.84rem;
+      line-height: 1.65;
+      white-space: pre;
+    }
+
+    .code-panel .comment {
+      color: #6f86aa;
+    }
+
+    .code-panel .accent {
+      color: #54f0b4;
+    }
+
+    .code-panel .blue {
+      color: #73dcff;
+    }
+
+    .roadmap {
+      display: grid;
+      gap: 0.85rem;
+      counter-reset: roadmap;
+    }
+
+    .roadmap-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.88rem;
+      padding: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .roadmap-item::before {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border: 1px solid rgba(70, 213, 255, 0.18);
+      border-radius: 14px;
+      color: var(--cyan);
+      background: rgba(70, 213, 255, 0.09);
+      content: counter(roadmap, decimal-leading-zero);
+      counter-increment: roadmap;
+      font-size: 0.78rem;
+      font-weight: 950;
+    }
+
+    .roadmap-item h3 {
+      margin-bottom: 0.25rem;
+      font-size: 1rem;
+    }
+
+    .roadmap-item p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .cta {
+      position: relative;
+      overflow: hidden;
+      margin: 3.5rem 0 5rem;
+      padding: 1px;
+      border-radius: 36px;
+      background: linear-gradient(135deg, rgba(70, 213, 255, 0.55), rgba(164, 118, 255, 0.28), rgba(84, 240, 180, 0.5));
+      box-shadow: var(--shadow);
+    }
+
+    .cta-inner {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 1.4rem;
+      align-items: center;
+      padding: clamp(1.6rem, 4vw, 2.5rem);
+      border-radius: 35px;
+      background:
+        radial-gradient(circle at 92% 20%, rgba(84, 240, 180, 0.17), transparent 30%),
+        rgba(5, 10, 22, 0.9);
+    }
+
+    .cta h2 {
+      margin-bottom: 0.72rem;
+      font-size: clamp(2rem, 4vw, 3.5rem);
+    }
+
+    .cta p {
+      max-width: 760px;
+      margin-bottom: 0;
+      color: var(--muted);
+    }
+
+    .footer {
+      padding: 2rem 0 3rem;
+      color: var(--subtle);
+      font-size: 0.88rem;
+      text-align: center;
+    }
+
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      display: grid;
+      place-items: center;
+      padding: 2rem;
+      background: rgba(3, 7, 18, 0.82);
+      backdrop-filter: blur(22px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 220ms var(--ease);
+    }
+
+    .lightbox.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .lightbox-dialog {
+      position: relative;
+      width: min(1120px, 100%);
+      max-height: min(82vh, 820px);
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: var(--radius-xl);
+      background: rgba(5, 10, 22, 0.94);
+      box-shadow: 0 30px 120px rgba(0, 0, 0, 0.62);
+      transform: translateY(16px) scale(0.98);
+      transition: transform 240ms var(--ease);
+    }
+
+    .lightbox.open .lightbox-dialog {
+      transform: translateY(0) scale(1);
+    }
+
+    .lightbox-image {
+      width: 100%;
+      max-height: calc(82vh - 96px);
+      object-fit: contain;
+      background: #040812;
+    }
+
+    .lightbox-caption {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1rem 1.15rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--muted);
+    }
+
+    .lightbox-caption strong {
+      color: var(--text);
+    }
+
+    .lightbox-close {
+      position: absolute;
+      top: 0.9rem;
+      right: 0.9rem;
+      z-index: 5;
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 999px;
+      color: var(--text);
+      background: rgba(5, 10, 22, 0.75);
+      backdrop-filter: blur(18px);
+      cursor: pointer;
+      font-size: 1.45rem;
+      line-height: 1;
+      transition:
+        background 180ms var(--ease),
+        transform 180ms var(--ease);
+    }
+
+    .lightbox-close:hover {
+      background: rgba(255, 255, 255, 0.13);
+      transform: rotate(90deg);
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(18px);
+      transition:
+        opacity 650ms var(--ease),
+        transform 650ms var(--ease);
+      transition-delay: var(--reveal-delay, 0ms);
+      will-change: opacity, transform;
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 980px) {
+      .hero,
+      .section-head,
+      .foundation-inner,
+      .architecture-panel,
+      .spotlight,
+      .gallery,
+      .implementation,
+      .cta-inner {
         grid-template-columns: 1fr;
       }
 
-      .details-panel {
-        min-height: 520px;
-      }
-
-      .model-grid,
-      .dataset-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-    }
-
-    @media (max-width: 900px) {
-      .app-shell {
-        grid-template-columns: 1fr;
-      }
-
-      .sidebar {
-        position: static;
-        height: auto;
-        border-right: 0;
-        border-bottom: 1px solid var(--line-soft);
-      }
-
-      .nav {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-      }
-
-      .session-panel,
-      .sidebar-footer {
-        display: none;
-      }
-
-      .topbar {
-        position: static;
+      .tool-showcase-head {
         align-items: flex-start;
         flex-direction: column;
       }
 
-      .model-strip {
-        justify-content: flex-start;
+      .tool-showcase-head p {
+        text-align: left;
       }
 
-      .main {
-        grid-template-rows: auto minmax(0, 1fr);
+      .hero {
+        padding-top: 5.6rem;
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      .nav-actions {
+        margin-left: auto;
+      }
+
+      .loop {
+        grid-template-columns: 1fr;
+      }
+
+      .loop-node:not(:last-child)::after {
+        top: auto;
+        right: auto;
+        bottom: -0.65rem;
+        left: 50%;
+        transform: translateX(-50%) rotate(90deg);
+      }
+
+      .cta-inner {
+        align-items: start;
       }
     }
 
-    @media (max-width: 680px) {
-      .sidebar,
-      .page,
-      .topbar {
-        padding-left: 14px;
-        padding-right: 14px;
+    @media (max-width: 720px) {
+      .shell {
+        width: min(100% - 28px, var(--max));
       }
 
-      .nav {
+      .hero-meta,
+      .grid-2,
+      .grid-3,
+      .upgrade-grid,
+      .metric-grid {
         grid-template-columns: 1fr;
       }
 
-      .run-summary,
-      .grid.three,
-      .model-grid,
-      .dataset-grid,
-      .form-row,
-      .history-row {
-        grid-template-columns: 1fr;
+      h1 {
+        font-size: clamp(3.25rem, 17vw, 5.7rem);
       }
 
-      .message.user,
-      .message.agent {
-        width: 100%;
+      section {
+        padding: 3.4rem 0;
       }
 
-      .composer-actions,
-      .control-row {
-        align-items: stretch;
+      .runtime-card,
+      .foundation-inner {
+        padding: 0.75rem;
+      }
+
+      .flow-row {
+        grid-template-columns: auto 1fr;
+      }
+
+      .flow-row .badge {
+        grid-column: 2;
+        justify-self: start;
+      }
+
+      th,
+      td {
+        padding: 0.72rem 0.75rem;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+      }
+
+      .lightbox {
+        padding: 0.9rem;
+      }
+
+      .lightbox-caption {
+        align-items: flex-start;
         flex-direction: column;
       }
+    }
 
-      .quick-prompts,
-      .primary-button,
-      .ghost-button {
-        width: 100%;
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+
+      .reveal {
+        opacity: 1;
+        transform: none;
       }
     }
   </style>
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar" aria-label="WhaleCode sidebar">
-      <div class="brand">
-        <div class="brand-mark">W</div>
-        <div class="brand-title">
-          <strong>WhaleCode</strong>
-          <span>Agent Console</span>
+  <div class="page-progress" aria-hidden="true"></div>
+
+  <header class="nav">
+    <div class="shell nav-inner">
+      <a class="brand" href="#top" aria-label="WhaleCode home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 64 64" role="img">
+            <path d="M53.6 28.7c-2.1-7.4-9.5-13.1-18.3-13.1-8.1 0-15.2 4.8-18 11.7-3.9.3-7 3.3-7 7.1 0 4 3.6 7.2 8.1 7.2h21.5c8.4 0 15.2-5.8 15.2-12.9 0-.1 0-.1-.1-.1l4.8-4.2c.9-.8.1-2.2-1.1-1.8l-5.1 1.7ZM25.4 32.4a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm17.8 0a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM17.9 45.2c5.7 2 11.8 2.8 18.2 2.4 2.6-.2 4.8 1.8 5 4.4.1 1.2-.9 2.2-2.1 2.1-8.8-.6-16.2-2.6-22-6.3-1.1-.7-.3-3 1-2.6Z" />
+          </svg>
+        </span>
+        <span>
+          WhaleCode
+          <small>Agent Showcase</small>
+        </span>
+      </a>
+      <div class="nav-actions">
+        <nav class="nav-links" aria-label="Page navigation">
+          <a href="#why">Why</a>
+          <a href="#upgrades">Upgrades</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#benchmarks">Benchmarks</a>
+          <a href="#evidence">Evidence</a>
+        </nav>
+        <div class="language-switcher" aria-label="Language selector">
+          <button class="language-option active" type="button" data-lang="en" aria-pressed="true">EN</button>
+          <button class="language-option" type="button" data-lang="zh" aria-pressed="false">中文</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="shell hero">
+      <div class="hero-content reveal">
+        <div class="eyebrow"><span class="pulse"></span> Production-grade coding agent framework</div>
+        <h1><span class="gradient-text">WhaleCode</span></h1>
+        <p class="hero-copy">
+          WhaleCode turns the general-purpose HelloAgent foundation into a repository-native coding system:
+          structured function-calling ReAct, atomized safe tools, long-horizon context engineering, persistent
+          sessions, and a benchmark lab built for controlled iteration.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#upgrades">Explore the upgrades</a>
+          <a class="button" href="#benchmarks">View benchmark results</a>
+        </div>
+        <div class="hero-meta" aria-label="Project metrics">
+          <div class="mini-stat">
+            <strong>35k+</strong>
+            <span>Python LOC across agent, tools, web, tests</span>
+          </div>
+          <div class="mini-stat">
+            <strong>280</strong>
+            <span>line coding-specific system prompt</span>
+          </div>
+          <div class="mini-stat">
+            <strong>99%+</strong>
+            <span>tool-call parse target via function calling</span>
+          </div>
         </div>
       </div>
 
-      <nav class="nav" aria-label="Primary navigation">
-        <button class="nav-button active" data-page="agent">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16v10H7l-3 3V5z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-          智能体交互
-        </button>
-        <button class="nav-button" data-page="models">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 4h12v6H6V4zm0 10h12v6H6v-6zm3-7h1m-1 10h1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          模型管理
-        </button>
-        <button class="nav-button" data-page="datasets">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6c0-1.1 3.6-2 8-2s8 .9 8 2-3.6 2-8 2-8-.9-8-2zm0 0v6c0 1.1 3.6 2 8 2s8-.9 8-2V6M4 12v6c0 1.1 3.6 2 8 2s8-.9 8-2v-6" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-          数据集测试
-        </button>
-      </nav>
-
-      <div class="session-panel">
-        <div class="section-kicker">
-          <span>历史会话</span>
-          <button class="icon-button" id="newSession" aria-label="新建会话">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
-          </button>
-        </div>
-        <div class="session-list" id="sessionList">
-          <article class="session-item active">
-            <div>
-              <div class="session-name">修复数据处理异常</div>
-              <div class="session-meta">8 steps · 2m ago</div>
-            </div>
-            <button class="icon-button" aria-label="删除会话">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </article>
-          <article class="session-item">
-            <div>
-              <div class="session-name">重构 benchmark runner</div>
-              <div class="session-meta">12 steps · yesterday</div>
-            </div>
-            <button class="icon-button" aria-label="删除会话">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </article>
-          <article class="session-item">
-            <div>
-              <div class="session-name">新增工具调用审计日志</div>
-              <div class="session-meta">5 steps · Jul 12</div>
-            </div>
-            <button class="icon-button" aria-label="删除会话">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </article>
-        </div>
-      </div>
-
-      <div class="sidebar-footer">
-        <div class="mini-metric"><span>Context</span><strong>128k / 262k</strong></div>
-        <div class="mini-metric"><span>Trace</span><strong>enabled</strong></div>
-        <div class="mini-metric"><span>Tools</span><strong>14 active</strong></div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div class="topbar-title">
-          <h1 id="pageTitle">智能体交互主页面</h1>
-          <p id="pageSub">默认只呈现运行状态、最终结果和总耗时；运行详情按需展开。</p>
-        </div>
-        <div class="model-strip">
-          <span class="pill"><span class="dot" id="serviceDot"></span><span id="serviceText">vLLM running</span></span>
-          <span class="pill"><span>当前模型</span><strong id="activeModel">Qwen3.5-35B-A3B-FP8</strong></span>
-          <span class="pill"><span>显存</span><strong id="gpuText">42.6 / 80 GB</strong></span>
-        </div>
-      </header>
-
-      <section class="page active" id="agentPage">
-        <div class="agent-layout">
-          <section class="panel chat-panel" aria-label="Agent chat">
-            <div class="panel-head">
+      <aside class="hero-card reveal" aria-label="WhaleCode runtime highlights">
+        <div class="runtime-card">
+          <div class="window-bar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+            <span>CodeAgent Runtime</span>
+          </div>
+          <div class="agent-flow">
+            <div class="flow-row">
+              <span class="flow-icon">01</span>
               <div>
-                <h2>WhaleCode Assistant</h2>
-                <p>面向代码仓库的 ReAct 智能体交互入口</p>
+                <h3>Think → Act → Observe</h3>
+                <p>Function-calling ReAct loop with Thought and Finish control tools.</p>
               </div>
-              <span class="status-tag" id="runState"><span class="dot"></span>已完成</span>
+              <span class="badge">structured</span>
             </div>
-
-            <div class="chat-stream" id="chatStream">
-              <article class="message user">
-                <div class="message-label">User · 当前会话</div>
-                <div class="bubble">请阅读项目主入口，找出 CLI 初始化链路，并说明如何接入新的 benchmark 命令。</div>
-              </article>
-              <article class="message agent">
-                <div class="message-label">WhaleCode · Final Output</div>
-                <div class="bubble">
-                  已完成入口链路梳理：<strong>run_cli.py</strong> 负责参数解析、环境加载、Rich/Prompt Toolkit UI 初始化、Agent 工厂创建与交互循环调度。新增 benchmark 命令建议接入 slash command 分发层，并复用现有 <span class="mono">code/benchmark</span> 模块的 runner 抽象。
-                  <div class="code-block">/bench aime --model Qwen3.5-35B-A3B-FP8 --limit 30
-/bench swev --dataset small --trace enabled</div>
-                  <div class="run-summary">
-                    <div class="summary-card">
-                      <div class="summary-label">状态</div>
-                      <div class="summary-value"><span class="dot"></span>已完成</div>
-                    </div>
-                    <div class="summary-card">
-                      <div class="summary-label">总耗时</div>
-                      <div class="summary-value">18.4s</div>
-                    </div>
-                    <div class="summary-card">
-                      <div class="summary-label">Token</div>
-                      <div class="summary-value">19,482</div>
-                    </div>
-                  </div>
-                </div>
-              </article>
-            </div>
-
-            <form class="composer" id="agentForm">
-              <textarea id="promptInput" placeholder="输入代码问题或开发需求，例如：为 benchmark runner 增加失败重试和结构化日志..."></textarea>
-              <div class="composer-actions">
-                <div class="quick-prompts">
-                  <button type="button" class="ghost-button quick" data-prompt="分析 run_cli.py 的启动链路，并输出关键函数调用顺序。">分析入口</button>
-                  <button type="button" class="ghost-button quick" data-prompt="为 vLLM 模型切换流程设计后端 API，并给出错误处理方案。">设计 API</button>
-                  <button type="button" class="ghost-button quick" data-prompt="运行数据集测试前，请生成完整的测试计划和风险点。">测试计划</button>
-                </div>
-                <button type="submit" class="primary-button" id="sendButton">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  运行智能体
-                </button>
-              </div>
-            </form>
-          </section>
-
-          <aside class="panel details-panel" aria-label="Run details">
-            <div class="panel-head">
+            <div class="flow-row">
+              <span class="flow-icon">02</span>
               <div>
-                <h2>运行详情</h2>
-                <p>完整链路默认折叠，按步骤查看</p>
+                <h3>Repository-safe tools</h3>
+                <p>Read, Write, Edit, Delete, Glob, Grep, Bash, TodoWrite, WebFetch.</p>
               </div>
-              <button class="ghost-button" id="expandAll">全部展开</button>
+              <span class="badge">sandboxed</span>
             </div>
-            <div class="details-body" id="detailsBody">
-              <details open>
-                <summary><span>01 · 思考链摘要</span><span class="status-tag">done</span></summary>
-                <div class="detail-content">
-                  识别用户目标，定位 CLI 入口、Agent 初始化、工具注册、benchmark 模块与 slash command 分发边界。
-                </div>
-              </details>
-              <details>
-                <summary><span>02 · 工具调用记录</span><span class="status-tag">4 calls</span></summary>
-                <div class="detail-content">
-                  <ul class="trace-list">
-                    <li><strong class="mono">ReadTool</strong><span>run_cli.py · 入口解析与 UI 初始化</span></li>
-                    <li><strong class="mono">GrepTool</strong><span>benchmark / slash command references</span></li>
-                    <li><strong class="mono">ReadTool</strong><span>code/benchmark/base.py · runner contract</span></li>
-                    <li><strong class="mono">TodoWrite</strong><span>生成命令接入任务列表</span></li>
-                  </ul>
-                </div>
-              </details>
-              <details>
-                <summary><span>03 · 中间代码片段</span><span class="status-tag">preview</span></summary>
-                <div class="detail-content">
-                  <div class="code-block">elif command == "/bench":
-    return handle_benchmark_command(args, agent_context)</div>
-                </div>
-              </details>
-              <details>
-                <summary><span>04 · 报错日志</span><span class="status-tag pending">clean</span></summary>
-                <div class="detail-content">本次执行无异常；未触发 circuit breaker，未产生 sandbox violation。</div>
-              </details>
-              <details>
-                <summary><span>05 · Token 消耗</span><span class="status-tag">19,482</span></summary>
-                <div class="detail-content">
-                  Prompt 12,340 · Completion 4,112 · Tool observations 3,030 · 自动压缩未触发。
-                </div>
-              </details>
+            <div class="flow-row">
+              <span class="flow-icon">03</span>
+              <div>
+                <h3>Context survives long tasks</h3>
+                <p>Micro compaction, LLM summaries, manual focus compaction, output truncation.</p>
+              </div>
+              <span class="badge">durable</span>
+            </div>
+            <div class="flow-row">
+              <span class="flow-icon">04</span>
+              <div>
+                <h3>Benchmark feedback loop</h3>
+                <p>Submit code, sandbox evaluate, inject feedback, iterate under step budgets.</p>
+              </div>
+              <span class="badge">measured</span>
+            </div>
+          </div>
+          <div class="terminal" aria-label="Runtime terminal sample">
+            <div><span class="muted-line">$</span> python run_cli.py --workspace ./repo</div>
+            <div>✓ workspace root locked</div>
+            <div>✓ 12+ coding tools registered</div>
+            <div>✓ trace, sessions, todos, terminals ready</div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="shell tool-showcase reveal" aria-label="WhaleCode toolchain map">
+      <div class="tool-showcase-card">
+        <div class="tool-showcase-head">
+          <p class="kicker">Toolchain map</p>
+          <p>Atomized tools make every operation inspectable, recoverable, and safer than raw shell-only automation.</p>
+        </div>
+        <div class="tool-marquee" aria-label="WhaleCode built-in coding tools">
+          <div class="tool-track">
+            <span class="tool-pill">Read</span>
+            <span class="tool-pill">Write</span>
+            <span class="tool-pill">Edit</span>
+            <span class="tool-pill">Delete</span>
+            <span class="tool-pill">Glob</span>
+            <span class="tool-pill">Grep</span>
+            <span class="tool-pill">Bash</span>
+            <span class="tool-pill">TodoWrite</span>
+            <span class="tool-pill">WebSearch</span>
+            <span class="tool-pill">WebFetch</span>
+            <span class="tool-pill">AskUser</span>
+            <span class="tool-pill">TraceLogger</span>
+            <span class="tool-pill">Read</span>
+            <span class="tool-pill">Write</span>
+            <span class="tool-pill">Edit</span>
+            <span class="tool-pill">Delete</span>
+            <span class="tool-pill">Glob</span>
+            <span class="tool-pill">Grep</span>
+            <span class="tool-pill">Bash</span>
+            <span class="tool-pill">TodoWrite</span>
+            <span class="tool-pill">WebSearch</span>
+            <span class="tool-pill">WebFetch</span>
+            <span class="tool-pill">AskUser</span>
+            <span class="tool-pill">TraceLogger</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="why" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Why it matters</p>
+          <h2>A coding agent designed around real repository failure modes.</h2>
+        </div>
+        <p>
+          The project is not just a ReAct demo. It hardens the entire lifecycle: how the model calls tools,
+          how files are protected, how large outputs are compressed, how background commands are tracked,
+          and how benchmark submissions are judged.
+        </p>
+      </div>
+
+      <div class="grid grid-3">
+        <article class="card reveal">
+          <span class="icon-chip">FC</span>
+          <h3>Native function calling instead of text parsing</h3>
+          <p>
+            Tool calls are structured JSON from the model API, avoiding fragile regex parsing of
+            <code>Action:</code> text and making the ReAct loop much more reliable.
+          </p>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">SA</span>
+          <h3>Safety as a first-class tool contract</h3>
+          <p>
+            File tools validate paths against <code>project_root</code>, use optimistic lock metadata,
+            produce backups, and reject conflicts before edits can overwrite human changes.
+          </p>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">CE</span>
+          <h3>Context engineering for long-horizon tasks</h3>
+          <p>
+            History, token counting, compaction, truncation, and structured context building work together
+            so the agent can continue across multi-step programming sessions.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="upgrades" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">HelloAgent → WhaleCode</p>
+          <h2>General agent framework, upgraded into a coding workbench.</h2>
+        </div>
+        <p>
+          HelloAgent provides the base abstractions: Agent, ReAct loop, LLM adapters, tool registry,
+          context compaction, circuit breaker, sessions, and skills. WhaleCode specializes those pieces
+          around coding workflows and evaluation.
+        </p>
+      </div>
+
+      <div class="foundation reveal">
+        <div class="foundation-inner">
+          <aside class="foundation-aside">
+            <h3>HelloAgent foundation</h3>
+            <p>
+              A flexible multi-agent base with ReAct, function calling, reusable tools, unified LLM
+              clients, circuit breakers, and session persistence.
+            </p>
+            <div class="stacked-tags" aria-label="HelloAgent capabilities">
+              <span>Agent base class</span>
+              <span>ToolRegistry</span>
+              <span>ReAct loop</span>
+              <span>LLM adapters</span>
+              <span>Context compaction</span>
+              <span>Session store</span>
             </div>
           </aside>
-        </div>
-      </section>
-
-      <section class="page" id="modelsPage">
-        <div class="grid">
-          <div class="grid three">
-            <article class="metric-card">
-              <div class="metric-label">vLLM 服务状态</div>
-              <div class="metric-value" id="modelServiceMetric">Running</div>
-              <div class="metric-foot">localhost:8000 · OpenAI-compatible</div>
+          <div class="upgrade-grid">
+            <article class="upgrade">
+              <small>Upgrade 01</small>
+              <h3>CodeAgent specialization</h3>
+              <p>
+                Adds workspace-aware prompts, repository root enforcement, default coding tools,
+                step budgets, and isolated sub-agent creation.
+              </p>
             </article>
-            <article class="metric-card">
-              <div class="metric-label">当前加载模型</div>
-              <div class="metric-value" style="font-size:1.15rem" id="loadedModelMetric">Qwen3.5-35B-A3B-FP8</div>
-              <div class="metric-foot">reasoning-parser: qwen3</div>
+            <article class="upgrade">
+              <small>Upgrade 02</small>
+              <h3>Atomized programming toolchain</h3>
+              <p>
+                Splits discovery, reading, editing, deleting, shell execution, web fetching, and planning
+                into auditable tools with structured responses.
+              </p>
             </article>
-            <article class="metric-card">
-              <div class="metric-label">显存占用</div>
-              <div class="metric-value" id="gpuMetric">53%</div>
-              <div class="metric-foot"><div class="progress"><span id="gpuBar" style="--value:53%"></span></div></div>
+            <article class="upgrade">
+              <small>Upgrade 03</small>
+              <h3>Benchmark-grade control loop</h3>
+              <p>
+                Converts one-shot answers into iterative submissions: evaluate safely, build feedback,
+                re-prompt, and retry within per-task limits.
+              </p>
+            </article>
+            <article class="upgrade">
+              <small>Upgrade 04</small>
+              <h3>CLI + Web operating surface</h3>
+              <p>
+                Adds a Rich CLI with slash commands and a zero-dependency Web console with SSE events,
+                model launch control, sessions, benchmarks, and trajectories.
+              </p>
             </article>
           </div>
-
-          <section class="panel">
-            <div class="panel-head">
-              <div>
-                <h2>模型控制台</h2>
-                <p>启动、停止、切换与卸载 vLLM 推理服务</p>
-              </div>
-              <div class="control-row">
-                <button class="ghost-button" id="stopService">停止服务</button>
-                <button class="primary-button" id="startService">启动服务</button>
-                <button class="ghost-button" id="unloadModel">卸载模型</button>
-              </div>
-            </div>
-            <div style="padding:18px; display:grid; gap:14px;">
-              <div class="control-row">
-                <span class="pill"><span id="loadStatus">就绪</span></span>
-                <span class="pill">加载进度 <strong id="loadPercent">100%</strong></span>
-              </div>
-              <div class="progress"><span id="loadBar" style="--value:100%"></span></div>
-              <div class="model-grid" id="modelGrid">
-                <article class="model-card active" data-model="Qwen3.5-35B-A3B-FP8" data-gpu="42.6 / 80 GB">
-                  <h3>Qwen3.5-35B-A3B-FP8</h3>
-                  <p>推荐生产编码任务，支持工具调用与长上下文。</p>
-                  <div class="card-meta"><span class="status-tag">已加载</span><span class="pill">35B · FP8</span><span class="pill">80GB</span></div>
-                </article>
-                <article class="model-card" data-model="Qwen3-Coder-30B-A3B" data-gpu="36.8 / 80 GB">
-                  <h3>Qwen3-Coder-30B-A3B</h3>
-                  <p>适合代码生成、仓库理解与修复任务。</p>
-                  <div class="card-meta"><span class="status-tag pending">未加载</span><span class="pill">30B</span><span class="pill">64GB</span></div>
-                </article>
-                <article class="model-card" data-model="DeepSeek-Coder-V2-Lite" data-gpu="18.2 / 80 GB">
-                  <h3>DeepSeek-Coder-V2-Lite</h3>
-                  <p>轻量快速，适合交互式探索与小型测试。</p>
-                  <div class="card-meta"><span class="status-tag pending">未加载</span><span class="pill">16B</span><span class="pill">24GB</span></div>
-                </article>
-              </div>
-            </div>
-          </section>
         </div>
-      </section>
+      </div>
+    </section>
 
-      <section class="page" id="datasetsPage">
-        <div class="grid two">
-          <div class="grid">
-            <div class="grid three">
-              <article class="metric-card">
-                <div class="metric-label">测试进度</div>
-                <div class="metric-value" id="testProgressText">0 / 164</div>
-                <div class="metric-foot"><div class="progress"><span id="testProgressBar" style="--value:0%"></span></div></div>
-              </article>
-              <article class="metric-card">
-                <div class="metric-label">通过率</div>
-                <div class="metric-value" id="passRate">96.9%</div>
-                <div class="metric-foot">动态统计 pass@1 / pass@k</div>
-              </article>
-              <article class="metric-card">
-                <div class="metric-label">平均耗时</div>
-                <div class="metric-value" id="avgLatency">11.8s</div>
-                <div class="metric-foot">失败数 <span id="failCount">5</span></div>
-              </article>
+    <section id="architecture" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Architecture</p>
+          <h2>The loop is simple. The engineering around it is the product.</h2>
+        </div>
+        <p>
+          WhaleCode keeps the classic Think → Act → Observe loop, then wraps it with path safety,
+          tool response semantics, context durability, terminal artifacts, trace logs, and benchmark
+          trajectories.
+        </p>
+      </div>
+
+      <div class="architecture-panel">
+        <div class="system-map reveal" aria-label="WhaleCode architecture map">
+          <span class="map-link one"></span>
+          <span class="map-link two"></span>
+          <span class="map-link three"></span>
+          <span class="map-link four"></span>
+          <div class="system-core">
+            <div>
+              <strong>CodeAgent</strong>
+              <span>Function-calling ReAct runtime</span>
             </div>
-
-            <section class="panel">
-              <div class="panel-head">
-                <div>
-                  <h2>数据集选择</h2>
-                  <p>选择测试集与模型后启动批量评测</p>
-                </div>
-              </div>
-              <div style="padding:18px; display:grid; gap:16px;">
-                <div class="dataset-grid" id="datasetGrid">
-                  <article class="dataset-card selected" data-size="164">
-                    <h3>HumanEval+</h3>
-                    <p>函数级代码生成评测，覆盖边界用例增强。</p>
-                    <div class="card-meta"><span class="status-tag">164 cases</span><span class="pill">pass@1</span></div>
-                  </article>
-                  <article class="dataset-card selected" data-size="378">
-                    <h3>MBPP+</h3>
-                    <p>Python 编程题增强集，适合日常代码能力回归。</p>
-                    <div class="card-meta"><span class="status-tag">378 cases</span><span class="pill">pass@k</span></div>
-                  </article>
-                  <article class="dataset-card" data-size="100">
-                    <h3>ClassEval</h3>
-                    <p>类与对象场景评测，覆盖多方法依赖。</p>
-                    <div class="card-meta"><span class="status-tag pending">100 cases</span><span class="pill">OOP</span></div>
-                  </article>
-                </div>
-                <div class="form-row">
-                  <label>模型
-                    <select id="testModel">
-                      <option>Qwen3.5-35B-A3B-FP8</option>
-                      <option>Qwen3-Coder-30B-A3B</option>
-                      <option>DeepSeek-Coder-V2-Lite</option>
-                    </select>
-                  </label>
-                  <label>pass@k
-                    <select id="passK">
-                      <option>pass@1</option>
-                      <option>pass@3</option>
-                      <option>pass@5</option>
-                    </select>
-                  </label>
-                  <button class="primary-button" id="runDatasetTest">一键运行测试</button>
-                </div>
-              </div>
-            </section>
-
-            <section class="panel">
-              <div class="panel-head">
-                <div>
-                  <h2>历史测试记录</h2>
-                  <p>支持筛选、排序与查看完整用例明细</p>
-                </div>
-                <div class="control-row">
-                  <select aria-label="筛选历史记录">
-                    <option>全部数据集</option>
-                    <option>HumanEval+</option>
-                    <option>MBPP+</option>
-                  </select>
-                  <select aria-label="排序历史记录">
-                    <option>按时间倒序</option>
-                    <option>按通过率排序</option>
-                    <option>按失败数排序</option>
-                  </select>
-                </div>
-              </div>
-              <div style="padding:18px;">
-                <div class="history-list">
-                  <article class="history-row">
-                    <div><strong>2026-07-12 21:18</strong>HumanEval+ · MBPP+</div>
-                    <div>Qwen3.5-35B-A3B-FP8</div>
-                    <div>pass@1 97.4%</div>
-                    <button class="ghost-button">查看明细</button>
-                  </article>
-                  <article class="history-row">
-                    <div><strong>2026-07-11 18:44</strong>ClassEval</div>
-                    <div>Qwen3-Coder-30B-A3B</div>
-                    <div>pass@1 90.0%</div>
-                    <button class="ghost-button">查看明细</button>
-                  </article>
-                  <article class="history-row">
-                    <div><strong>2026-07-10 09:06</strong>AIME · SWEV</div>
-                    <div>DeepSeek-Coder-V2-Lite</div>
-                    <div>pass@3 84.2%</div>
-                    <button class="ghost-button">查看明细</button>
-                  </article>
-                </div>
-              </div>
-            </section>
           </div>
-
-          <aside class="panel">
-            <div class="panel-head">
-              <div>
-                <h2>当前用例详情</h2>
-                <p>运行中实时更新执行样本与错误摘要</p>
-              </div>
-            </div>
-            <div class="details-body">
-              <div class="case-panel" id="casePanel">
-                <article class="case-row">
-                  <span class="status-tag">pass</span>
-                  <div><strong>HumanEval/042</strong><p>修复边界条件后输出与 reference 一致。</p></div>
-                  <span class="mono">8.4s</span>
-                </article>
-                <article class="case-row">
-                  <span class="status-tag pending">running</span>
-                  <div><strong>MBPP/211</strong><p>正在生成候选代码并执行沙箱验证。</p></div>
-                  <span class="mono">...</span>
-                </article>
-                <article class="case-row">
-                  <span class="status-tag error">fail</span>
-                  <div><strong>HumanEval/117</strong><p>断言失败：空列表输入未返回默认值。</p></div>
-                  <span class="mono">13.9s</span>
-                </article>
-              </div>
-            </div>
-          </aside>
+          <article class="map-node">
+            <small>Input Layer</small>
+            <h3>Workspace-aware prompt</h3>
+            <p>Project root, working directory, coding rules, and task intent are assembled before each model call.</p>
+          </article>
+          <article class="map-node">
+            <small>Tool Layer</small>
+            <h3>Atomic safe tools</h3>
+            <p>Read, Edit, Bash, Grep, TodoWrite, and WebFetch return structured, auditable responses.</p>
+          </article>
+          <article class="map-node">
+            <small>Memory Layer</small>
+            <h3>Context durability</h3>
+            <p>History compaction, token counting, saved outputs, and session snapshots keep long tasks alive.</p>
+          </article>
+          <article class="map-node">
+            <small>Eval Layer</small>
+            <h3>Controlled feedback</h3>
+            <p>Benchmark adapters evaluate code safely, summarize failures, and feed the next repair round.</p>
+          </article>
         </div>
-      </section>
-    </main>
-  </div>
+        <div class="process reveal">
+          <article class="process-step">
+            <span class="num">1</span>
+            <div>
+              <h3>Prepare a workspace-aware prompt</h3>
+              <p>System prompt is enriched with project root, working directory, and coding-specific tool rules.</p>
+            </div>
+          </article>
+          <article class="process-step">
+            <span class="num">2</span>
+            <div>
+              <h3>Call specialized tools</h3>
+              <p>Each tool returns <code>SUCCESS</code>, <code>PARTIAL</code>, or <code>ERROR</code> with structured data.</p>
+            </div>
+          </article>
+          <article class="process-step">
+            <span class="num">3</span>
+            <div>
+              <h3>Protect the run</h3>
+              <p>Circuit breakers stop broken tools, background terminals persist output, and traces record events.</p>
+            </div>
+          </article>
+          <article class="process-step">
+            <span class="num">4</span>
+            <div>
+              <h3>Compact without losing state</h3>
+              <p>Old tool results are shortened, summaries preserve decisions, and TodoWrite persists active plans.</p>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="innovations" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Core innovations</p>
+          <h2>Small, clever design decisions that compound into reliability.</h2>
+        </div>
+        <p>
+          The strongest parts of WhaleCode are the guardrails that make an autonomous coding loop safe,
+          observable, and recoverable under pressure.
+        </p>
+      </div>
+
+      <div class="grid grid-3">
+        <article class="card reveal">
+          <span class="icon-chip">01</span>
+          <h3>Optimistic locking for file edits</h3>
+          <p>
+            <code>Read</code> returns file timestamp and size metadata; <code>Write</code> and <code>Edit</code>
+            can check those values before mutating the file.
+          </p>
+          <ul class="feature-list">
+            <li>Detects stale reads before overwrite</li>
+            <li>Creates backups for surgical edits</li>
+            <li>Returns diffs and diagnostics after mutation</li>
+          </ul>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">02</span>
+          <h3>Bash that nudges the model toward safer tools</h3>
+          <p>
+            Shell execution supports real builds and tests, but redirects standalone <code>ls</code>,
+            <code>grep</code>, <code>sed</code>, and destructive patterns toward specialized tools.
+          </p>
+          <ul class="feature-list">
+            <li>Secret-looking environment variables stripped</li>
+            <li>CPU, memory, process, and file-size rlimits</li>
+            <li>Background processes tracked as terminal artifacts</li>
+          </ul>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">03</span>
+          <h3>TodoWrite as a persistent planning state</h3>
+          <p>
+            Planning is not loose conversation text. It is a replace-all JSON state with validation,
+            one active item, terminal statuses, and session snapshot integration.
+          </p>
+          <ul class="feature-list">
+            <li>Survives compaction and session restore</li>
+            <li>Rejects duplicate or conflicting tasks</li>
+            <li>Gives the model a minimal planning contract</li>
+          </ul>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">04</span>
+          <h3>Three-layer context compression</h3>
+          <p>
+            Micro-compaction trims old tool results, auto-compaction summarizes when token thresholds
+            are crossed, and manual compaction can focus on a chosen subsystem.
+          </p>
+          <ul class="feature-list">
+            <li>Incremental token counting with cache</li>
+            <li>Full output persisted outside the prompt</li>
+            <li>GSSC context builder for structured assembly</li>
+          </ul>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">05</span>
+          <h3>TraceLogger for human and machine audit</h3>
+          <p>
+            Every major event can be emitted into JSONL and a readable HTML trace, with secret redaction
+            and run statistics for review.
+          </p>
+          <ul class="feature-list">
+            <li>Session start and metadata events</li>
+            <li>Tool call/result timeline</li>
+            <li>HTML reports for debugging and demos</li>
+          </ul>
+        </article>
+        <article class="card reveal">
+          <span class="icon-chip">06</span>
+          <h3>Web console for operational control</h3>
+          <p>
+            The web surface streams agent events over SSE, controls vLLM processes, switches models,
+            launches benchmarks, and exposes trajectory detail.
+          </p>
+          <ul class="feature-list">
+            <li>No heavy framework dependency</li>
+            <li>Model discovery and launch helpers</li>
+            <li>Benchmark history and trajectory panels</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="benchmarks" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Evaluation lab</p>
+          <h2>Benchmarks are treated as product infrastructure, not afterthoughts.</h2>
+        </div>
+        <p>
+          WhaleCode includes runners for programming, math, and repository repair datasets. The benchmark
+          layer records progress, preserves trajectories, supports resume, and standardizes heterogeneous
+          task formats through adapters.
+        </p>
+      </div>
+
+      <div class="spotlight">
+        <article class="big-card reveal">
+          <h3>Controlled submission loop</h3>
+          <p>
+            Instead of a one-shot answer, each benchmark can run multiple controlled rounds. The agent submits,
+            sandbox evaluation produces structured feedback, and the next prompt contains the actionable failure
+            signal.
+          </p>
+          <div class="loop" aria-label="Controlled benchmark loop">
+            <div class="loop-node"><b>Submit</b><span>Agent writes or returns a candidate solution.</span></div>
+            <div class="loop-node"><b>Sandbox</b><span>Static checks and OS-level resource limits apply.</span></div>
+            <div class="loop-node"><b>Evaluate</b><span>Adapters run assertions, hidden tests, stdin, or functions.</span></div>
+            <div class="loop-node"><b>Feedback</b><span>Failures are clipped and transformed into a retry prompt.</span></div>
+            <div class="loop-node"><b>Retry</b><span>Agent improves within a fixed step and round budget.</span></div>
+          </div>
+          <div class="metric-grid">
+            <div class="metric">
+              <strong>6+</strong>
+              <span>benchmark families covered</span>
+            </div>
+            <div class="metric">
+              <strong>4</strong>
+              <span>Python evaluation adapters</span>
+            </div>
+          </div>
+        </article>
+
+        <div class="benchmark-card reveal">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Benchmark</th>
+                  <th>Tasks</th>
+                  <th>Passed</th>
+                  <th>Pass Rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>AIME 2024</td>
+                  <td>30</td>
+                  <td>28</td>
+                  <td class="pass">93.3%</td>
+                </tr>
+                <tr>
+                  <td>AIME 2025</td>
+                  <td>30</td>
+                  <td>29</td>
+                  <td class="pass">96.7%</td>
+                </tr>
+                <tr>
+                  <td>AIME 2026</td>
+                  <td>30</td>
+                  <td>28</td>
+                  <td class="pass">93.3%</td>
+                </tr>
+                <tr>
+                  <td>HumanEval+</td>
+                  <td>164</td>
+                  <td>162</td>
+                  <td class="pass">98.8%</td>
+                </tr>
+                <tr>
+                  <td>ClassEval</td>
+                  <td>100</td>
+                  <td>91</td>
+                  <td class="pass">91.0%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <article class="card">
+            <span class="icon-chip">SEC</span>
+            <h3>Dual-layer sandbox for generated code</h3>
+            <p>
+              Benchmark execution combines AST static checks for dangerous imports/calls with subprocess
+              isolation, resource limits, timeout enforcement, and minimal child environments.
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="evidence" class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Project evidence</p>
+          <h2>Architecture, CLI, and runtime surfaces are already implemented.</h2>
+        </div>
+        <p>
+          These assets come from the project itself and make the showcase concrete: key design, full
+          architecture, and the interactive CLI experience.
+        </p>
+      </div>
+
+      <div class="demo-grid">
+        <article class="visual-card reveal">
+          <div class="mock-toolbar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+            <span class="mock-title">Web Console Mock</span>
+          </div>
+          <div class="mock-body">
+            <div class="web-console-grid">
+              <aside class="mock-sidebar">
+                <div class="mock-menu-item active"><span>Agent Job</span><strong>Live</strong></div>
+                <div class="mock-menu-item"><span>Model</span><strong>Qwen</strong></div>
+                <div class="mock-menu-item"><span>Benchmarks</span><strong>5</strong></div>
+                <div class="mock-menu-item"><span>Sessions</span><strong>Saved</strong></div>
+              </aside>
+              <div class="mock-main">
+                <div class="prompt-box">Task: inspect repository, edit safely, run verification, summarize changes.</div>
+                <div class="event-stream">
+                  <div class="event-line"><span class="event-dot"></span><strong>agent_start</strong><em>00:01</em></div>
+                  <div class="event-line"><span class="event-dot"></span><strong>tool_call · Grep</strong><em>00:04</em></div>
+                  <div class="event-line"><span class="event-dot"></span><strong>tool_result · 18 matches</strong><em>00:06</em></div>
+                  <div class="event-line"><span class="event-dot"></span><strong>background_terminal</strong><em>00:18</em></div>
+                  <div class="event-line"><span class="event-dot"></span><strong>final_answer</strong><em>00:31</em></div>
+                </div>
+                <div class="mock-command"><span>stream: /api/jobs/events</span><strong>SSE</strong></div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <div class="demo-stack">
+          <article class="visual-card reveal">
+            <div class="mock-toolbar">
+              <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+              <span class="mock-title">CLI Runtime Mock</span>
+            </div>
+            <div class="cli-screen">
+              <div><span class="dim">$</span> python run_cli.py --workspace ./repo</div>
+              <div><span class="accent">/tools</span> Read · Write · Edit · Bash · TodoWrite</div>
+              <div>🎬 Tool call: Read({"path": "code/agents/code_agent.py"})</div>
+              <div>👀 Observation: optimistic metadata captured</div>
+              <div>✓ Verification complete. Ready for concise handoff.</div>
+            </div>
+          </article>
+
+          <article class="visual-card reveal">
+            <div class="mock-toolbar">
+              <span class="mock-title">Trajectory Mock</span>
+              <span class="badge">auditable</span>
+            </div>
+            <div class="trajectory-mini">
+              <div class="trajectory-step"><span>01</span><div><strong>Submit candidate</strong><small>agent writes solution</small></div><code>Write</code></div>
+              <div class="trajectory-step"><span>02</span><div><strong>Run sandbox</strong><small>AST + resource limits</small></div><code>Bash</code></div>
+              <div class="trajectory-step"><span>03</span><div><strong>Inject feedback</strong><small>structured retry signal</small></div><code>Eval</code></div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker">Implementation snapshot</p>
+          <h2>The codebase shows production thinking in multiple layers.</h2>
+        </div>
+        <p>
+          The most important modules are cohesive: <code>CodeAgent</code> wires repository behavior,
+          <code>ToolRegistry</code> normalizes execution, file tools protect edits, and benchmark runners
+          evaluate the system end to end.
+        </p>
+      </div>
+
+      <div class="implementation">
+        <div class="roadmap reveal">
+          <article class="roadmap-item">
+            <div>
+              <h3><code>code/agents/code_agent.py</code></h3>
+              <p>Repository-aware CodeAgent with default tool registration, workspace prompt, compaction API, and isolated sub-agents.</p>
+            </div>
+          </article>
+          <article class="roadmap-item">
+            <div>
+              <h3><code>code/tools/builtin/file_tools.py</code></h3>
+              <p>Read/Write/Edit/Delete with path resolution, optimistic locks, backups, conflict detection, and structured diagnostics.</p>
+            </div>
+          </article>
+          <article class="roadmap-item">
+            <div>
+              <h3><code>code/benchmark/base.py</code></h3>
+              <p>BenchmarkCodeAgent plus controlled submission rounds, event capture, progress updates, and trajectory persistence.</p>
+            </div>
+          </article>
+          <article class="roadmap-item">
+            <div>
+              <h3><code>web/server.py</code></h3>
+              <p>Zero-dependency HTTP/SSE control plane for model management, agent jobs, benchmarks, sessions, and trajectories.</p>
+            </div>
+          </article>
+        </div>
+
+        <div class="code-panel reveal" aria-label="Representative implementation notes">
+          <pre><span class="comment"># WhaleCode design spine</span>
+<span class="blue">Agent</span> → <span class="blue">ReActAgent</span> → <span class="accent">CodeAgent</span>
+
+<span class="comment"># Every file tool receives the same safety boundary</span>
+project_root = Path(project_root).resolve()
+working_dir  = Path(working_dir or project_root).resolve()
+working_dir.relative_to(project_root)
+
+<span class="comment"># Tool results are machine-readable, not raw strings</span>
+ToolResponse:
+  status: SUCCESS | PARTIAL | ERROR
+  data: structured payload
+  error_info: typed failure code
+  stats: timing and token metadata
+
+<span class="comment"># Benchmark loop</span>
+while rounds_left:
+  candidate = agent.run(prompt)
+  result = adapter.evaluate(candidate)
+  if result.passed: break
+  prompt = build_feedback(result)</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell cta reveal">
+      <div class="cta-inner">
+        <div>
+          <p class="kicker">Bottom line</p>
+          <h2>WhaleCode is HelloAgent sharpened for real code.</h2>
+          <p>
+            Its innovation is not one giant trick. It is the careful layering of structured tool calls,
+            safe file mutation, persistent planning, context compression, audited execution, and benchmark
+            feedback loops into a coherent coding-agent system.
+          </p>
+        </div>
+        <a class="button primary" href="#top">Back to top</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="shell footer">
+    Built as an English showcase for WhaleCode. Content is based on the local project implementation,
+    README, docs, benchmark runners, and existing assets.
+  </footer>
 
   <script>
     const pageMeta = {
-      agent: ["智能体交互主页面", "默认只呈现运行状态、最终结果和总耗时；运行详情按需展开。"],
-      models: ["vLLM 模型管理", "启动、停止、热切换与卸载模型，实时展示加载进度和显存占用。"],
-      datasets: ["数据集测试", "批量运行测试集，实时统计通过率、失败数、平均耗时与 pass@k 指标。"]
+      en: {
+        title: "WhaleCode — Production-Grade Coding Agent Showcase",
+        description:
+          "WhaleCode showcase — a production-grade coding agent framework built on HelloAgent and upgraded for real repository work, safe tools, context engineering, and benchmark evaluation."
+      },
+      zh: {
+        title: "WhaleCode — 生产级编程智能体展示",
+        description:
+          "WhaleCode 项目展示页：基于 HelloAgent 升级而来的生产级编程智能体框架，突出真实仓库工作、安全工具链、上下文工程与评测闭环。"
+      }
     };
 
-    const navButtons = document.querySelectorAll(".nav-button");
-    const pages = {
-      agent: document.getElementById("agentPage"),
-      models: document.getElementById("modelsPage"),
-      datasets: document.getElementById("datasetsPage")
-    };
+    const translations = new Map(Object.entries({
+      "Agent Showcase": "智能体展示",
+      "Why": "亮点",
+      "Upgrades": "升级",
+      "Architecture": "架构",
+      "Benchmarks": "评测",
+      "Evidence": "证据",
+      "Production-grade coding agent framework": '<span class="pulse"></span> 生产级编程智能体框架',
+      "WhaleCode turns the general-purpose HelloAgent foundation into a repository-native coding system: structured function-calling ReAct, atomized safe tools, long-horizon context engineering, persistent sessions, and a benchmark lab built for controlled iteration.": "WhaleCode 将通用的 HelloAgent 基础框架升级为面向真实代码仓库的编程智能体系统：结构化函数调用 ReAct、原子化安全工具、长程上下文工程、可持久化会话，以及支持受控迭代的评测实验室。",
+      "Explore the upgrades": "查看创新升级",
+      "View benchmark results": "查看评测结果",
+      "Python LOC across agent, tools, web, tests": "覆盖 agent、工具、Web 与测试的 Python 代码行",
+      "line coding-specific system prompt": "行编程场景专用系统提示词",
+      "tool-call parse target via function calling": "基于函数调用的工具解析目标成功率",
+      "CodeAgent Runtime": "CodeAgent 运行时",
+      "Think → Act → Observe": "思考 → 行动 → 观察",
+      "Function-calling ReAct loop with Thought and Finish control tools.": "通过 Thought 与 Finish 控制工具实现函数调用式 ReAct 循环。",
+      "structured": "结构化",
+      "Repository-safe tools": "仓库安全工具链",
+      "Read, Write, Edit, Delete, Glob, Grep, Bash, TodoWrite, WebFetch.": "Read、Write、Edit、Delete、Glob、Grep、Bash、TodoWrite、WebFetch。",
+      "sandboxed": "沙箱化",
+      "Context survives long tasks": "上下文支撑长任务",
+      "Micro compaction, LLM summaries, manual focus compaction, output truncation.": "微压缩、LLM 摘要、手动聚焦压缩与工具输出截断协同工作。",
+      "durable": "可持续",
+      "Benchmark feedback loop": "评测反馈闭环",
+      "Submit code, sandbox evaluate, inject feedback, iterate under step budgets.": "提交代码、沙箱评测、注入反馈，并在步数预算内持续迭代。",
+      "measured": "可度量",
+      "$ python run_cli.py --workspace ./repo": '<span class="muted-line">$</span> python run_cli.py --workspace ./repo',
+      "✓ workspace root locked": "✓ 工作区根目录已锁定",
+      "✓ 12+ coding tools registered": "✓ 已注册 12+ 个编程工具",
+      "✓ trace, sessions, todos, terminals ready": "✓ 轨迹、会话、任务与终端记录已就绪",
+      "Toolchain map": "工具链地图",
+      "Atomized tools make every operation inspectable, recoverable, and safer than raw shell-only automation.": "原子化工具让每一次操作都可检查、可恢复，并且比纯 Shell 自动化更安全。",
+      "Why it matters": "为什么重要",
+      "A coding agent designed around real repository failure modes.": "围绕真实代码仓库故障模式设计的编程智能体。",
+      "The project is not just a ReAct demo. It hardens the entire lifecycle: how the model calls tools, how files are protected, how large outputs are compressed, how background commands are tracked, and how benchmark submissions are judged.": "这个项目不只是 ReAct 演示，而是对完整生命周期进行了工程化加固：模型如何调用工具、文件如何被保护、大输出如何压缩、后台命令如何追踪，以及评测提交如何判定。",
+      "Native function calling instead of text parsing": "用原生函数调用替代文本解析",
+      "Tool calls are structured JSON from the model API, avoiding fragile regex parsing of Action: text and making the ReAct loop much more reliable.": "工具调用来自模型 API 的结构化 JSON，避免脆弱的 <code>Action:</code> 文本正则解析，让 ReAct 循环更可靠。",
+      "Safety as a first-class tool contract": "将安全作为工具契约的一等公民",
+      "File tools validate paths against project_root, use optimistic lock metadata, produce backups, and reject conflicts before edits can overwrite human changes.": "文件工具会基于 <code>project_root</code> 校验路径，使用乐观锁元数据、生成备份，并在编辑覆盖人工修改前拒绝冲突。",
+      "Context engineering for long-horizon tasks": "面向长程任务的上下文工程",
+      "History, token counting, compaction, truncation, and structured context building work together so the agent can continue across multi-step programming sessions.": "历史管理、Token 计数、上下文压缩、输出截断与结构化上下文构建协同，使智能体能够持续完成多步骤编程会话。",
+      "HelloAgent → WhaleCode": "HelloAgent → WhaleCode",
+      "General agent framework, upgraded into a coding workbench.": "从通用智能体框架升级为编程工作台。",
+      "HelloAgent provides the base abstractions: Agent, ReAct loop, LLM adapters, tool registry, context compaction, circuit breaker, sessions, and skills. WhaleCode specializes those pieces around coding workflows and evaluation.": "HelloAgent 提供 Agent、ReAct 循环、LLM 适配器、工具注册表、上下文压缩、熔断器、会话与 Skills 等基础能力。WhaleCode 则围绕编程工作流与评测体系对这些能力进行专项强化。",
+      "HelloAgent foundation": "HelloAgent 基础能力",
+      "A flexible multi-agent base with ReAct, function calling, reusable tools, unified LLM clients, circuit breakers, and session persistence.": "一个灵活的多智能体基础框架，具备 ReAct、函数调用、可复用工具、统一 LLM 客户端、熔断器与会话持久化能力。",
+      "Agent base class": "Agent 基类",
+      "ToolRegistry": "工具注册表",
+      "ReAct loop": "ReAct 循环",
+      "LLM adapters": "LLM 适配器",
+      "Context compaction": "上下文压缩",
+      "Session store": "会话存储",
+      "Upgrade 01": "升级 01",
+      "Upgrade 02": "升级 02",
+      "Upgrade 03": "升级 03",
+      "Upgrade 04": "升级 04",
+      "CodeAgent specialization": "CodeAgent 编程专用化",
+      "Adds workspace-aware prompts, repository root enforcement, default coding tools, step budgets, and isolated sub-agent creation.": "加入工作区感知提示词、仓库根目录约束、默认编程工具、步数预算，以及隔离式子智能体创建。",
+      "Atomized programming toolchain": "原子化编程工具链",
+      "Splits discovery, reading, editing, deleting, shell execution, web fetching, and planning into auditable tools with structured responses.": "将发现、读取、编辑、删除、Shell 执行、网页获取与任务规划拆分为可审计、结构化响应的工具。",
+      "Benchmark-grade control loop": "评测级控制闭环",
+      "Converts one-shot answers into iterative submissions: evaluate safely, build feedback, re-prompt, and retry within per-task limits.": "将一次性回答升级为迭代式提交：安全评测、构建反馈、重新提示，并在任务限制内重试。",
+      "CLI + Web operating surface": "CLI + Web 操作界面",
+      "Adds a Rich CLI with slash commands and a zero-dependency Web console with SSE events, model launch control, sessions, benchmarks, and trajectories.": "新增带 slash 命令的 Rich CLI，以及零依赖 Web 控制台，支持 SSE 事件、模型启动控制、会话、评测与轨迹查看。",
+      "The loop is simple. The engineering around it is the product.": "循环很简单，围绕循环的工程化才是核心。",
+      "WhaleCode keeps the classic Think → Act → Observe loop, then wraps it with path safety, tool response semantics, context durability, terminal artifacts, trace logs, and benchmark trajectories.": "WhaleCode 保留经典的 Think → Act → Observe 循环，并进一步包裹路径安全、工具响应语义、上下文持久性、终端产物、轨迹日志与评测轨迹。",
+      "Prepare a workspace-aware prompt": "构建工作区感知提示词",
+      "System prompt is enriched with project root, working directory, and coding-specific tool rules.": "系统提示词注入项目根目录、当前工作目录与编程场景专用工具规则。",
+      "Call specialized tools": "调用专用工具",
+      "Each tool returns SUCCESS, PARTIAL, or ERROR with structured data.": "每个工具都返回带结构化数据的 <code>SUCCESS</code>、<code>PARTIAL</code> 或 <code>ERROR</code>。",
+      "Protect the run": "保护执行过程",
+      "Circuit breakers stop broken tools, background terminals persist output, and traces record events.": "熔断器阻止故障工具反复调用，后台终端持久化输出，轨迹记录完整事件。",
+      "Compact without losing state": "在不丢失状态的前提下压缩",
+      "Old tool results are shortened, summaries preserve decisions, and TodoWrite persists active plans.": "旧工具结果被压缩，摘要保留关键决策，TodoWrite 持久化当前计划。",
+      "Core innovations": "核心创新",
+      "Small, clever design decisions that compound into reliability.": "一系列精巧设计共同构成可靠性。",
+      "The strongest parts of WhaleCode are the guardrails that make an autonomous coding loop safe, observable, and recoverable under pressure.": "WhaleCode 最强的部分，是让自主编程循环在复杂压力下仍然安全、可观测、可恢复的工程护栏。",
+      "Optimistic locking for file edits": "文件编辑的乐观锁机制",
+      "Read returns file timestamp and size metadata; Write and Edit can check those values before mutating the file.": "<code>Read</code> 返回文件时间戳与大小元数据；<code>Write</code> 和 <code>Edit</code> 在修改前可校验这些值。",
+      "Detects stale reads before overwrite": "覆盖前检测过期读取",
+      "Creates backups for surgical edits": "为精准编辑创建备份",
+      "Returns diffs and diagnostics after mutation": "修改后返回 diff 与诊断信息",
+      "Bash that nudges the model toward safer tools": "引导模型使用更安全工具的 Bash",
+      "Shell execution supports real builds and tests, but redirects standalone ls, grep, sed, and destructive patterns toward specialized tools.": "Shell 支持真实构建与测试，但会将独立的 <code>ls</code>、<code>grep</code>、<code>sed</code> 与破坏性模式引导到专用工具。",
+      "Secret-looking environment variables stripped": "剥离疑似密钥的环境变量",
+      "CPU, memory, process, and file-size rlimits": "限制 CPU、内存、进程数与文件大小",
+      "Background processes tracked as terminal artifacts": "后台进程以终端产物形式追踪",
+      "TodoWrite as a persistent planning state": "TodoWrite 作为可持久化规划状态",
+      "Planning is not loose conversation text. It is a replace-all JSON state with validation, one active item, terminal statuses, and session snapshot integration.": "规划不再是松散对话文本，而是带校验的 replace-all JSON 状态：仅一个活跃任务、终态约束，并集成到会话快照。",
+      "Survives compaction and session restore": "可跨上下文压缩与会话恢复保留",
+      "Rejects duplicate or conflicting tasks": "拒绝重复或冲突任务",
+      "Gives the model a minimal planning contract": "为模型提供极简规划契约",
+      "Three-layer context compression": "三层上下文压缩",
+      "Micro-compaction trims old tool results, auto-compaction summarizes when token thresholds are crossed, and manual compaction can focus on a chosen subsystem.": "微压缩裁剪旧工具结果；自动压缩在 Token 超阈值时生成摘要；手动压缩可聚焦指定子系统。",
+      "Incremental token counting with cache": "带缓存的增量 Token 计数",
+      "Full output persisted outside the prompt": "完整输出持久化在提示词之外",
+      "GSSC context builder for structured assembly": "GSSC 上下文构建器进行结构化组装",
+      "TraceLogger for human and machine audit": "面向人类与机器审计的 TraceLogger",
+      "Every major event can be emitted into JSONL and a readable HTML trace, with secret redaction and run statistics for review.": "每个关键事件都可输出为 JSONL 与可读 HTML 轨迹，并带密钥脱敏与运行统计，便于复盘。",
+      "Session start and metadata events": "会话启动与元数据事件",
+      "Tool call/result timeline": "工具调用与结果时间线",
+      "HTML reports for debugging and demos": "用于调试与演示的 HTML 报告",
+      "Web console for operational control": "用于运行控制的 Web 控制台",
+      "The web surface streams agent events over SSE, controls vLLM processes, switches models, launches benchmarks, and exposes trajectory detail.": "Web 界面通过 SSE 流式推送智能体事件，控制 vLLM 进程、切换模型、启动评测，并展示轨迹详情。",
+      "No heavy framework dependency": "无重型框架依赖",
+      "Model discovery and launch helpers": "模型发现与启动辅助",
+      "Benchmark history and trajectory panels": "评测历史与轨迹面板",
+      "Evaluation lab": "评测实验室",
+      "Benchmarks are treated as product infrastructure, not afterthoughts.": "评测被视为产品基础设施，而非附属品。",
+      "WhaleCode includes runners for programming, math, and repository repair datasets. The benchmark layer records progress, preserves trajectories, supports resume, and standardizes heterogeneous task formats through adapters.": "WhaleCode 包含编程、数学与仓库修复数据集的 runner。评测层记录进度、持久化轨迹、支持断点续测，并通过适配器统一异构任务格式。",
+      "Controlled submission loop": "多轮受控提交闭环",
+      "Instead of a one-shot answer, each benchmark can run multiple controlled rounds. The agent submits, sandbox evaluation produces structured feedback, and the next prompt contains the actionable failure signal.": "每个 benchmark 不再依赖一次性答案，而是可运行多轮受控提交：智能体提交结果，沙箱评测产生结构化反馈，下一轮提示词包含可执行的失败信号。",
+      "Submit": "提交",
+      "Agent writes or returns a candidate solution.": "智能体写入或返回候选解。",
+      "Sandbox": "沙箱",
+      "Static checks and OS-level resource limits apply.": "应用静态检查与 OS 级资源限制。",
+      "Evaluate": "评测",
+      "Adapters run assertions, hidden tests, stdin, or functions.": "适配器运行断言、隐藏测试、标准输入输出或函数调用。",
+      "Feedback": "反馈",
+      "Failures are clipped and transformed into a retry prompt.": "失败信息被裁剪并转化为下一轮重试提示。",
+      "Retry": "重试",
+      "Agent improves within a fixed step and round budget.": "智能体在固定步数与轮次预算内改进。",
+      "benchmark families covered": "类 benchmark 家族覆盖",
+      "Python evaluation adapters": "种 Python 评测适配器",
+      "Benchmark": "评测项",
+      "Tasks": "任务数",
+      "Passed": "通过",
+      "Pass Rate": "通过率",
+      "Dual-layer sandbox for generated code": "面向生成代码的双层安全沙箱",
+      "Benchmark execution combines AST static checks for dangerous imports/calls with subprocess isolation, resource limits, timeout enforcement, and minimal child environments.": "评测执行结合 AST 静态检查危险导入/调用、子进程隔离、资源限制、超时强制终止与最小化子进程环境。",
+      "Project evidence": "项目证据",
+      "Architecture, CLI, and runtime surfaces are already implemented.": "架构、CLI 与运行界面均已实现。",
+      "These assets come from the project itself and make the showcase concrete: key design, full architecture, and the interactive CLI experience.": "这些素材均来自项目本身，让展示更具体：关键设计图、完整架构图与交互式 CLI 体验。",
+      "Architecture overview": "架构总览",
+      "ReAct, tools, context, sessions": "ReAct、工具、上下文、会话",
+      "Interactive CLI": "交互式 CLI",
+      "Slash commands and live tool traces": "Slash 命令与实时工具轨迹",
+      "View larger": "放大查看",
+      "Two front doors: terminal and browser": "两个入口：终端与浏览器",
+      "The Rich CLI is optimized for local engineering workflows, while the web console makes model launch, task execution, SSE event streams, benchmark history, and trajectories easier to demo.": "Rich CLI 针对本地工程工作流优化；Web 控制台则让模型启动、任务执行、SSE 事件流、评测历史与轨迹演示更加直观。",
+      "Implementation snapshot": "实现快照",
+      "The codebase shows production thinking in multiple layers.": "代码库在多个层面体现了生产级工程思维。",
+      "The most important modules are cohesive: CodeAgent wires repository behavior, ToolRegistry normalizes execution, file tools protect edits, and benchmark runners evaluate the system end to end.": "核心模块职责清晰：<code>CodeAgent</code> 连接仓库行为，<code>ToolRegistry</code> 规范执行，文件工具保护编辑，benchmark runner 端到端评测系统能力。",
+      "Repository-aware CodeAgent with default tool registration, workspace prompt, compaction API, and isolated sub-agents.": "仓库感知的 CodeAgent，内置默认工具注册、工作区提示词、压缩 API 与隔离式子智能体。",
+      "Read/Write/Edit/Delete with path resolution, optimistic locks, backups, conflict detection, and structured diagnostics.": "Read/Write/Edit/Delete 支持路径解析、乐观锁、备份、冲突检测与结构化诊断。",
+      "BenchmarkCodeAgent plus controlled submission rounds, event capture, progress updates, and trajectory persistence.": "BenchmarkCodeAgent 支持受控提交轮次、事件捕获、进度更新与轨迹持久化。",
+      "Zero-dependency HTTP/SSE control plane for model management, agent jobs, benchmarks, sessions, and trajectories.": "零依赖 HTTP/SSE 控制平面，覆盖模型管理、智能体任务、评测、会话与轨迹。",
+      "Bottom line": "总结",
+      "WhaleCode is HelloAgent sharpened for real code.": "WhaleCode 是面向真实代码任务强化后的 HelloAgent。",
+      "Its innovation is not one giant trick. It is the careful layering of structured tool calls, safe file mutation, persistent planning, context compression, audited execution, and benchmark feedback loops into a coherent coding-agent system.": "它的创新不是某个单点技巧，而是将结构化工具调用、安全文件修改、持久化规划、上下文压缩、可审计执行与评测反馈闭环，细致叠加为一个一致的编程智能体系统。",
+      "Back to top": "返回顶部",
+      "Press Esc or click outside to close.": "按 Esc 或点击外部关闭。",
+      "Built as an English showcase for WhaleCode. Content is based on the local project implementation, README, docs, benchmark runners, and existing assets.": "这是为 WhaleCode 制作的双语展示页。内容基于本地项目实现、README、文档、benchmark runner 与已有素材整理。"
+    }));
 
-    navButtons.forEach((button) => {
-      button.addEventListener("click", () => {
-        const page = button.dataset.page;
-        navButtons.forEach((item) => item.classList.toggle("active", item === button));
-        Object.entries(pages).forEach(([key, el]) => el.classList.toggle("active", key === page));
-        document.getElementById("pageTitle").textContent = pageMeta[page][0];
-        document.getElementById("pageSub").textContent = pageMeta[page][1];
-      });
-    });
+    const normalizeText = text => text.replace(/\s+/g, " ").trim();
+    const translationSelector = [
+      ".brand small",
+      ".nav-links a",
+      ".eyebrow",
+      ".hero-copy",
+      ".button",
+      ".mini-stat span",
+      ".window-bar > span:last-child",
+      ".flow-row h3",
+      ".flow-row p",
+      ".badge",
+      ".terminal div",
+      ".kicker",
+      "h2",
+      ".section-head > p",
+      ".card h3",
+      ".card p",
+      ".feature-list li",
+      ".foundation-aside h3",
+      ".foundation-aside p",
+      ".stacked-tags span",
+      ".upgrade small",
+      ".upgrade h3",
+      ".upgrade p",
+      ".process-step h3",
+      ".process-step p",
+      ".big-card h3",
+      ".big-card p",
+      ".loop-node b",
+      ".loop-node span",
+      ".metric span",
+      "th",
+      ".caption b",
+      ".caption span",
+      ".zoom-hint",
+      ".lightbox-caption span",
+      ".roadmap-item p",
+      ".cta h2",
+      ".cta p",
+      ".footer"
+    ].join(",");
 
-    document.querySelectorAll(".quick").forEach((button) => {
-      button.addEventListener("click", () => {
-        document.getElementById("promptInput").value = button.dataset.prompt;
-        document.getElementById("promptInput").focus();
-      });
-    });
+    const metaDescription = document.querySelector("meta[name='description']");
+    const translatableElements = Array.from(document.querySelectorAll(translationSelector));
 
-    document.getElementById("expandAll").addEventListener("click", () => {
-      const details = document.querySelectorAll("#detailsBody details");
-      const shouldOpen = Array.from(details).some((item) => !item.open);
-      details.forEach((item) => {
-        item.open = shouldOpen;
-      });
-      document.getElementById("expandAll").textContent = shouldOpen ? "全部折叠" : "全部展开";
-    });
-
-    document.getElementById("agentForm").addEventListener("submit", (event) => {
-      event.preventDefault();
-      const input = document.getElementById("promptInput");
-      const value = input.value.trim();
-      if (!value) return;
-
-      const chat = document.getElementById("chatStream");
-      const userMessage = document.createElement("article");
-      userMessage.className = "message user";
-      userMessage.innerHTML = `<div class="message-label">User · 新任务</div><div class="bubble">${escapeHtml(value)}</div>`;
-      chat.appendChild(userMessage);
-
-      const runState = document.getElementById("runState");
-      const sendButton = document.getElementById("sendButton");
-      runState.className = "status-tag pending";
-      runState.innerHTML = '<span class="spinner"></span>处理中';
-      sendButton.disabled = true;
-      sendButton.innerHTML = '<span class="spinner"></span>智能体运行中';
-      input.value = "";
-      chat.scrollTop = chat.scrollHeight;
-
-      setTimeout(() => {
-        const agentMessage = document.createElement("article");
-        agentMessage.className = "message agent";
-        agentMessage.innerHTML = `
-          <div class="message-label">WhaleCode · Final Output</div>
-          <div class="bubble">
-            已完成任务拆解与执行模拟。建议把需求拆成 API 编排、实时事件流、任务状态持久化和前端状态机四层，并通过统一 trace_id 串联智能体步骤、工具调用和测试结果。
-            <div class="run-summary">
-              <div class="summary-card"><div class="summary-label">状态</div><div class="summary-value"><span class="dot"></span>已完成</div></div>
-              <div class="summary-card"><div class="summary-label">总耗时</div><div class="summary-value">12.7s</div></div>
-              <div class="summary-card"><div class="summary-label">Token</div><div class="summary-value">8,936</div></div>
-            </div>
-          </div>`;
-        chat.appendChild(agentMessage);
-        runState.className = "status-tag";
-        runState.innerHTML = '<span class="dot"></span>已完成';
-        sendButton.disabled = false;
-        sendButton.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg>运行智能体';
-        chat.scrollTop = chat.scrollHeight;
-      }, 1250);
-    });
-
-    document.getElementById("newSession").addEventListener("click", () => {
-      const list = document.getElementById("sessionList");
-      list.querySelectorAll(".session-item").forEach((item) => item.classList.remove("active"));
-      const item = document.createElement("article");
-      item.className = "session-item active";
-      item.innerHTML = `
-        <div>
-          <div class="session-name">新建代码任务</div>
-          <div class="session-meta">0 steps · just now</div>
-        </div>
-        <button class="icon-button" aria-label="删除会话">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 7h12m-9 0V5h6v2m-7 3v8m4-8v8m4-8v8M8 7l1 13h6l1-13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>`;
-      list.prepend(item);
-    });
-
-    document.getElementById("sessionList").addEventListener("click", (event) => {
-      const deleteButton = event.target.closest(".icon-button");
-      const row = event.target.closest(".session-item");
-      if (!row) return;
-      if (deleteButton) {
-        row.remove();
+    translatableElements.forEach(element => {
+      const key = normalizeText(element.textContent);
+      if (!translations.has(key)) {
         return;
       }
-      document.querySelectorAll(".session-item").forEach((item) => item.classList.remove("active"));
-      row.classList.add("active");
+      element.dataset.i18nKey = key;
+      element.dataset.i18nEnglish = element.innerHTML.trim();
     });
 
-    function simulateLoading(targetModel, gpuText) {
-      const cards = document.querySelectorAll(".model-card");
-      const loadBar = document.getElementById("loadBar");
-      const loadPercent = document.getElementById("loadPercent");
-      const loadStatus = document.getElementById("loadStatus");
-      const buttons = [document.getElementById("startService"), document.getElementById("stopService"), document.getElementById("unloadModel")];
-      let progress = 0;
-      buttons.forEach((button) => (button.disabled = true));
-      loadStatus.innerHTML = '<span class="spinner"></span> 加载中';
-      const timer = setInterval(() => {
-        progress += 20;
-        loadBar.style.setProperty("--value", progress + "%");
-        loadPercent.textContent = progress + "%";
-        if (progress >= 100) {
-          clearInterval(timer);
-          cards.forEach((card) => {
-            const active = card.dataset.model === targetModel;
-            card.classList.toggle("active", active);
-            const tag = card.querySelector(".status-tag");
-            tag.className = active ? "status-tag" : "status-tag pending";
-            tag.textContent = active ? "已加载" : "未加载";
-          });
-          document.getElementById("activeModel").textContent = targetModel;
-          document.getElementById("loadedModelMetric").textContent = targetModel;
-          document.getElementById("gpuText").textContent = gpuText;
-          document.getElementById("gpuMetric").textContent = targetModel.includes("Lite") ? "23%" : targetModel.includes("30B") ? "46%" : "53%";
-          document.getElementById("gpuBar").style.setProperty("--value", document.getElementById("gpuMetric").textContent);
-          loadStatus.textContent = "切换完成";
-          buttons.forEach((button) => (button.disabled = false));
-        }
-      }, 260);
-    }
+    let currentLanguage = "en";
+    const setLanguage = language => {
+      const isChinese = language === "zh";
+      currentLanguage = isChinese ? "zh" : "en";
+      document.documentElement.lang = isChinese ? "zh-CN" : "en";
+      document.title = isChinese ? pageMeta.zh.title : pageMeta.en.title;
+      if (metaDescription) {
+        metaDescription.setAttribute("content", isChinese ? pageMeta.zh.description : pageMeta.en.description);
+      }
 
-    document.getElementById("modelGrid").addEventListener("click", (event) => {
-      const card = event.target.closest(".model-card");
-      if (!card || card.classList.contains("active")) return;
-      simulateLoading(card.dataset.model, card.dataset.gpu);
-    });
-
-    document.getElementById("stopService").addEventListener("click", () => {
-      document.getElementById("serviceDot").className = "dot error";
-      document.getElementById("serviceText").textContent = "vLLM stopped";
-      document.getElementById("modelServiceMetric").textContent = "Stopped";
-    });
-
-    document.getElementById("startService").addEventListener("click", () => {
-      document.getElementById("serviceDot").className = "dot";
-      document.getElementById("serviceText").textContent = "vLLM running";
-      document.getElementById("modelServiceMetric").textContent = "Running";
-    });
-
-    document.getElementById("unloadModel").addEventListener("click", () => {
-      document.getElementById("activeModel").textContent = "未加载";
-      document.getElementById("loadedModelMetric").textContent = "未加载";
-      document.getElementById("gpuText").textContent = "0 / 80 GB";
-      document.getElementById("gpuMetric").textContent = "0%";
-      document.getElementById("gpuBar").style.setProperty("--value", "0%");
-      document.querySelectorAll(".model-card").forEach((card) => {
-        card.classList.remove("active");
-        const tag = card.querySelector(".status-tag");
-        tag.className = "status-tag pending";
-        tag.textContent = "未加载";
+      document.querySelectorAll("[data-i18n-key]").forEach(element => {
+        const key = element.dataset.i18nKey;
+        element.innerHTML = isChinese ? translations.get(key) : element.dataset.i18nEnglish;
       });
+
+      document.querySelectorAll(".language-option").forEach(button => {
+        const active = button.dataset.lang === language;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+
+      try {
+        localStorage.setItem("whalecode-showcase-language", language);
+      } catch (error) {
+        // Local storage can be unavailable in strict browser modes; language still switches.
+      }
+    };
+
+    document.querySelectorAll(".language-option").forEach(button => {
+      button.addEventListener("click", () => setLanguage(button.dataset.lang));
     });
 
-    document.getElementById("datasetGrid").addEventListener("click", (event) => {
-      const card = event.target.closest(".dataset-card");
-      if (card) card.classList.toggle("selected");
-    });
-
-    document.getElementById("runDatasetTest").addEventListener("click", () => {
-      const selected = Array.from(document.querySelectorAll(".dataset-card.selected"));
-      const total = selected.reduce((sum, card) => sum + Number(card.dataset.size), 0) || 164;
-      const button = document.getElementById("runDatasetTest");
-      const progressText = document.getElementById("testProgressText");
-      const progressBar = document.getElementById("testProgressBar");
-      let done = 0;
-      button.disabled = true;
-      button.innerHTML = '<span class="spinner"></span>测试运行中';
-      const timer = setInterval(() => {
-        done = Math.min(total, done + Math.ceil(total / 9));
-        const percent = Math.round((done / total) * 100);
-        progressText.textContent = `${done} / ${total}`;
-        progressBar.style.setProperty("--value", percent + "%");
-        document.getElementById("passRate").textContent = (94 + percent / 35).toFixed(1) + "%";
-        document.getElementById("avgLatency").textContent = (13.6 - percent / 42).toFixed(1) + "s";
-        document.getElementById("failCount").textContent = Math.max(2, Math.round((100 - percent) / 7));
-        if (done >= total) {
-          clearInterval(timer);
-          button.disabled = false;
-          button.textContent = "一键运行测试";
-        }
-      }, 420);
-    });
-
-    function escapeHtml(value) {
-      return value.replace(/[&<>"']/g, (char) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#039;"
-      })[char]);
+    let initialLanguage = "en";
+    try {
+      initialLanguage = localStorage.getItem("whalecode-showcase-language") || "en";
+    } catch (error) {
+      initialLanguage = "en";
     }
+    setLanguage(initialLanguage === "zh" ? "zh" : "en");
+
+    const navLinks = Array.from(document.querySelectorAll(".nav-links a"));
+    const sectionTargets = navLinks
+      .map(link => document.querySelector(link.getAttribute("href")))
+      .filter(Boolean);
+
+    const setActiveNav = id => {
+      navLinks.forEach(link => {
+        link.classList.toggle("active", link.getAttribute("href") === "#" + id);
+      });
+    };
+
+    const navObserver = new IntersectionObserver(
+      entries => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            setActiveNav(entry.target.id);
+          }
+        });
+      },
+      { rootMargin: "-42% 0px -46% 0px", threshold: 0.01 }
+    );
+    sectionTargets.forEach(section => navObserver.observe(section));
+
+    const progress = document.querySelector(".page-progress");
+    const updateProgress = () => {
+      const scrollTop = window.scrollY || document.documentElement.scrollTop;
+      const height = document.documentElement.scrollHeight - window.innerHeight;
+      const ratio = height > 0 ? Math.min(1, scrollTop / height) : 0;
+      progress.style.width = (ratio * 100).toFixed(3) + "%";
+    };
+
+    const observer = new IntersectionObserver(
+      entries => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("visible");
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.14 }
+    );
+
+    document.querySelectorAll(".reveal").forEach((el, index) => {
+      el.style.setProperty("--reveal-delay", Math.min(index * 28, 224) + "ms");
+      observer.observe(el);
+    });
+    window.addEventListener("scroll", updateProgress, { passive: true });
+    updateProgress();
   </script>
 </body>
 </html>

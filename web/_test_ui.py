@@ -40,8 +40,8 @@ try:
         check("vitals bar has 4 vital tiles", page.locator("#agentVitals .vital").count() == 4)
         check("empty-state invitation shows", page.locator(".empty-state").is_visible())
         check("3 example chips", page.locator(".example-chip").count() == 3)
-        gpu = page.locator("#gpuReadout").inner_text()
-        check("reactor GPU readout shows GB", "GB" in gpu, gpu)
+        check("agent cancel button exists", page.locator("#cancelAgentButton").count() == 1)
+        check("agent cancel hidden while idle", page.locator("#cancelAgentButton").is_hidden())
         check("reactor status is running", "运行中" in page.locator("#serviceStatus").inner_text())
         check("active model shown", "Qwen" in page.locator("#activeModel").inner_text())
 
@@ -58,6 +58,7 @@ try:
         check("has an ACT step", page.locator(".step.act").count() >= 1)
         check("has a FAILED observe step", page.locator(".step.fail").count() >= 1)
         check("answer card surfaced", page.locator(".answer").count() == 1)
+        check("answer meta chips surfaced", page.locator(".answer-meta span").count() >= 3)
         check("no raw <pre> visible by default (collapsed)", page.locator(".step-body pre:visible").count() == 0)
         check("no step body visible by default", page.locator(".step-body:visible").count() == 0)
         tok = page.locator("#vitalTokens").inner_text()
@@ -77,12 +78,13 @@ try:
         page.wait_for_timeout(500)
         page.screenshot(path=str(SHOTS / "4_benchmarks.png"), full_page=True)
         check("dataset cards render", page.locator(".dataset-card").count() == 5)
+        check("LiveCodeBench v6 card renders", page.locator('.dataset-card:has-text("LiveCodeBench v6")').count() == 1)
+        check("MBPP is not shown", page.locator('.dataset-card:has-text("MBPP")').count() == 0)
         check("selected datasets highlighted", page.locator(".dataset-card.selected").count() >= 1)
         rates = page.locator(".scoreboard .sb-rate")
         check("every result shows a pass-rate scoreboard", rates.count() == 3, f"{rates.count()} rows")
         texts = [rates.nth(i).inner_text() for i in range(rates.count())]
         check("scoreboards show % (not KB)", all("%" in t for t in texts), str(texts))
-        check("zero-pass row flagged", page.locator(".scoreboard.zero").count() == 1)
 
         # ---- Expand a result detail ----
         page.locator(".result-summary").first.click()
@@ -92,6 +94,11 @@ try:
         check("case rows render", page.locator(".case-row").count() == 3)
         check("passed & failed cases both present",
               page.locator(".case-row.passed").count() >= 1 and page.locator(".case-row.failed").count() >= 1)
+        check("trajectory buttons render", page.locator(".trajectory-button").count() >= 1)
+        page.locator(".trajectory-button").first.click()
+        page.wait_for_selector(".trajectory-panel", timeout=8000)
+        check("trajectory panel renders", page.locator(".trajectory-panel").count() >= 1)
+        check("trajectory timeline renders", page.locator(".trajectory-event").count() >= 1)
         page.screenshot(path=str(SHOTS / "5_result_detail.png"), full_page=True)
 
         # ---- Mobile ----

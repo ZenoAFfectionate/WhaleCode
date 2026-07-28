@@ -1289,6 +1289,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         task_ids: Optional[List[str]],
         dry_run: bool,
         resume: Optional[str],
+        fresh: bool = False,
     ) -> Dict[str, Any]:
         tasks = self._load_tasks()
         if task_ids:
@@ -1297,11 +1298,14 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         if limit and limit > 0:
             tasks = tasks[:limit]
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         completed_ids: Set[str] = set()
-        resume_path: Optional[Path] = Path(resume) if resume else None
+        resume_path: Optional[Path] = None
         persisted_records: List[Dict[str, Any]] = []
         record_index: Dict[str, int] = {}
-        if resume_path is not None:
+
+        if resume:
+            resume_path = Path(resume)
             if not resume_path.exists():
                 print(f"  ▶ Resume target does not exist yet: {resume_path}")
                 print("    A new results file will be created at this path.\n")
@@ -1315,14 +1319,31 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                 completed_ids = self._load_completed_ids(resume_path)
                 print(f"  ▶ Resuming from: {resume_path}")
                 print(f"    Already completed: {len(completed_ids)} tasks")
+        else:
+            # Canonical per-dataset file (e.g. ``swev.jsonl``).
+            canonical = self.output_dir / f"{self.benchmark_name}.jsonl"
+
+            if fresh and canonical.exists():
+                canonical.unlink()
+                print(f"  ▶ Fresh run requested — removed previous results: {canonical}\n")
+
+            if canonical.exists():
+                resume_path = canonical
+                raw_records = self._load_result_records(resume_path)
+                persisted_records = self._latest_result_records(raw_records)
+                if len(persisted_records) != len(raw_records):
+                    duplicate_count = len(raw_records) - len(persisted_records)
+                    self._write_result_records(resume_path, persisted_records)
+                    print(f"  ▶ Cleaned {duplicate_count} duplicate result record(s)")
+                completed_ids = self._load_completed_ids(resume_path)
+                print(f"  ▶ Auto-resuming from: {resume_path}")
+                print(f"    Already completed: {len(completed_ids)} tasks\n")
 
         if resume_path is not None:
             results_file = resume_path
             results_file.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
+            results_file = self.output_dir / f"{self.benchmark_name}.jsonl"
 
         if not persisted_records and results_file.exists():
             persisted_records = self._latest_result_records(self._load_result_records(results_file))
@@ -1439,7 +1460,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             "workers": self.workers,
         }
 
-        summary_file = self.output_dir / f"{self.benchmark_name}_{timestamp}_summary.json"
+        summary_file = self.output_dir / f"{self.benchmark_name}_summary.json"
         summary_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
         print(f"\n{'=' * 60}")
@@ -1466,6 +1487,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
         task_ids: Optional[List[str]] = None,
         dry_run: bool = False,
         resume: Optional[str] = None,
+        fresh: bool = False,
     ) -> Dict[str, Any]:
         """Run the benchmark and export predictions for Docker evaluation."""
         # Use the constructor's resume_file (swev has custom clone-failure logic)
@@ -1475,6 +1497,7 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
             task_ids=task_ids,
             dry_run=dry_run,
             resume=effective_resume,
+            fresh=fresh,
         )
 
         if dry_run:
@@ -1580,8 +1603,14 @@ def main():
     parser.add_argument(
         "--task-timeout",
         type=int,
-        default=1200,
-        help="Per-instance agent wall-clock timeout in seconds (default: 1200)",
+        default=3600,
+        help="Per-instance agent wall-clock timeout in seconds (default: 3600)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=65536,
+        help="Max output tokens per LLM call (reasoning+content). 0 disables the cap.",
     )
     parser.add_argument(
         "--docker-executable",
@@ -1604,6 +1633,11 @@ def main():
         default=None,
         metavar="RESULTS_FILE",
         help="Resume from a previous results JSONL file, skipping completed tasks",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore existing results file and start a fresh run",
     )
     parser.add_argument(
         "--preflight-only",
@@ -1634,7 +1668,7 @@ def main():
         bench._docker_preflight()
         print("SWEV preflight check passed.")
         return
-    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume)
+    bench.run(limit=args.limit, task_ids=args.task_ids, dry_run=args.dry_run, resume=args.resume, fresh=args.fresh)
 
 
 if __name__ == "__main__":

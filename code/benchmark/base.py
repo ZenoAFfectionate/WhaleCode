@@ -333,6 +333,7 @@ class BenchmarkRunner(ABC):
         default_temperature: float = 1.0,
         default_max_steps: int = 64,
         default_timeout: int = 60,
+        default_max_tokens: int = 16384,
         timeout_help: Optional[str] = None,
         include_task_timeout: bool = False,
         default_task_timeout: int = 1200,
@@ -344,12 +345,15 @@ class BenchmarkRunner(ABC):
             parser.add_argument("--timeout", type=int, default=default_timeout)
         else:
             parser.add_argument("--timeout", type=int, default=default_timeout, help=timeout_help)
+        parser.add_argument("--max-tokens", type=int, default=default_max_tokens,
+                            help="Max output tokens per LLM call (reasoning+content). 0 disables the cap.")
         if include_task_timeout:
             parser.add_argument("--task-timeout", type=int, default=default_task_timeout)
         parser.add_argument("--trajectory-dir", default=str(_DEFAULT_TRAJECTORY_DIR))
         parser.add_argument("--limit", type=int, default=None, help="Only run first N tasks")
         parser.add_argument("--task-ids", nargs="*", default=None, help="Specific task IDs to run")
         parser.add_argument("--resume", default=None, help="Resume from a previous .jsonl results file")
+        parser.add_argument("--fresh", action="store_true", help="Ignore existing results file and start a fresh run (overwrites {benchmark}.jsonl)")
         parser.add_argument("--dry-run", action="store_true")
 
     @staticmethod
@@ -363,6 +367,7 @@ class BenchmarkRunner(ABC):
             "max_steps": args.max_steps,
             "timeout": args.timeout,
             "trajectory_dir": args.trajectory_dir,
+            "max_tokens": getattr(args, "max_tokens", None),
         }
         if include_task_timeout:
             kwargs["task_timeout"] = args.task_timeout
@@ -380,6 +385,7 @@ class BenchmarkRunner(ABC):
         timeout: int = 30,
         task_timeout: int = 1200,
         trajectory_dir: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ):
         self.data_path = Path(data_path)
         self.output_dir = Path(output_dir)
@@ -394,6 +400,7 @@ class BenchmarkRunner(ABC):
         self.max_steps = max_steps
         self.timeout = timeout  # seconds for sandboxed code execution
         self.task_timeout = task_timeout  # seconds for one end-to-end benchmark task
+        self.max_tokens = max_tokens  # None → use env or built-in default
         self._progress_manager: Optional[BenchmarkProgressManager] = None
         self._progress_queue = None
         self._current_task_id: Optional[str] = None
@@ -535,8 +542,12 @@ class BenchmarkRunner(ABC):
         llm_kwargs: Dict[str, Any] = {"temperature": self.temperature}
         # Cap per-request output tokens (reasoning + content). Without this,
         # reasoning models can spend the whole task budget in one generation.
-        # Override with BENCH_LLM_MAX_TOKENS; set it to 0 to disable the cap.
-        max_tokens = int(os.getenv("BENCH_LLM_MAX_TOKENS", "16384"))
+        # Priority: CLI --max-tokens > env BENCH_LLM_MAX_TOKENS > built-in default 16384.
+        # Set to 0 to disable the cap.
+        if self.max_tokens is not None:
+            max_tokens = self.max_tokens
+        else:
+            max_tokens = int(os.getenv("BENCH_LLM_MAX_TOKENS", "16384"))
         if max_tokens > 0:
             llm_kwargs["max_tokens"] = max_tokens
         if self.model:
@@ -892,6 +903,7 @@ class BenchmarkRunner(ABC):
         task_ids: Optional[List[str]] = None,
         dry_run: bool = False,
         resume: Optional[str] = None,
+        fresh: bool = False,
     ) -> Dict[str, Any]:
         """Run the benchmark and return a summary dict.
 
@@ -902,6 +914,8 @@ class BenchmarkRunner(ABC):
             resume: Path to a previous results ``.jsonl`` file.  Already-
                 completed task IDs are skipped and rerun task IDs replace their
                 existing records in the same file.
+            fresh: Ignore any existing ``{benchmark}.jsonl`` and start a
+                fresh run (overwrites the canonical file).
         """
         tasks = self._load_tasks()
         if task_ids:
@@ -910,12 +924,16 @@ class BenchmarkRunner(ABC):
         if limit and limit > 0:
             tasks = tasks[:limit]
 
-        # --- Resume handling ---
+        # --- Decide which file to write results to ---
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         completed_ids: set = set()
-        resume_path: Optional[Path] = Path(resume) if resume else None
+        resume_path: Optional[Path] = None
         persisted_records: List[Dict[str, Any]] = []
         record_index: Dict[str, int] = {}
+
         if resume:
+            # Explicit --resume: always use the specified file.
+            resume_path = Path(resume)
             if not resume_path.exists():
                 print(f"  ▶ Resume target does not exist yet: {resume}")
                 print("    A new results file will be created at this path.\n")
@@ -929,15 +947,34 @@ class BenchmarkRunner(ABC):
                 completed_ids = self._load_completed_ids(resume_path)
                 print(f"  ▶ Resuming from: {resume}")
                 print(f"    Already completed: {len(completed_ids)} tasks")
+        else:
+            # Canonical per-dataset file (e.g. ``aime_24.jsonl``).
+            canonical = self.output_dir / f"{self.benchmark_name}.jsonl"
 
-        # Decide which file to write results to
+            if fresh and canonical.exists():
+                # --fresh: discard all prior records for this benchmark.
+                canonical.unlink()
+                print(f"  ▶ Fresh run requested — removed previous results: {canonical}\n")
+
+            if canonical.exists():
+                # Auto-resume: the canonical file already exists.
+                resume_path = canonical
+                raw_records = self._load_result_records(resume_path)
+                persisted_records = self._latest_result_records(raw_records)
+                if len(persisted_records) != len(raw_records):
+                    duplicate_count = len(raw_records) - len(persisted_records)
+                    self._write_result_records(resume_path, persisted_records)
+                    print(f"  ▶ Cleaned {duplicate_count} duplicate result record(s)")
+                completed_ids = self._load_completed_ids(resume_path)
+                print(f"  ▶ Auto-resuming from: {resume_path}")
+                print(f"    Already completed: {len(completed_ids)} tasks\n")
+
+        # Resolve the actual results file path.
         if resume_path is not None:
             results_file = resume_path
             results_file.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            results_file = self.output_dir / f"{self.benchmark_name}_{timestamp}.jsonl"
+            results_file = self.output_dir / f"{self.benchmark_name}.jsonl"
 
         if not persisted_records and results_file.exists():
             persisted_records = self._latest_result_records(self._load_result_records(results_file))
@@ -1051,7 +1088,7 @@ class BenchmarkRunner(ABC):
             ).to_metadata(),
         }
 
-        summary_file = self.output_dir / f"{self.benchmark_name}_{timestamp}_summary.json"
+        summary_file = self.output_dir / f"{self.benchmark_name}_summary.json"
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 

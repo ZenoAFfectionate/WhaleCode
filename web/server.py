@@ -40,6 +40,11 @@ WEB_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = WEB_ROOT / "static"
 CODE_DIR = PROJECT_ROOT / "code"
 RESULTS_DIR = PROJECT_ROOT / "data" / "_results"
+RESULT_DIRS = [
+    PROJECT_ROOT / "result" / "_results",
+    PROJECT_ROOT / "data" / "_results",
+]
+TRAJECTORY_ROOT = PROJECT_ROOT / "result" / "_trajectory"
 
 
 def load_project_env(env_path: Path = PROJECT_ROOT / ".env") -> None:
@@ -101,11 +106,11 @@ DATASETS = [
         "description": "函数级代码生成评测，覆盖增强边界用例。",
     },
     {
-        "id": "mbpp",
-        "name": "MBPP+",
-        "cases": 378,
-        "script": "scripts/run_mbpp.sh",
-        "description": "Python 编程题增强集，适合日常代码能力回归。",
+        "id": "lcb6",
+        "name": "LiveCodeBench v6",
+        "cases": 400,
+        "script": "scripts/run_lcb6.sh",
+        "description": "LiveCodeBench v6 代码生成评测，覆盖 LeetCode / AtCoder 风格任务。",
     },
     {
         "id": "clev",
@@ -145,6 +150,77 @@ def json_safe(value: Any) -> Any:
         if isinstance(value, (list, tuple)):
             return [json_safe(item) for item in value]
         return str(value)
+
+
+TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+
+
+class JobCancelled(Exception):
+    """Raised inside a running job when the user requests cancellation."""
+
+
+def compact_session_title(value: Any, limit: int = 8) -> str:
+    """Return a short, UI-friendly session title from the first user prompt."""
+    text = str(value or "").strip()
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[:limit]
+
+
+def _message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role") or message.get("type") or "").lower()
+    return str(getattr(message, "role", "") or getattr(message, "type", "")).lower()
+
+
+def _message_content(message: Any) -> str:
+    if isinstance(message, dict):
+        value = message.get("content") or message.get("text") or message.get("input_text") or ""
+    else:
+        value = getattr(message, "content", "") or getattr(message, "text", "") or getattr(message, "input_text", "")
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        value = "\n".join(part for part in parts if part)
+    return str(value or "")
+
+
+def first_user_prompt_from_session(data: dict[str, Any]) -> str:
+    """Best-effort extraction for sessions saved by different history formats."""
+    candidates = []
+    for key in ("messages", "conversation", "history", "turns", "records"):
+        value = data.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+    state = data.get("state")
+    if isinstance(state, dict):
+        for key in ("messages", "conversation", "history", "turns"):
+            value = state.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+    for message in candidates:
+        if _message_role(message) in {"user", "human"}:
+            title = compact_session_title(_message_content(message))
+            if title:
+                return title
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    for key in ("first_prompt", "prompt", "title", "task", "input_text"):
+        title = compact_session_title(metadata.get(key) or data.get(key))
+        if title:
+            return title
+    return ""
+
+
+def format_session_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace("T", " ")[:16]
 
 
 def openai_models_url(base_url: str | None) -> str | None:
@@ -359,6 +435,9 @@ class Job:
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     subscribers: list[queue.Queue] = field(default_factory=list)
+    cancel_requested: bool = False
+    cancel_reason: str | None = None
+    process: subprocess.Popen | None = None
 
 
 class JobManager:
@@ -403,8 +482,73 @@ class JobManager:
             "completed": job.completed,
             "result": job.result,
             "error": job.error,
+            "cancel_requested": job.cancel_requested,
+            "cancel_reason": job.cancel_reason,
             "events": job.events[-200:],
         }
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen | None) -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        except Exception:
+            pass
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job and job.cancel_requested)
+
+    def attach_process(self, job_id: str, process: subprocess.Popen) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.process = process
+
+    def clear_process(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.process = None
+
+    def cancel(self, job_id: str, reason: str = "用户取消运行") -> dict[str, Any]:
+        process: subprocess.Popen | None = None
+        should_emit = False
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                raise KeyError(job_id)
+            if job.status not in TERMINAL_JOB_STATUSES:
+                job.cancel_requested = True
+                job.cancel_reason = reason
+                job.status = "cancelled"
+                job.completed_at = now_iso()
+                job.error = reason
+                job.updated_at = now_iso()
+                process = job.process
+                should_emit = True
+            snapshot = self.snapshot(job)
+        self._terminate_process(process)
+        if should_emit:
+            self.emit(job_id, "cancelled", {"reason": reason})
+        return snapshot
+
+    def finish_cancelled(self, job_id: str, reason: str, duration_seconds: float) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.cancel_requested = True
+            job.cancel_reason = reason
+            job.status = "cancelled"
+            job.completed_at = job.completed_at or now_iso()
+            job.duration_seconds = duration_seconds
+            job.error = reason
+            job.updated_at = now_iso()
 
     def subscribe(self, job_id: str) -> queue.Queue:
         with self._lock:
@@ -426,6 +570,8 @@ class JobManager:
     def update(self, job_id: str, **changes: Any) -> None:
         with self._lock:
             job = self._jobs[job_id]
+            if job.status == "cancelled" and changes.get("status") not in (None, "cancelled"):
+                return
             for key, value in changes.items():
                 setattr(job, key, value)
             job.updated_at = now_iso()
@@ -433,6 +579,8 @@ class JobManager:
     def emit(self, job_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
         with self._lock:
             job = self._jobs[job_id]
+            if job.status == "cancelled" and event_type != "cancelled":
+                return
             event = {
                 "timestamp": now_iso(),
                 "type": event_type,
@@ -663,6 +811,8 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
     jobs.update(job.id, status="running", started_at=now_iso(), progress=5)
     jobs.emit(job.id, "status", {"message": "Agent run started"})
     try:
+        if jobs.is_cancel_requested(job.id):
+            raise JobCancelled(job.cancel_reason or "用户取消运行")
         workspace = Path(payload.get("workspace") or PROJECT_ROOT).expanduser().resolve()
         workspace.relative_to(PROJECT_ROOT.parent)
         prompt = str(payload.get("prompt") or "").strip()
@@ -670,6 +820,8 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
             raise ValueError("prompt is required")
 
         def sink(event_type: str, event_payload: dict[str, Any]) -> None:
+            if jobs.is_cancel_requested(job.id):
+                raise JobCancelled(job.cancel_reason or "用户取消运行")
             jobs.emit(job.id, event_type, event_payload)
 
         agent = create_web_agent(
@@ -687,10 +839,17 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
             agent.load_session(str(Path(resume_path).expanduser()), check_consistency=False)
             jobs.emit(job.id, "session_loaded", {"path": resume_path})
 
+        if jobs.is_cancel_requested(job.id):
+            raise JobCancelled(job.cancel_reason or "用户取消运行")
         result = agent.run(prompt)
+        if jobs.is_cancel_requested(job.id):
+            raise JobCancelled(job.cancel_reason or "用户取消运行")
         session_name = payload.get("session_name") or f"web-{job.id}"
         session_path = agent.save_session(session_name)
         duration = time.time() - start
+        model_name = payload.get("model") or configured_model_name()
+        tokens = getattr(agent, "_total_tokens", None)
+        steps = getattr(agent, "_current_step", None)
         jobs.update(
             job.id,
             status="completed",
@@ -700,12 +859,29 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
             result={
                 "answer": result,
                 "session_path": session_path,
-                "tokens": getattr(agent, "_total_tokens", None),
-                "steps": getattr(agent, "_current_step", None),
+                "tokens": tokens,
+                "steps": steps,
+                "model": model_name,
             },
         )
-        jobs.emit(job.id, "completed", {"answer": result, "session_path": session_path, "duration_seconds": duration})
+        jobs.emit(
+            job.id,
+            "completed",
+            {
+                "answer": result,
+                "session_path": session_path,
+                "duration_seconds": duration,
+                "tokens": tokens,
+                "steps": steps,
+                "model": model_name,
+            },
+        )
+    except JobCancelled as exc:
+        jobs.finish_cancelled(job.id, str(exc), time.time() - start)
     except Exception as exc:
+        if jobs.is_cancel_requested(job.id):
+            jobs.finish_cancelled(job.id, job.cancel_reason or "用户取消运行", time.time() - start)
+            return
         jobs.update(
             job.id,
             status="failed",
@@ -730,7 +906,9 @@ def benchmark_command(dataset_id: str, payload: dict[str, Any]) -> list[str]:
         command += ["--model", str(payload["model"])]
     if payload.get("base_url"):
         command += ["--base-url", str(payload["base_url"])]
-    if payload.get("pass_k") and dataset_id in {"hevp", "mbpp", "clev"}:
+    if payload.get("max_tokens"):
+        command += ["--max-tokens", str(int(payload["max_tokens"]))]
+    if payload.get("pass_k") and dataset_id in {"hevp", "lcb6", "clev"}:
         pass
     return command
 
@@ -749,6 +927,8 @@ def run_benchmark_job(job: Job, payload: dict[str, Any]) -> None:
     completed_cases = 0
     try:
         for dataset_id in selected:
+            if jobs.is_cancel_requested(job.id):
+                raise JobCancelled(job.cancel_reason or "用户取消运行")
             dataset = next(item for item in DATASETS if item["id"] == dataset_id)
             command = benchmark_command(dataset_id, payload)
             jobs.emit(job.id, "benchmark_started", {"dataset": dataset, "command": command})
@@ -760,9 +940,12 @@ def run_benchmark_job(job: Job, payload: dict[str, Any]) -> None:
                 text=True,
                 bufsize=1,
             )
+            jobs.attach_process(job.id, proc)
             assert proc.stdout is not None
             recent_lines: list[str] = []
             for line in proc.stdout:
+                if jobs.is_cancel_requested(job.id):
+                    raise JobCancelled(job.cancel_reason or "用户取消运行")
                 text = line.rstrip()
                 recent_lines.append(text)
                 recent_lines = recent_lines[-120:]
@@ -773,6 +956,7 @@ def run_benchmark_job(job: Job, payload: dict[str, Any]) -> None:
                     progress = min(98, (completed_cases / max(total or dataset["cases"], 1)) * 100)
                     jobs.update(job.id, completed=completed_cases, progress=progress)
             code = proc.wait()
+            jobs.clear_process(job.id)
             summaries.append(
                 {
                     "dataset": dataset["name"],
@@ -797,7 +981,14 @@ def run_benchmark_job(job: Job, payload: dict[str, Any]) -> None:
             result=result,
         )
         jobs.emit(job.id, "completed", result)
+    except JobCancelled as exc:
+        jobs.finish_cancelled(job.id, str(exc), time.time() - start)
+        jobs.clear_process(job.id)
     except Exception as exc:
+        jobs.clear_process(job.id)
+        if jobs.is_cancel_requested(job.id):
+            jobs.finish_cancelled(job.id, job.cancel_reason or "用户取消运行", time.time() - start)
+            return
         jobs.update(
             job.id,
             status="failed",
@@ -844,6 +1035,80 @@ def _summarize_records(records: list[Any]) -> dict[str, Any]:
     return {"passed": passed, "total": total, "failed": total - passed, "pass_rate": round(passed / total, 4)}
 
 
+def _read_jsonl_records(path: Path, limit: int | None = None) -> list[Any]:
+    records: list[Any] = []
+    for idx, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
+        if limit is not None and idx >= limit:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except Exception:
+            records.append({"output": line})
+    return records
+
+
+def _summary_path_for(path: Path) -> Path:
+    if path.suffix == ".jsonl":
+        return path.with_name(f"{path.stem}_summary.json")
+    return path
+
+
+def _benchmark_from_name(name: str) -> str:
+    stem = Path(name).stem.replace("_summary", "")
+    if stem.startswith("lcb6"):
+        return "lcb6"
+    if stem.startswith("humaneval"):
+        return "humaneval_plus"
+    if stem.startswith("classeval"):
+        return "classeval"
+    if stem.startswith("aime_24"):
+        return "aime_24"
+    if stem.startswith("aime_25"):
+        return "aime_25"
+    if stem.startswith("aime_26"):
+        return "aime_26"
+    return stem.split("_2026", 1)[0]
+
+
+def _trajectory_task_dir(task_id: str) -> str:
+    return str(task_id or "").strip().replace("/", "_").replace("\\", "_")
+
+
+def _find_trajectory_path(task_id: str, benchmark: str | None = None) -> Path | None:
+    safe = _trajectory_task_dir(task_id)
+    if not safe:
+        return None
+    roots = []
+    if benchmark:
+        roots.append(TRAJECTORY_ROOT / benchmark)
+    roots.append(TRAJECTORY_ROOT)
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.exists() or root in seen:
+            continue
+        seen.add(root)
+        direct = root / safe / "trajectory.json"
+        if direct.exists():
+            return direct
+        matches = list(root.glob(f"**/{safe}/trajectory.json"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _annotate_record(record: Any, benchmark: str | None = None) -> Any:
+    if not isinstance(record, dict):
+        return record
+    item = dict(record)
+    task_id = item.get("task_id") or item.get("id") or item.get("name")
+    if task_id and _find_trajectory_path(str(task_id), benchmark):
+        item["trajectory_available"] = True
+    return item
+
+
 def _history_summary(path: Path) -> dict[str, Any]:
     """Extract a lightweight summary (incl. pass rate) for a result artifact.
 
@@ -853,6 +1118,11 @@ def _history_summary(path: Path) -> dict[str, Any]:
     surfaced a pass rate.
     """
     try:
+        summary_file = _summary_path_for(path)
+        if summary_file.exists() and summary_file != path:
+            summary_data = json.loads(summary_file.read_text(encoding="utf-8"))
+            if isinstance(summary_data, dict):
+                return summary_data
         if path.suffix == ".json":
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -867,34 +1137,39 @@ def _history_summary(path: Path) -> dict[str, Any]:
             if isinstance(data, list):
                 return _summarize_records(data)
             return {}
-        records: list[Any] = []
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[:5000]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                continue
-        return _summarize_records(records)
+        return _summarize_records([r for r in _read_jsonl_records(path, limit=5000) if isinstance(r, dict)])
     except Exception:
         return {}
 
 
+def _iter_result_files() -> list[Path]:
+    files: list[Path] = []
+    for root in RESULT_DIRS:
+        root.mkdir(parents=True, exist_ok=True)
+        files.extend(
+            path for path in root.glob("*")
+            if path.is_file()
+            and path.suffix in {".json", ".jsonl"}
+            and not path.name.endswith("_summary.json")
+        )
+    return sorted(files, key=lambda item: item.stat().st_mtime, reverse=True)
+
+
 def load_benchmark_history() -> list[dict[str, Any]]:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     records = []
-    for path in sorted(RESULTS_DIR.glob("*"), key=lambda item: item.stat().st_mtime, reverse=True)[:40]:
-        if not path.is_file() or path.suffix not in {".json", ".jsonl"}:
-            continue
+    for path in _iter_result_files()[:80]:
+        benchmark = _benchmark_from_name(path.name)
         item = {
             "file": str(path),
             "name": path.name,
+            "source_dir": str(path.parent),
+            "benchmark": benchmark,
             "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
             "size_bytes": path.stat().st_size,
         }
         summary = _history_summary(path)
         if summary:
+            summary.setdefault("benchmark", benchmark)
             item["summary"] = summary
         records.append(item)
     return records
@@ -903,21 +1178,23 @@ def load_benchmark_history() -> list[dict[str, Any]]:
 def load_benchmark_detail(file_value: str) -> dict[str, Any]:
     requested = Path(file_value)
     if not requested.is_absolute():
-        requested = RESULTS_DIR / requested.name
+        candidates = [root / requested.name for root in RESULT_DIRS]
+        requested = next((item for item in candidates if item.exists()), candidates[0])
     target = requested.resolve()
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    target.relative_to(RESULTS_DIR.resolve())
+    if not any(_is_relative_to(target, root.resolve()) for root in RESULT_DIRS):
+        raise PermissionError("benchmark result outside allowed directories")
     if not target.exists() or target.suffix not in {".json", ".jsonl"}:
         raise FileNotFoundError("benchmark result not found")
 
     stat = target.stat()
     records: list[Any] = []
-    summary: dict[str, Any] = {}
+    summary: dict[str, Any] = _history_summary(target)
     raw_preview = ""
+    benchmark = str(summary.get("benchmark") or _benchmark_from_name(target.name))
     if target.suffix == ".json":
         data = json.loads(target.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            summary = data
+            summary = summary or data
             for key in ("cases", "items", "results", "details", "samples", "records", "examples"):
                 value = data.get(key)
                 if isinstance(value, list):
@@ -928,26 +1205,58 @@ def load_benchmark_detail(file_value: str) -> dict[str, Any]:
     else:
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         raw_preview = "\n".join(lines[:80])
-        for line in lines[:500]:
-            if not line.strip():
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                records.append({"output": line})
+        records = _read_jsonl_records(target, limit=500)
 
     if not raw_preview:
         raw_preview = target.read_text(encoding="utf-8", errors="replace")[:12000]
+    annotated = [_annotate_record(record, benchmark) for record in records[:200]]
 
     return {
         "file": str(target),
         "name": target.name,
+        "source_dir": str(target.parent),
+        "benchmark": benchmark,
         "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
         "size_bytes": stat.st_size,
         "summary": summary,
-        "records": records[:200],
+        "records": annotated,
         "record_count": len(records),
         "raw_preview": raw_preview,
+    }
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def load_benchmark_trajectory(task_id: str, benchmark: str | None = None) -> dict[str, Any]:
+    path = _find_trajectory_path(task_id, benchmark)
+    if not path:
+        raise FileNotFoundError("trajectory not found")
+    target = path.resolve()
+    if not _is_relative_to(target, TRAJECTORY_ROOT.resolve()):
+        raise PermissionError("trajectory outside allowed directory")
+    data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+    if not isinstance(data, dict):
+        raise ValueError("trajectory payload is not an object")
+    agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+    events = agent.get("events") if isinstance(agent, dict) else []
+    history = agent.get("history") if isinstance(agent, dict) else []
+    return {
+        "file": str(target),
+        "benchmark": data.get("benchmark") or benchmark,
+        "task_id": data.get("task_id") or task_id,
+        "saved_at": data.get("saved_at"),
+        "task": data.get("task") if isinstance(data.get("task"), dict) else {},
+        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+        "events": events[:500] if isinstance(events, list) else [],
+        "history": history[-80:] if isinstance(history, list) else [],
+        "workspace": data.get("workspace") if isinstance(data.get("workspace"), dict) else {},
+        "raw_preview": json.dumps(json_safe(data), ensure_ascii=False, indent=2)[:30000],
     }
 
 
@@ -1003,6 +1312,14 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
             return self.send_json({"sessions": self.list_sessions()})
         if path == "/api/benchmarks/history":
             return self.send_json({"history": load_benchmark_history()})
+        if path == "/api/benchmarks/trajectory":
+            params = urllib.parse.parse_qs(parsed.query)
+            task_id = (params.get("task_id") or [""])[0]
+            benchmark = (params.get("benchmark") or [None])[0]
+            try:
+                return self.send_json({"trajectory": load_benchmark_trajectory(task_id, benchmark)})
+            except Exception as exc:
+                return self.send_json({"error": f"{type(exc).__name__}: {exc}"}, HTTPStatus.NOT_FOUND)
         if path.startswith("/api/benchmarks/history/"):
             name = urllib.parse.unquote(path.split("/")[-1])
             try:
@@ -1016,6 +1333,13 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         try:
             payload = parse_json_body(self)
+            if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                job_id = path.split("/")[3]
+                try:
+                    snapshot = jobs.cancel(job_id, str(payload.get("reason") or "用户取消运行"))
+                    return self.send_json({"ok": True, "job": snapshot})
+                except KeyError:
+                    return self.send_json({"error": "job not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/agent/runs":
                 title = str(payload.get("prompt") or "Agent run")[:80]
                 job = jobs.create("agent", title)
@@ -1069,7 +1393,7 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(f"event: {event['type']}\n".encode("utf-8"))
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
-                    if event["type"] in {"completed", "failed"}:
+                    if event["type"] in {"completed", "failed", "cancelled"}:
                         break
                 except queue.Empty:
                     self.wfile.write(b": keepalive\n\n")
@@ -1085,6 +1409,8 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 metadata = data.get("metadata", {})
+                first_prompt_title = first_user_prompt_from_session(data)
+                saved_at = data.get("saved_at") or data.get("updated_at") or data.get("created_at")
                 sessions.append(
                     {
                         "filename": path.name,
@@ -1092,12 +1418,18 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                         "session_id": data.get("session_id"),
                         "created_at": data.get("created_at"),
                         "saved_at": data.get("saved_at"),
-                        "title": metadata.get("title") or path.stem,
+                        "display_time": format_session_time(saved_at),
+                        "title": first_prompt_title or compact_session_title(metadata.get("title") or path.stem),
                         "metadata": metadata,
                     }
                 )
             except Exception:
-                sessions.append({"filename": path.name, "filepath": str(path), "title": path.stem})
+                sessions.append({
+                    "filename": path.name,
+                    "filepath": str(path),
+                    "title": compact_session_title(path.stem),
+                    "display_time": format_session_time(datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")),
+                })
         return sessions
 
 

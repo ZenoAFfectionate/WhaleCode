@@ -583,7 +583,7 @@ def test_cli_task_list_uses_export_state():
     registry.register_tool(todo)
 
     # Use the CLIUI helper directly.
-    from run_cli import CLIUI
+    from CodeingAgent.WhaleCode.scripts.cli import CLIUI
     tasks = CLIUI._get_task_list(agent)
     assert isinstance(tasks, list)
 

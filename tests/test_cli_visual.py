@@ -24,22 +24,22 @@ if "hello_agents" not in sys.modules:
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import run_cli  # noqa: E402
+import CodeingAgent.WhaleCode.scripts.cli as cli  # noqa: E402
 
 
 def _rich_ui(width: int = 80):
     """A CLIUI whose console records output at a deterministic width."""
     from rich.console import Console
 
-    ui = run_cli.CLIUI(use_rich=True)
+    ui = cli.CLIUI(use_rich=True)
     ui.console = Console(
-        record=True, width=width, force_terminal=True, theme=run_cli.WHALE_THEME
+        record=True, width=width, force_terminal=True, theme=cli.WHALE_THEME
     )
     return ui
 
 
 def _plain_capture(fn, *args, **kwargs) -> str:
-    ui = run_cli.CLIUI(use_rich=False)
+    ui = cli.CLIUI(use_rich=False)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         fn(ui, *args, **kwargs)
@@ -50,9 +50,9 @@ def _plain_capture(fn, *args, **kwargs) -> str:
 
 def test_theme_palette_defined():
     """VR-6: a named theme must exist with the semantic style names."""
-    assert hasattr(run_cli, "WHALE_THEME")
+    assert hasattr(cli, "WHALE_THEME")
     for name in ("thinking", "accent", "success", "error", "warning", "muted"):
-        assert name in run_cli.WHALE_THEME.styles, f"missing theme style: {name}"
+        assert name in cli.WHALE_THEME.styles, f"missing theme style: {name}"
 
 
 # ── VR-2: thinking box ───────────────────────────────────────────────
@@ -67,7 +67,7 @@ def test_thinking_rendered_as_panel_in_rich():
 
 
 def test_thinking_plain_mode_line_preserved():
-    out = _plain_capture(run_cli.CLIUI.render_log_block, "thinking", "reason text")
+    out = _plain_capture(cli.CLIUI.render_log_block, "thinking", "reason text")
     assert "reason text" in out
     assert "╭" not in out, "plain mode must stay boxless"
 
@@ -84,7 +84,7 @@ def test_assistant_rendered_as_panel_in_rich():
 
 
 def test_assistant_plain_keeps_rule_text():
-    out = _plain_capture(run_cli.CLIUI.render_assistant, "hi there")
+    out = _plain_capture(cli.CLIUI.render_assistant, "hi there")
     assert "── Assistant ──" in out
     assert "hi there" in out
 
@@ -124,7 +124,7 @@ def test_tool_card_error_uses_error_marker():
 # ── VR-4: per-tool argument summarizers ──────────────────────────────
 
 def _mixin():
-    return run_cli.CLICodeAgentMixin()
+    return cli.CLICodeAgentMixin()
 
 
 def test_summarize_bash_first_line():
@@ -192,7 +192,7 @@ def test_spacer_emits_blank_line():
 
 
 def test_step_header_plain_keeps_marker():
-    out = _plain_capture(run_cli.CLIUI.render_step_header, 3, "[ctx 10/100 10%]")
+    out = _plain_capture(cli.CLIUI.render_step_header, 3, "[ctx 10/100 10%]")
     assert "✦ Step 3" in out
 
 
@@ -218,7 +218,7 @@ def test_step_header_rich_preserves_bracketed_ctx():
 def test_tool_call_defers_header_in_rich(tmp_path):
     ui = _rich_ui()
 
-    class _A(run_cli.CLICodeAgentMixin):
+    class _A(cli.CLICodeAgentMixin):
         pass
 
     a = _A()
@@ -256,11 +256,11 @@ class _FakeToolAgent:
 
 
 def test_tool_category_classifier():
-    assert run_cli.CLIUI._tool_category("Read") == "File"
-    assert run_cli.CLIUI._tool_category("Bash") == "Shell"
-    assert run_cli.CLIUI._tool_category("WebSearch") == "Web"
-    assert run_cli.CLIUI._tool_category("TodoWrite") == "Planning"
-    assert run_cli.CLIUI._tool_category("Whatever") == "Other"
+    assert cli.CLIUI._tool_category("Read") == "File"
+    assert cli.CLIUI._tool_category("Bash") == "Shell"
+    assert cli.CLIUI._tool_category("WebSearch") == "Web"
+    assert cli.CLIUI._tool_category("TodoWrite") == "Planning"
+    assert cli.CLIUI._tool_category("Whatever") == "Other"
 
 
 def test_render_tools_grouped_shows_categories():
@@ -283,7 +283,7 @@ def test_render_tools_full_shows_descriptions():
 # ── VR-1: input zone has a dark background ───────────────────────────
 
 def test_input_style_has_background_chip_and_toolbar():
-    tokens = run_cli._input_style_tokens()
+    tokens = cli._input_style_tokens()
     # The prompt glyph chip and the status toolbar must both be backed by a
     # dark surface (the user's core ask: the input should look like a field).
     assert tokens["chip"].startswith("bg:")

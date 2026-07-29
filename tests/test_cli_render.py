@@ -23,7 +23,7 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
 
 def test_model_output_shows_reasoning():
     """CLI-1: model_output event must render reasoning_content (not silently drop)."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -34,7 +34,7 @@ def test_model_output_shows_reasoning():
         def render_log_block(self, kind, text): captured.write(f"[{kind}] {text}\n")
 
     ui = _FakeUI()
-    mixin = run_cli.CLICodeAgentMixin()
+    mixin = cli.CLICodeAgentMixin()
     mixin.ui = ui
     mixin._streaming_line_buffer = ""
 
@@ -54,7 +54,7 @@ def test_model_output_shows_reasoning():
 
 def test_step_start_visible():
     """CLI-2: step_start must NOT be ignored — user must see step number."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -65,7 +65,7 @@ def test_step_start_visible():
         render_log_block = Mock()
 
     ui = _FakeUI()
-    mixin = run_cli.CLICodeAgentMixin()
+    mixin = cli.CLICodeAgentMixin()
     mixin.ui = ui
     mixin._streaming_line_buffer = ""
 
@@ -81,8 +81,8 @@ def test_step_start_visible():
 
 def test_compact_args_truncation():
     """CLI-3: tool-call args must be compact, not full dict dump."""
-    import run_cli
-    m = run_cli.CLICodeAgentMixin()
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    m = cli.CLICodeAgentMixin()
 
     # Named keys preferred
     assert m._compact_args({"path": "src/main.py"}) == "src/main.py"
@@ -104,8 +104,8 @@ def test_compact_args_truncation():
 
 def test_truncate_observation():
     """CLI-4: long tool output must be head+tail truncated."""
-    import run_cli
-    m = run_cli.CLICodeAgentMixin()
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    m = cli.CLICodeAgentMixin()
 
     short = "line1\nline2\nline3"
     assert m._truncate_observation(short) == short  # no change
@@ -120,7 +120,7 @@ def test_truncate_observation():
 
 def test_render_assistant_uses_rule_separator():
     """CLI-6: render_assistant must use Rule not Panel."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
     captured = io.StringIO()
 
     class _FakeConsole:
@@ -134,9 +134,9 @@ def test_render_assistant_uses_rule_separator():
             captured.write(text)
 
     # Must not raise; verify the method signature.
-    import run_cli as cli_module
+    import CodeingAgent.WhaleCode.scripts.cli as cli_module
     # Smoke: call with a plain UI (no rich).
-    ui = run_cli.CLIUI(use_rich=False)
+    ui = cli.CLIUI(use_rich=False)
     ui.render_assistant("Hello world")
     # Just verify no crash and output contains the separator text.
     captured2 = io.StringIO()
@@ -164,8 +164,8 @@ def test_show_runtime_info_includes_new_fields():
 
 def test_log_block_tiered_rendering():
     """CLI-10: tool calls / thinking / observation use compact dim lines, not Panel."""
-    import run_cli
-    ui = run_cli.CLIUI(use_rich=False)
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    ui = cli.CLIUI(use_rich=False)
 
     # All secondary-tier calls should not throw.
     for kind in ("action", "thinking", "observation", "info"):
@@ -180,8 +180,8 @@ def test_log_block_tiered_rendering():
 
 def test_mixin_has_all_new_methods():
     """Smoke: all CLI improvement helper methods exist on the mixin."""
-    import run_cli
-    m = run_cli.CLICodeAgentMixin()
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    m = cli.CLICodeAgentMixin()
     for method in (
         "_compact_args",
         "_truncate_observation",
@@ -197,14 +197,14 @@ def test_mixin_has_all_new_methods():
 
 def test_run_agent_turn_transcript_pairs_tool_and_preserves_full_outputs(tmp_path, capsys):
     """CLI transcript should show compact status while saving full reasoning/output."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
 
     class _Config:
         context_window = 100000
 
-    class _FakeAgent(run_cli.CLICodeAgentMixin):
+    class _FakeAgent(cli.CLICodeAgentMixin):
         def __init__(self):
-            self.ui = run_cli.CLIUI(use_rich=False)
+            self.ui = cli.CLIUI(use_rich=False)
             self.working_dir = str(tmp_path)
             self.project_root = str(tmp_path)
             self.config = _Config()
@@ -241,7 +241,7 @@ def test_run_agent_turn_transcript_pairs_tool_and_preserves_full_outputs(tmp_pat
 
     agent = _FakeAgent()
     ui = agent.ui
-    result = run_cli.run_agent_turn(agent, "check cli", ui)
+    result = cli.run_agent_turn(agent, "check cli", ui)
     out = capsys.readouterr().out
 
     assert result == "done"
@@ -281,7 +281,7 @@ def test_run_agent_turn_transcript_pairs_tool_and_preserves_full_outputs(tmp_pat
 
 def test_reasoning_off_hides_terminal_preview_but_keeps_trace_and_file(tmp_path):
     """CLI-N3: off mode hides terminal reasoning while preserving audit data."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -292,7 +292,7 @@ def test_reasoning_off_hides_terminal_preview_but_keeps_trace_and_file(tmp_path)
         def status(self, msg): captured.write(f"[status] {msg}\n")
         def render_log_block(self, kind, text): captured.write(f"[{kind}] {text}\n")
 
-    mixin = run_cli.CLICodeAgentMixin()
+    mixin = cli.CLICodeAgentMixin()
     mixin.ui = _FakeUI()
     mixin.working_dir = str(tmp_path)
     mixin.project_root = str(tmp_path)
@@ -312,7 +312,7 @@ def test_reasoning_off_hides_terminal_preview_but_keeps_trace_and_file(tmp_path)
 
 def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
     """CLI-A1: artifact storage defaults to memory and can be configured."""
-    import run_cli
+    import CodeingAgent.WhaleCode.scripts.cli as cli
 
     class _FakeUI:
         use_rich = False
@@ -321,7 +321,7 @@ def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
         def status(self, msg): pass
         def render_log_block(self, kind, text): pass
 
-    mixin = run_cli.CLICodeAgentMixin()
+    mixin = cli.CLICodeAgentMixin()
     mixin.ui = _FakeUI()
     mixin.working_dir = str(tmp_path)
     mixin.project_root = str(tmp_path)
@@ -331,7 +331,7 @@ def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
     events = mixin.get_cli_events()
     assert "memory/custom_cli_artifacts/reasoning" in events[-1]["reasoning_path"]
 
-    disabled = run_cli.CLICodeAgentMixin()
+    disabled = cli.CLICodeAgentMixin()
     disabled.ui = _FakeUI()
     disabled.working_dir = str(tmp_path)
     disabled.project_root = str(tmp_path)
@@ -345,8 +345,8 @@ def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
 
 def test_event_history_renderer_shows_structured_timeline(capsys):
     """CLI-N8: /trace data can be rendered as event timeline."""
-    import run_cli
-    ui = run_cli.CLIUI(use_rich=False)
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    ui = cli.CLIUI(use_rich=False)
     ui.render_event_history(
         [
             {"event": "step", "summary": "Step 1"},
@@ -363,11 +363,11 @@ def test_event_history_renderer_shows_structured_timeline(capsys):
 
 def test_parser_accepts_reasoning_modes_and_trace_command_is_registered():
     """CLI-N3/N8: public CLI knobs are wired into parser and command lists."""
-    import run_cli
-    parser = run_cli.build_parser()
+    import CodeingAgent.WhaleCode.scripts.cli as cli
+    parser = cli.build_parser()
     args = parser.parse_args(["--reasoning", "full", "--plain", "hello"])
     assert args.reasoning == "full"
     artifact_args = parser.parse_args(["--artifact-dir", "memory/custom_cli_artifacts", "--no-artifacts", "hello"])
     assert artifact_args.artifact_dir == "memory/custom_cli_artifacts"
     assert artifact_args.no_artifacts is True
-    assert "/trace" in run_cli.INTERACTIVE_EXACT_COMMANDS
+    assert "/trace" in cli.INTERACTIVE_EXACT_COMMANDS

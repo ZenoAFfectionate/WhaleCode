@@ -36,7 +36,7 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
 | 🗜️ **Three-Layer Compact** | micro / auto / manual context compaction keeps long sessions manageable |
 | 📋 **Persistent Task System** | TodoWrite with atomic JSON snapshots — plans survive compaction and session resume |
 | 🛡️ **Sandbox Safety** | Static + runtime guards for benchmark execution; circuit breaker for failing tools |
-| 📊 **Benchmark Suite** | Built-in evaluation on MBPP+, HumanEval+, ClassEval, AIME, LiveCodeBench & SWE-bench |
+| 📊 **Benchmark Suite** | Built-in evaluation on HumanEval+, ClassEval, AIME, LiveCodeBench & SWE-bench |
 
 ---
 
@@ -103,8 +103,7 @@ CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
     --language-model-only \
-    --enable-auto-tool-choice \
-    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    --enable-auto-tool-choice
 ```
 
 </details>

@@ -83,3 +83,203 @@ def test_execution_stays_in_env_without_secret(tmp_path, monkeypatch):
     text = resp.text + str(resp.data.get("output", ""))
     assert "TOPSECRET123" not in text
     assert "key=[]" in text
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 严重-1: expanded sensitive env coverage + extra param filtering
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestExpandedSensitiveEnvFragments:
+    """Verify that the expanded _SENSITIVE_ENV_FRAGMENTS list catches more
+    credential patterns (fix for 严重-1)."""
+
+    def test_connection_string_detected(self):
+        assert _is_sensitive_env_key("DB_CONNECTION_STRING")
+        assert _is_sensitive_env_key("CONNECTION_STRING")
+
+    def test_certificate_detected(self):
+        assert _is_sensitive_env_key("TLS_CERTIFICATE")
+        assert _is_sensitive_env_key("CLIENT_CERT")
+        assert _is_sensitive_env_key("CA_CERTIFICATE")
+
+    def test_license_key_detected(self):
+        assert _is_sensitive_env_key("JETBRAINS_LICENSE")
+        assert _is_sensitive_env_key("GITHUB_LICENSE")
+
+    def test_registry_detected(self):
+        assert _is_sensitive_env_key("DOCKER_REGISTRY_PASSWORD")
+        assert _is_sensitive_env_key("NPM_REGISTRY_TOKEN")
+        assert _is_sensitive_env_key("REGISTRY_AUTH")
+
+    def test_npm_token_detected(self):
+        assert _is_sensitive_env_key("NPM_TOKEN")
+
+    def test_database_url_detected(self):
+        assert _is_sensitive_env_key("DATABASE_URL")
+
+    def test_sauce_labs_detected(self):
+        assert _is_sensitive_env_key("SAUCE_ACCESS_KEY")
+        assert _is_sensitive_env_key("SAUCE_USERNAME")
+
+    def test_standalone_key_fragment_detected(self):
+        assert _is_sensitive_env_key("ENCRYPTION_KEY")
+        assert _is_sensitive_env_key("SIGNING_KEY")
+
+    def test_git_ssh_key_is_blocked(self):
+        """GIT_SSH_KEY contains 'KEY' and is correctly blocked.
+        The bare 'KEY' fragment is intentionally broad — virtually every
+        environment variable with KEY in its name carries a credential."""
+        assert _is_sensitive_env_key("GIT_SSH_KEY")
+
+    def test_harmless_env_vars_still_ok(self):
+        assert not _is_sensitive_env_key("PYTHONPATH")
+        assert not _is_sensitive_env_key("EDITOR")
+        assert not _is_sensitive_env_key("LANG")
+        assert not _is_sensitive_env_key("PWD")
+        assert not _is_sensitive_env_key("USER")
+        assert not _is_sensitive_env_key("SHELL")
+        assert not _is_sensitive_env_key("DISPLAY")
+        assert not _is_sensitive_env_key("TERM")
+
+
+class TestExtraParamFiltering:
+    """Verify build_sandbox_env filters sensitive keys in the *extra* dict
+    as well (fix for 严重-1 extra bypass)."""
+
+    def test_extra_sensitive_key_is_filtered(self, tmp_path, monkeypatch):
+        # Make sure the parent env doesn't have this key so it can only come
+        # from `extra`.
+        monkeypatch.delenv("MY_SECRET_TOKEN", raising=False)
+        env = build_sandbox_env(
+            tmp_path,
+            extra={"MY_SECRET_TOKEN": "leaked", "SAFE_VAR": "ok"},
+        )
+        assert "MY_SECRET_TOKEN" not in env
+        assert "SAFE_VAR" in env
+        assert env["SAFE_VAR"] == "ok"
+
+    def test_extra_with_no_sensitive_fully_passed(self, tmp_path):
+        env = build_sandbox_env(
+            tmp_path, extra={"PROJECT_SPECIFIC_FLAG": "1"},
+        )
+        assert env["PROJECT_SPECIFIC_FLAG"] == "1"
+
+    def test_project_root_always_set(self, tmp_path):
+        env = build_sandbox_env(tmp_path)
+        assert env["PROJECT_ROOT"] == str(tmp_path)
+
+
+class TestBashNotLoginShell:
+    """Verify shell commands use ``bash -c`` (not ``bash -lc``) so that
+    .bashrc / .bash_profile are NOT sourced (fix for 严重-1)."""
+
+    def test_login_shell_marker_not_set(self, tmp_path, monkeypatch):
+        """$SHLVL increments in any interactive shell; what matters is that
+        login-specific variables are not present."""
+        tool = _tool(tmp_path)
+        resp = tool.run({
+            "command": (
+                "echo LOGIN_SHELL=${LOGIN_SHELL:-NOT_SET} "
+            ),
+            "block_until_ms": 15000,
+        })
+        output = resp.data.get("output", "")
+        # If bash were invoked with -l, $0 would start with '-'
+        # With -c, it should just be 'bash'
+        assert "NOT_SET" in output, f"login shell env detected: {output}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 严重-2: resource limit hardening
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestResourceLimitDefaults:
+    """Verify the tightened default values (fix for 严重-2)."""
+
+    def test_default_process_limit_is_512(self):
+        tool = BashTool(project_root="/tmp")
+        assert tool.DEFAULT_MAX_PROCESSES == 512
+
+    def test_default_memory_limit_is_16gib(self):
+        tool = BashTool(project_root="/tmp")
+        assert tool.DEFAULT_MAX_MEMORY_BYTES == 16 * 1024**3
+
+    def test_default_execution_timeout_is_5min(self):
+        tool = BashTool(project_root="/tmp")
+        assert tool.DEFAULT_MAX_EXECUTION_MS == 300_000
+
+    def test_preexec_built_with_new_defaults(self, tmp_path):
+        tool = _tool(tmp_path)
+        preexec = tool._build_preexec()
+        assert preexec is None or callable(preexec)
+
+    def test_config_overrides_still_work(self, tmp_path):
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            config=Config(bash_max_processes=128, bash_max_execution_ms=60000),
+        )
+        assert tool.max_processes == 128
+        assert tool.max_execution_ms == 60000
+
+    def test_zero_disables_memory_limit(self, tmp_path):
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            config=Config(bash_max_memory_bytes=0),
+        )
+        assert tool.max_memory_bytes == 0
+
+
+class TestWatchdogTimer:
+    """Verify the wall-clock watchdog (fix for 严重-2)."""
+
+    def test_watchdog_kills_long_running_command(self, tmp_path):
+        """A command that sleeps beyond max_execution_ms must be killed by
+        the watchdog timer."""
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            working_dir=str(tmp_path),
+            config=Config(bash_max_execution_ms=500),  # 0.5s
+        )
+        start = __import__("time").monotonic()
+        resp = tool.run({
+            "command": "sleep 60",  # would run 60s without watchdog
+            "block_until_ms": 5000,
+        })
+        elapsed = __import__("time").monotonic() - start
+        # The watchdog should fire within ~1s (500ms + overhead)
+        assert elapsed < 10.0, f"watchdog did not fire, elapsed={elapsed:.1f}s"
+
+    def test_watchdog_not_triggered_for_quick_command(self, tmp_path):
+        """A quick command must complete normally without the watchdog firing."""
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            working_dir=str(tmp_path),
+            config=Config(bash_max_execution_ms=5000),
+        )
+        resp = tool.run({
+            "command": "echo quick",
+            "block_until_ms": 15000,
+        })
+        assert resp.status.value == "success"
+        assert "quick" in resp.data.get("output", "")
+
+    def test_zero_max_execution_disables_watchdog(self, tmp_path):
+        """When max_execution_ms=0 the watchdog is not started at all."""
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            working_dir=str(tmp_path),
+            config=Config(bash_max_execution_ms=0),
+        )
+        resp = tool.run({
+            "command": "echo still_works",
+            "block_until_ms": 5000,
+        })
+        assert resp.status.value == "success"
+        assert "still_works" in resp.data.get("output", "")

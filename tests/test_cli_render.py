@@ -23,7 +23,7 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
 
 def test_model_output_shows_reasoning():
     """CLI-1: model_output event must render reasoning_content (not silently drop)."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -54,7 +54,7 @@ def test_model_output_shows_reasoning():
 
 def test_step_start_visible():
     """CLI-2: step_start must NOT be ignored — user must see step number."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -81,7 +81,7 @@ def test_step_start_visible():
 
 def test_compact_args_truncation():
     """CLI-3: tool-call args must be compact, not full dict dump."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     m = cli.CLICodeAgentMixin()
 
     # Named keys preferred
@@ -104,7 +104,7 @@ def test_compact_args_truncation():
 
 def test_truncate_observation():
     """CLI-4: long tool output must be head+tail truncated."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     m = cli.CLICodeAgentMixin()
 
     short = "line1\nline2\nline3"
@@ -120,7 +120,7 @@ def test_truncate_observation():
 
 def test_render_assistant_uses_rule_separator():
     """CLI-6: render_assistant must use Rule not Panel."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     captured = io.StringIO()
 
     class _FakeConsole:
@@ -134,7 +134,7 @@ def test_render_assistant_uses_rule_separator():
             captured.write(text)
 
     # Must not raise; verify the method signature.
-    import CodeingAgent.WhaleCode.scripts.cli as cli_module
+    from scripts import cli as cli_module
     # Smoke: call with a plain UI (no rich).
     ui = cli.CLIUI(use_rich=False)
     ui.render_assistant("Hello world")
@@ -153,7 +153,7 @@ def test_render_assistant_uses_rule_separator():
 def test_show_runtime_info_includes_new_fields():
     """CLI-9: /info must show max_steps, tokens, context usage, bash params."""
     # Check source that the info function references these.
-    run_cli_src = Path("run_cli.py").read_text()
+    run_cli_src = (Path(__file__).resolve().parents[1] / "scripts" / "cli.py").read_text()
     assert "max_steps" in run_cli_src, "CLI-9 FAIL: max_steps missing from /info"
     assert "Tokens used" in run_cli_src or "total_tokens" in run_cli_src
     assert "Context:" in run_cli_src  # context usage line
@@ -164,7 +164,7 @@ def test_show_runtime_info_includes_new_fields():
 
 def test_log_block_tiered_rendering():
     """CLI-10: tool calls / thinking / observation use compact dim lines, not Panel."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     ui = cli.CLIUI(use_rich=False)
 
     # All secondary-tier calls should not throw.
@@ -180,7 +180,7 @@ def test_log_block_tiered_rendering():
 
 def test_mixin_has_all_new_methods():
     """Smoke: all CLI improvement helper methods exist on the mixin."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     m = cli.CLICodeAgentMixin()
     for method in (
         "_compact_args",
@@ -197,7 +197,7 @@ def test_mixin_has_all_new_methods():
 
 def test_run_agent_turn_transcript_pairs_tool_and_preserves_full_outputs(tmp_path, capsys):
     """CLI transcript should show compact status while saving full reasoning/output."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
 
     class _Config:
         context_window = 100000
@@ -281,7 +281,7 @@ def test_run_agent_turn_transcript_pairs_tool_and_preserves_full_outputs(tmp_pat
 
 def test_reasoning_off_hides_terminal_preview_but_keeps_trace_and_file(tmp_path):
     """CLI-N3: off mode hides terminal reasoning while preserving audit data."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     captured = io.StringIO()
 
     class _FakeUI:
@@ -312,7 +312,7 @@ def test_reasoning_off_hides_terminal_preview_but_keeps_trace_and_file(tmp_path)
 
 def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
     """CLI-A1: artifact storage defaults to memory and can be configured."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
 
     class _FakeUI:
         use_rich = False
@@ -345,7 +345,7 @@ def test_cli_artifacts_can_use_custom_dir_or_be_disabled(tmp_path):
 
 def test_event_history_renderer_shows_structured_timeline(capsys):
     """CLI-N8: /trace data can be rendered as event timeline."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     ui = cli.CLIUI(use_rich=False)
     ui.render_event_history(
         [
@@ -363,7 +363,7 @@ def test_event_history_renderer_shows_structured_timeline(capsys):
 
 def test_parser_accepts_reasoning_modes_and_trace_command_is_registered():
     """CLI-N3/N8: public CLI knobs are wired into parser and command lists."""
-    import CodeingAgent.WhaleCode.scripts.cli as cli
+    from scripts import cli
     parser = cli.build_parser()
     args = parser.parse_args(["--reasoning", "full", "--plain", "hello"])
     assert args.reasoning == "full"

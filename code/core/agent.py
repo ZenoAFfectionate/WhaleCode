@@ -1,13 +1,26 @@
-"""Agent基类"""
+"""Agent base class — shared lifecycle, tool execution, session persistence, and context management."""
 
-from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, AsyncGenerator
+from __future__ import annotations
+
 import asyncio
-from .message import Message
-from .llm import HelloAgentsLLM
+import json as _json
+import time as _time
+from abc import ABC, abstractmethod
+from datetime import datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional, TYPE_CHECKING
+
+from ..context.history import HistoryManager
+from ..context.token_counter import TokenCounter
+from ..context.truncator import ObservationTruncator
+from ..tools.errors import ToolErrorCode
+from ..tools.response import ToolResponse, ToolStatus
 from .config import Config
 from .lifecycle import AgentEvent, EventType, LifecycleHook
+from .llm import HelloAgentsLLM
 from .logging import agent_print
+from .message import Message
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -56,8 +69,7 @@ class Agent(ABC):
         # 工具注册表（可选）
         self.tool_registry = tool_registry
 
-        # 新增：Token 计数器（缓存 + 增量计算）
-        from ..context.token_counter import TokenCounter
+        # Token 计数器（缓存 + 增量计算）
         self.token_counter = TokenCounter(model=self.llm.model)
         self._last_prompt_tokens = 0
         self._estimated_next_prompt_tokens = 0
@@ -65,9 +77,7 @@ class Agent(ABC):
         self._turn_completion_tokens = 0
         self._total_tokens = 0
 
-        # 新增：上下文工程组件
-        from ..context.history import HistoryManager
-
+        # 上下文工程组件
         self.history_manager = HistoryManager(
             compression_threshold=self.config.compression_threshold,
             token_counter=self.token_counter,
@@ -77,22 +87,17 @@ class Agent(ABC):
         self._history_estimated_token_count = self.history_manager.get_estimated_token_count()
 
         # 统一暴露截断器，便于工具层和测试使用相同的上下文能力
-        from ..context.truncator import ObservationTruncator
-        from pathlib import Path
-        truncator_output_dir = str(Path("memory/tool-output").resolve())
         self.truncator = ObservationTruncator(
             token_counter=self.token_counter,
-            output_dir=truncator_output_dir,
+            output_dir=str(Path("memory/tool-output").resolve()),
         )
 
-        # 新增：可观测性组件（trace_logger 按每轮 run/arun 创建，不在构造时初始化）
+        # 可观测性组件（trace_logger 按每轮 run/arun 创建，不在构造时初始化）
         from ..observability import TraceLogger
         self.trace_logger: Optional[TraceLogger] = None
 
-        # 新增：Skills 知识外化组件
-        from pathlib import Path
+        # Skills 知识外化组件
         from ..skills import SkillLoader
-
         self.skill_loader: Optional[SkillLoader] = None
         if self.config.skills_enabled:
             skills_path = Path(self.config.skills_dir)
@@ -104,25 +109,23 @@ class Agent(ABC):
                 skill_tool = SkillTool(skill_loader=self.skill_loader)
                 self.tool_registry.register_tool(skill_tool)
 
-        # 新增：会话持久化组件
-        from datetime import datetime
+        # 会话持久化组件
         from .session_store import SessionStore
-
         self.session_store: Optional[SessionStore] = None
         if self.config.session_enabled:
             self.session_store = SessionStore(session_dir=self.config.session_dir)
 
         self.session_id = SessionStore.generate_session_id()
 
-        # 会话元数据（用于保存）
+        now = datetime.now()
         self._session_metadata = {
             "session_id": self.session_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now.isoformat(),
             "total_tokens": 0,
             "total_steps": 0,
-            "duration_seconds": 0
+            "duration_seconds": 0,
         }
-        self._start_time = datetime.now()
+        self._start_time = now
 
         # 新增：TodoWrite 进度管理组件
         if self.config.todowrite_enabled and self.tool_registry:
@@ -346,17 +349,12 @@ class Agent(ABC):
         return {}
 
     def _init_trace(self) -> None:
-        """为当前 run/arun/arun_stream 调用创建新的 TraceLogger。
-
-        每次调用会替换 self.trace_logger（旧实例如已 finalize 则被丢弃），
-        确保多轮对话和子代理场景下各自拥有独立的 trace 文件。
-        """
+        """为当前 run/arun/arun_stream 调用创建新的 TraceLogger。"""
         self.trace_logger = None
         if not self.config.trace_enabled:
             return
-        from ..observability import TraceLogger
-
-        self.trace_logger = TraceLogger(
+        from ..observability import TraceLogger as _TraceLogger
+        self.trace_logger = _TraceLogger(
             output_dir=self.config.trace_dir,
             sanitize=self.config.trace_sanitize,
             html_include_raw_response=self.config.trace_html_include_raw_response,
@@ -574,8 +572,6 @@ class Agent(ABC):
 
     def _format_tool_response_text(self, _tool_name: str, response) -> str:
         """Render a ToolResponse into the final observation string."""
-        from ..tools.response import ToolStatus
-
         if response.status == ToolStatus.ERROR:
             error_code = response.error_info.get("code", "UNKNOWN") if response.error_info else "UNKNOWN"
             return f"❌ Error [{error_code}]: {response.text}"
@@ -640,8 +636,6 @@ class Agent(ABC):
 
     def _build_tool_execution_result(self, tool_name: str, response) -> Dict[str, Any]:
         """Format a ToolResponse once and keep its history metadata alongside the text."""
-        from ..tools.response import ToolStatus
-
         return {
             "content": self._format_tool_response_text(tool_name, response),
             "metadata": self._tool_history_metadata(tool_name, response),
@@ -724,9 +718,6 @@ class Agent(ABC):
 
     def _execute_tool_response(self, tool_name: str, arguments: Dict[str, Any]):
         """Execute a tool through ToolRegistry and return the raw ToolResponse."""
-        from ..tools.errors import ToolErrorCode
-        from ..tools.response import ToolResponse
-
         if not self.tool_registry:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
@@ -739,9 +730,6 @@ class Agent(ABC):
 
     async def _aexecute_tool_response(self, tool_name: str, arguments: Dict[str, Any]):
         """Async variant of _execute_tool_response()."""
-        from ..tools.errors import ToolErrorCode
-        from ..tools.response import ToolResponse
-
         if not self.tool_registry:
             return ToolResponse.error(
                 code=ToolErrorCode.INTERNAL_ERROR,
@@ -854,7 +842,6 @@ class Agent(ABC):
             raise RuntimeError("Session persistence is not enabled. Set session_enabled=True in Config.")
 
         # 更新元数据
-        from datetime import datetime
         self._session_metadata["duration_seconds"] = (datetime.now() - self._start_time).total_seconds()
         self._session_metadata["session_id"] = self.session_id
 
@@ -976,11 +963,7 @@ class Agent(ABC):
         if not self.tool_registry:
             return "no-tools"
 
-        import json
-        from hashlib import sha256
-
-        # 收集所有工具的签名（建议-4：用 get_parameters() 而非不存在的
-        # tool.parameters 属性，使签名真正包含参数定义，schema 变化检测生效）
+        # 收集所有工具的签名（用 get_parameters() 使签名真正包含参数定义）
         tools_signature = {}
         for tool_name in sorted(self.tool_registry.list_tools()):
             tool = self.tool_registry.get_tool(tool_name)
@@ -1003,7 +986,7 @@ class Agent(ABC):
                 ],
             }
 
-        schema_str = json.dumps(tools_signature, sort_keys=True)
+        schema_str = _json.dumps(tools_signature, sort_keys=True)
         return sha256(schema_str.encode()).hexdigest()[:16]
 
     def _get_read_cache(self) -> Dict[str, Dict]:
@@ -1053,8 +1036,6 @@ class Agent(ABC):
                 }
             }
         """
-        import time
-
         # 1. 保存当前状态（使用 to_dict 完整保存 rounds/usage 等元数据）
         original_hm_state = self.history_manager.to_dict()
         original_tools = None
@@ -1073,7 +1054,7 @@ class Agent(ABC):
             self.max_steps = max_steps_override
 
         # 记录开始时间
-        start_time = time.time()
+        start_time = _time.time()
         success = False
         result = ""
         error_msg = None
@@ -1093,7 +1074,7 @@ class Agent(ABC):
 
         finally:
             # 记录执行时长
-            duration = time.time() - start_time
+            duration = _time.time() - start_time
 
             # 6. 收集元数据
             metadata = self._get_subagent_metadata(duration, error_msg)

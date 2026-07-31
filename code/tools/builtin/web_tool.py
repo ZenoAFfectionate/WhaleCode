@@ -954,7 +954,14 @@ class WebSearchTool(_WebToolBase):
             hint_message="Use WebFetch for a chosen URL or Read the saved output file for the full result list.",
             output_truncator=output_truncator,
         )
-        self.search_backend = search_backend or _DuckDuckGoSearchBackend()
+        self._search_backend = search_backend  # None → lazily create default
+
+    @property
+    def search_backend(self) -> _SearchBackend:
+        """Lazy-init: only create the DuckDuckGo backend on first use."""
+        if self._search_backend is None:
+            self._search_backend = _DuckDuckGoSearchBackend()
+        return self._search_backend
 
     def get_parameters(self) -> List[ToolParameter]:
         return [

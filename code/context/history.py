@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..core.message import Message
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .token_counter import TokenCounter
@@ -150,11 +153,20 @@ class HistoryManager:
         self._estimated_history_token_count = 0
         self._recorded_usage = self._empty_usage_snapshot()
 
+        # 性能优化：缓存 estimate_tokens() 结果，避免每轮重复全量编码
+        # 缓存键 = (system_prompt_hash, latest_input_hash, len(history))
+        self._cached_estimate_key: Optional[tuple] = None
+        self._cached_estimate_value: int = 0
+        # 缓存 system_prompt 的 token 数（每轮不变）
+        self._cached_system_prompt_hash: Optional[int] = None
+        self._cached_system_prompt_tokens: int = 0
+
     def append(self, message: Message) -> None:
         """追加消息（只追加，不编辑）。"""
         self._history.append(message)
         self._estimated_history_token_count += self._count_message(message)
         self._mark_usage_stale()
+        self._cached_estimate_key = None  # 历史变更 → 缓存失效
 
     def get_history(self) -> List[Message]:
         """获取历史副本。"""
@@ -165,6 +177,7 @@ class HistoryManager:
         self._history.clear()
         self._estimated_history_token_count = 0
         self._recorded_usage = self._empty_usage_snapshot()
+        self._cached_estimate_key = None  # 历史清空 → 缓存失效
 
     def get_last_api_prompt_tokens(self) -> int:
         """返回最近一次 LLM API 返回的真实 prompt token 数。
@@ -249,6 +262,7 @@ class HistoryManager:
         self._history = [summary_msg, *retained_history]
         self._estimated_history_token_count = self._count_messages(self._history)
         self._mark_usage_stale()
+        self._cached_estimate_key = None  # 历史被替换 → 缓存失效
 
     def build_summary_message(
         self,
@@ -324,7 +338,22 @@ class HistoryManager:
         system_prompt: Optional[str] = None,
         latest_user_input: Optional[str] = None,
     ) -> int:
-        """估算当前 prompt token 数。"""
+        """估算当前 prompt token 数。
+
+        性能优化：当使用默认 history（self._history）且 system_prompt/latest_user_input
+        与上次调用相同时，直接返回缓存值，避免每轮重复全量重建 + 编码。
+        """
+        # ---- 缓存命中检查（仅对默认 history 生效） ----
+        if history is None:
+            cache_key = (
+                hash(system_prompt or ""),
+                hash(latest_user_input or ""),
+                len(self._history),
+            )
+            if self._cached_estimate_key == cache_key:
+                return self._cached_estimate_value
+            self._cached_estimate_key = cache_key
+
         messages = self.build_llm_messages(
             system_prompt=system_prompt,
             latest_user_input=latest_user_input,
@@ -332,11 +361,26 @@ class HistoryManager:
         )
         total = 0
         counter = self._get_token_counter()
-        for message in messages:
+
+        # ---- system_prompt 缓存 ----
+        if system_prompt:
+            sp_hash = hash(system_prompt)
+            if sp_hash == self._cached_system_prompt_hash:
+                total += self._cached_system_prompt_tokens
+            else:
+                sp_tokens = counter.count_text(system_prompt) + 4
+                self._cached_system_prompt_hash = sp_hash
+                self._cached_system_prompt_tokens = sp_tokens
+                total += sp_tokens
+            # 跳过 messages[0]（即 system_prompt），从 messages[1:] 开始
+            msg_iter = iter(messages)
+            next(msg_iter, None)
+        else:
+            msg_iter = iter(messages)
+
+        for message in msg_iter:
             total += counter.count_text(message.get("content", "")) + 4
             # 重要-7: assistant 工具调用的真实负载在 tool_calls.arguments 里
-            # （例如 Write 会把整份文件塞进 arguments），不计会严重低估 prompt
-            # 规模，导致压缩不触发 → 下一次请求超窗。
             tool_calls = message.get("tool_calls") or []
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
@@ -347,6 +391,12 @@ class HistoryManager:
                     self._tool_call_arguments_for_llm(function.get("arguments"))
                 )
                 total += 4
+
+        # 仅在使用默认 history 且明确带 latest_user_input 时缓存结果
+        # （这是最常调用的模式：_maybe_compact_history 中的两次 estimate_tokens 调用）
+        if history is None:
+            self._cached_estimate_value = total
+
         return total
 
     def get_compact_trigger_limit(self) -> int:
@@ -559,6 +609,7 @@ class HistoryManager:
         self._history = best_candidate
         self._estimated_history_token_count = self._count_messages(self._history)
         self._mark_usage_stale()
+        self._cached_estimate_key = None  # 历史被替换 → 缓存失效
         after_tokens = self.estimate_tokens(system_prompt=system_prompt)
         return {
             "before_tokens": before_tokens,
@@ -583,6 +634,7 @@ class HistoryManager:
             for msg_data in data.get("history", [])
         ]
         self._estimated_history_token_count = self._count_messages(self._history)
+        self._cached_estimate_key = None  # 历史被替换 → 缓存失效
         usage = data.get("usage")
         if isinstance(usage, dict):
             prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -643,7 +695,11 @@ class HistoryManager:
                     ],
                 }
             if not content.strip():
-                return None
+                # 重要-1: do not drop the assistant message even if it has no
+                # text content and no tool_calls — this preserves message ordering
+                # and prevents silent context loss after compaction or session
+                # restore where metadata may have been corrupted.
+                return {"role": "assistant", "content": "[no output]"}
             return {"role": "assistant", "content": content}
         if message.role == "summary":
             return {"role": "user", "content": f"{self.SUMMARY_NOTE_PREFIX}\n{content}"}
@@ -718,19 +774,49 @@ class HistoryManager:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
                     pass
+            # 重要-1: defend against malformed arguments (number, bool, list,
+            # etc.) that would produce invalid JSON downstream.  Wrap anything
+            # that isn't a dict into {"_raw": <value>} so tool_call_arguments
+            # always stays serialisable.
+            if arguments is None:
+                arguments = {}
+            elif not isinstance(arguments, dict):
+                _logger.warning(
+                    "HistoryManager: tool_call arguments for '%s' is not a dict "
+                    "(type=%s).  Wrapping in _raw to preserve data.",
+                    function.get("name", "unknown"),
+                    type(arguments).__name__,
+                )
+                arguments = {"_raw": arguments}
             normalized.append(
                 {
                     "id": tool_call.get("id", ""),
                     "name": function.get("name", tool_call.get("name", "unknown")),
-                    "arguments": arguments if arguments is not None else {},
+                    "arguments": arguments,
                 }
             )
         return normalized
 
     def _assistant_tool_calls(self, message: Message) -> List[Dict[str, Any]]:
+        """Extract tool_calls from message metadata with defensive logging.
+
+        When metadata is present but not a list, the tool call information is
+        effectively lost for the next LLM call.  Log a warning so operators
+        can detect serialisation / schema drift before it causes silent
+        context corruption.
+        """
         metadata_calls = self._message_metadata(message).get("tool_calls")
         if isinstance(metadata_calls, list):
             return self._normalize_tool_calls(metadata_calls)
+        if metadata_calls is not None:
+            # 重要-1: metadata exists but has the wrong type — tool_calls will
+            # be silently dropped in _project_message_for_llm unless we log it.
+            _logger.warning(
+                "HistoryManager: tool_calls in message metadata is not a list "
+                "(type=%s).  The assistant's tool calls will be lost when "
+                "building the next LLM prompt.",
+                type(metadata_calls).__name__,
+            )
         return []
 
     def _build_tool_name_map(self, history: Sequence[Message]) -> Dict[str, str]:

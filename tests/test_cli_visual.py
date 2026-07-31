@@ -24,7 +24,7 @@ if "hello_agents" not in sys.modules:
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import CodeingAgent.WhaleCode.scripts.cli as cli  # noqa: E402
+from scripts import cli  # noqa: E402
 
 
 def _rich_ui(width: int = 80):

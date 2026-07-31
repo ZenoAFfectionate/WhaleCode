@@ -58,7 +58,9 @@ class Config(BaseModel):
     # 这里作为单一事实来源与文档，便于多环境切换与审计）
     bash_allow_network: bool = False            # BASH_ALLOW_NETWORK
     bash_max_cpu_seconds: int = 3600            # BASH_MAX_CPU_SECONDS（严重-2）
+    bash_max_memory_bytes: int = 0              # BASH_MAX_MEMORY_BYTES（0=不限，严重-2 修复后默认由 BashTool 控制）
     bash_max_processes: int = 4096              # BASH_MAX_PROCESSES（fork bomb 防护）
+    bash_max_file_size_bytes: int = 0           # BASH_MAX_FILE_SIZE_BYTES（0=不限）
     bash_max_execution_ms: int = 0              # BASH_MAX_EXECUTION_MS（硬超时，0=不强杀）
     web_tools_enabled: bool = True              # WEB_TOOLS_ENABLED
     web_fetch_allow_private: bool = False       # WEBFETCH_ALLOW_PRIVATE（严重-3 SSRF 放行）
@@ -144,7 +146,9 @@ class Config(BaseModel):
         # 建议-6: sandbox / network / retry / step-limit switches.
         kwargs["bash_allow_network"] = _bool("BASH_ALLOW_NETWORK", cls.model_fields["bash_allow_network"].default)
         kwargs["bash_max_cpu_seconds"] = _int("BASH_MAX_CPU_SECONDS", cls.model_fields["bash_max_cpu_seconds"].default)
+        kwargs["bash_max_memory_bytes"] = _int("BASH_MAX_MEMORY_BYTES", cls.model_fields["bash_max_memory_bytes"].default)
         kwargs["bash_max_processes"] = _int("BASH_MAX_PROCESSES", cls.model_fields["bash_max_processes"].default)
+        kwargs["bash_max_file_size_bytes"] = _int("BASH_MAX_FILE_SIZE_BYTES", cls.model_fields["bash_max_file_size_bytes"].default)
         kwargs["bash_max_execution_ms"] = _int("BASH_MAX_EXECUTION_MS", cls.model_fields["bash_max_execution_ms"].default)
         kwargs["web_tools_enabled"] = _bool("WEB_TOOLS_ENABLED", cls.model_fields["web_tools_enabled"].default)
         kwargs["web_fetch_allow_private"] = _bool("WEBFETCH_ALLOW_PRIVATE", cls.model_fields["web_fetch_allow_private"].default)

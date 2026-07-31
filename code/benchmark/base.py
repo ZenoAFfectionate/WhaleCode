@@ -516,7 +516,7 @@ class BenchmarkRunner(ABC):
         registry.register_tool(WriteTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(DeleteTool(project_root=ws, working_dir=ws, registry=registry))
         registry.register_tool(EditTool(project_root=ws, working_dir=ws, registry=registry))
-        registry.register_tool(BashTool(project_root=ws, working_dir=ws))
+        registry.register_tool(BashTool(project_root=ws, working_dir=ws, config=agent.config, output_truncator=agent.truncator))
 
         # Persist session todo state outside the repo to avoid diff pollution.
         todo_dir = Path(tempfile.gettempdir()) / "whale_bench_tasks" / uuid.uuid4().hex[:8]
@@ -528,6 +528,21 @@ class BenchmarkRunner(ABC):
                 session_id=agent.session_id,
             )
         )
+
+        # LSP tools — help the agent navigate large codebases (e.g. SWEV).
+        # These degrade gracefully when the language server is not installed.
+        from hello_agents.tools.lsp import (
+            LSPDefinitionTool,
+            LSPDiagnosticsTool,
+            LSPHoverTool,
+            LSPReferencesTool,
+            LSPManager,
+        )
+        lsp_manager = LSPManager(workspace)
+        registry.register_tool(LSPDefinitionTool(workspace_root=ws, manager=lsp_manager))
+        registry.register_tool(LSPReferencesTool(workspace_root=ws, manager=lsp_manager))
+        registry.register_tool(LSPHoverTool(workspace_root=ws, manager=lsp_manager))
+        registry.register_tool(LSPDiagnosticsTool(workspace_root=ws, manager=lsp_manager))
 
     def _create_agent(self, workspace: Path) -> CodeAgent:
         """Create a fresh CodeAgent with coding tools only (no web tools)."""

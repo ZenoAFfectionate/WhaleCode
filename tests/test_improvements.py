@@ -17,6 +17,10 @@ from pathlib import Path
 
 import pytest
 
+# Bootstrap: add project root to sys.path so "scripts.cli" is importable
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 # ---------------------------------------------------------------------------
 # 重要-1: circuit breaker only trips on real tool faults
 # ---------------------------------------------------------------------------
@@ -583,7 +587,7 @@ def test_cli_task_list_uses_export_state():
     registry.register_tool(todo)
 
     # Use the CLIUI helper directly.
-    from CodeingAgent.WhaleCode.scripts.cli import CLIUI
+    from scripts.cli import CLIUI
     tasks = CLIUI._get_task_list(agent)
     assert isinstance(tasks, list)
 
@@ -1297,3 +1301,201 @@ class TestBashToolInteractiveCommands:
                 )
         finally:
             shutil.rmtree(tmp)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 重要-1: HistoryManager tool_calls projection safety
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestHistoryManagerToolCallSafety:
+    """Verify 重要-1 fixes: tool_calls are never silently lost during
+    message projection, and metadata corruption is detected."""
+
+    def test_empty_content_without_tool_calls_not_dropped(self):
+        """content='' and no tool_calls → message returns [no output], not None."""
+        from hello_agents.context.history import HistoryManager
+        from hello_agents.core.message import Message
+
+        hm = HistoryManager()
+        msg = Message(content="", role="assistant")
+        projected = hm._project_message_for_llm(msg)
+        assert projected is not None, "empty assistant message must not be dropped"
+        assert projected["role"] == "assistant"
+        assert projected["content"] == "[no output]"
+
+    def test_empty_content_with_valid_tool_calls_still_works(self):
+        """content='' but tool_calls present → correctly projected with tool_calls."""
+        from hello_agents.context.history import HistoryManager
+        from hello_agents.core.message import Message
+
+        hm = HistoryManager()
+        msg = Message(
+            content="",
+            role="assistant",
+            metadata={
+                "tool_calls": [{
+                    "id": "call-1",
+                    "name": "Read",
+                    "arguments": {"path": "f.py"},
+                }],
+            },
+        )
+        projected = hm._project_message_for_llm(msg)
+        assert projected is not None
+        assert projected["role"] == "assistant"
+        assert len(projected["tool_calls"]) == 1
+        assert projected["tool_calls"][0]["function"]["name"] == "Read"
+
+    def test_corrupt_tool_calls_not_list_still_preserves_message(self):
+        """tool_calls in metadata is a string (corrupted) → message is NOT
+        dropped, and tool_calls are empty (graceful degradation)."""
+        from hello_agents.context.history import HistoryManager
+        from hello_agents.core.message import Message
+
+        hm = HistoryManager()
+        msg = Message(
+            content="I will now read the file",
+            role="assistant",
+            metadata={"tool_calls": "this should be a list but isn't"},
+        )
+        # _assistant_tool_calls must return [] for non-list metadata
+        extracted = hm._assistant_tool_calls(msg)
+        assert extracted == []
+
+        # _project_message_for_llm must NOT drop the message
+        projected = hm._project_message_for_llm(msg)
+        assert projected is not None
+        assert projected["role"] == "assistant"
+        assert "tool_calls" not in projected
+        assert "I will now read the file" in projected["content"]
+
+    def test_assistant_with_content_and_valid_tool_calls(self):
+        """Normal case: content + valid tool_calls → both preserved."""
+        from hello_agents.context.history import HistoryManager
+        from hello_agents.core.message import Message
+
+        hm = HistoryManager()
+        msg = Message(
+            content="Let me check something",
+            role="assistant",
+            metadata={
+                "tool_calls": [
+                    {"id": "c1", "name": "Read", "arguments": {"path": "a.py"}},
+                    {"id": "c2", "name": "Grep", "arguments": {"pattern": "TODO"}},
+                ],
+            },
+        )
+        projected = hm._project_message_for_llm(msg)
+        assert projected is not None
+        assert projected["role"] == "assistant"
+        assert len(projected["tool_calls"]) == 2
+        assert projected["tool_calls"][0]["function"]["name"] == "Read"
+        assert projected["tool_calls"][1]["function"]["name"] == "Grep"
+
+    def test_metadata_tool_calls_roundtrip(self):
+        """build_assistant_tool_call_message → to_dict → from_dict →
+        _project_message_for_llm: tool_calls survive full roundtrip."""
+        from hello_agents.context.history import HistoryManager
+        from hello_agents.core.message import Message
+
+        hm = HistoryManager()
+        # Build via the public API
+        built = hm.build_assistant_tool_call_message(
+            tool_calls=[
+                {"id": "r1", "type": "function", "function": {
+                    "name": "Bash", "arguments": '{"command":"pytest"}'}},
+            ],
+            content="running tests",
+        )
+        # Serialise + deserialise
+        restored = Message.from_dict(built.to_dict())
+        # Extract + project
+        extracted = hm._assistant_tool_calls(restored)
+        assert len(extracted) == 1
+        assert extracted[0]["name"] == "Bash"
+        assert extracted[0]["arguments"] == {"command": "pytest"}
+
+        projected = hm._project_message_for_llm(restored)
+        assert projected is not None
+        assert projected["tool_calls"][0]["function"]["name"] == "Bash"
+
+
+class TestNormalizeToolCallsDefensive:
+    """Verify _normalize_tool_calls handles edge cases gracefully
+    (fix for 重要-1)."""
+
+    def test_string_arguments_parsed_to_dict(self):
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c1",
+            "function": {"name": "Read", "arguments": '{"path":"f.py"}'},
+        }])
+        assert result[0]["arguments"] == {"path": "f.py"}
+
+    def test_integer_arguments_wrapped_in_raw(self):
+        """Non-dict, non-string arguments must be wrapped, not passed through."""
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c2",
+            "function": {"name": "Tool", "arguments": 42},
+        }])
+        assert isinstance(result[0]["arguments"], dict)
+        assert result[0]["arguments"]["_raw"] == 42
+
+    def test_boolean_arguments_wrapped_in_raw(self):
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c3",
+            "function": {"name": "Tool", "arguments": True},
+        }])
+        assert isinstance(result[0]["arguments"], dict)
+        assert result[0]["arguments"]["_raw"] is True
+
+    def test_list_arguments_wrapped_in_raw(self):
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c4",
+            "function": {"name": "Tool", "arguments": [1, 2, 3]},
+        }])
+        assert isinstance(result[0]["arguments"], dict)
+        assert result[0]["arguments"]["_raw"] == [1, 2, 3]
+
+    def test_none_arguments_replaced_with_empty_dict(self):
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c5",
+            "function": {"name": "Tool", "arguments": None},
+        }])
+        assert result[0]["arguments"] == {}
+
+    def test_no_function_field_falls_back_to_top_level(self):
+        """When the 'function' wrapper is missing, use top-level fields."""
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([{
+            "id": "c6",
+            "name": "Read",
+            "arguments": {"path": "f.py"},
+        }])
+        assert result[0]["name"] == "Read"
+        assert result[0]["arguments"] == {"path": "f.py"}
+
+    def test_empty_tool_call_list(self):
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls([])
+        assert result == []
+
+    def test_non_dict_entry_skipped(self):
+        """A tool_call that isn't a dict is silently skipped."""
+        from hello_agents.context.history import HistoryManager
+        hm = HistoryManager()
+        result = hm._normalize_tool_calls(["not_a_dict", {"id": "ok", "name": "T", "arguments": {}}])
+        assert len(result) == 1
+        assert result[0]["name"] == "T"

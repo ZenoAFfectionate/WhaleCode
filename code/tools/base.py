@@ -1,13 +1,16 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
 import re
 import time
-import inspect
-import asyncio
-from pydantic import BaseModel
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Callable, get_type_hints
+from typing import Any, Callable, Dict, List, Optional, get_type_hints
 
-from .response import ToolResponse
+from pydantic import BaseModel
+
 from .errors import ToolErrorCode
+from .response import ToolResponse
 
 
 def tool_action(name: str = None, description: str = None):
@@ -187,6 +190,18 @@ class Tool(ABC):
         required_params = [p.name for p in self.get_parameters() if p.required]
         return all(param in parameters for param in required_params)
 
+    #: Mapping from declared parameter type → Python type(s) accepted for validation.
+    #: ``bool`` is excluded from ``int``/``float`` checks because ``isinstance(True, int)``
+    #: is true in Python; we validate booleans separately.
+    _TYPE_VALIDATORS: dict[str, type | tuple[type, ...]] = {
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "array": (list, str),
+        "object": (dict, str),
+    }
+
     def _validate_against_schema(self, parameters: Dict[str, Any]) -> Optional[ToolResponse]:
         """Validate parameters against the declared schema from get_parameters().
 
@@ -205,61 +220,54 @@ class Tool(ABC):
                     message=f"Missing required parameter: {p.name}",
                 )
 
-        # Check types of provided parameters
+        # Check types of provided parameters.
+        # bool is a subclass of int (True == 1 in isinstance), so booleans
+        # must be excluded from integer/number checks.
         for name, value in parameters.items():
-            if name not in schema:
+            expected = schema.get(name)
+            if expected is None:
                 continue  # Allow extra parameters
-            expected = schema[name]
-            expected_type = expected.type
+            expected_type = self._TYPE_VALIDATORS.get(expected.type)
+            if expected_type is None:
+                continue  # Unknown type → skip validation
 
-            if expected_type == "string":
-                if not isinstance(value, str):
-                    return ToolResponse.error(
-                        code=ToolErrorCode.INVALID_PARAM,
-                        message=f"Invalid parameter `{name}`: expected string, got {type(value).__name__}.",
-                    )
-            elif expected_type == "integer":
-                if isinstance(value, bool) or not isinstance(value, int):
-                    return ToolResponse.error(
-                        code=ToolErrorCode.INVALID_PARAM,
-                        message=f"Invalid parameter `{name}`: expected integer, got {type(value).__name__}.",
-                    )
-            elif expected_type == "number":
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    return ToolResponse.error(
-                        code=ToolErrorCode.INVALID_PARAM,
-                        message=f"Invalid parameter `{name}`: expected number, got {type(value).__name__}.",
-                    )
-            elif expected_type == "boolean":
+            declared = expected.type
+            if declared == "boolean":
                 if not isinstance(value, bool):
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
                         message=f"Invalid parameter `{name}`: expected boolean, got {type(value).__name__}.",
                     )
-            elif expected_type == "array":
-                if not isinstance(value, (list, str)):
+            elif declared == "integer":
+                if isinstance(value, bool) or not isinstance(value, int):
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"Invalid parameter `{name}`: expected array, got {type(value).__name__}.",
+                        message=f"Invalid parameter `{name}`: expected integer, got {type(value).__name__}.",
                     )
-            elif expected_type == "object":
-                if not isinstance(value, (dict, str)):
+            elif declared == "number":
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
                     return ToolResponse.error(
                         code=ToolErrorCode.INVALID_PARAM,
-                        message=f"Invalid parameter `{name}`: expected object, got {type(value).__name__}.",
+                        message=f"Invalid parameter `{name}`: expected number, got {type(value).__name__}.",
                     )
+            elif not isinstance(value, expected_type):
+                return ToolResponse.error(
+                    code=ToolErrorCode.INVALID_PARAM,
+                    message=f"Invalid parameter `{name}`: expected {declared}, got {type(value).__name__}.",
+                )
 
         return None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary format"""
+        """Convert to dictionary format."""
+        params = self.get_parameters()
         return {
             "name": self.name,
             "description": self.description,
             "parameters": [
                 param.model_dump() if hasattr(param, "model_dump") else param.dict()
-                for param in self.get_parameters()
-            ]
+                for param in params
+            ],
         }
 
     def __str__(self) -> str:

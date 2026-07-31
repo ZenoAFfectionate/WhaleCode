@@ -189,9 +189,8 @@ class TestRlimitPreexec:
 
     def test_resource_module_missing(self, monkeypatch):
         """当 resource 模块不可用时，返回 None（Windows 兼容）。"""
-        monkeypatch.setattr(
-            "hello_agents.tools.builtin.bash._resource", None,
-        )
+        from hello_agents.tools.builtin import bash as bash_mod
+        monkeypatch.setattr(bash_mod, "_resource", None)
         fn = make_rlimit_preexec(60, 1024 * 1024 * 1024, 256, 1024 * 1024)
         assert fn is None
 

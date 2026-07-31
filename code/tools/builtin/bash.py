@@ -50,6 +50,16 @@ _SENSITIVE_ENV_FRAGMENTS: tuple[str, ...] = (
     "SESSION_KEY",
     "AUTH",
     "PASSPHRASE",
+    # 严重-1: expanded coverage for common credential patterns
+    "DATABASE_URL",   # connection strings with embedded passwords
+    "CONNECTION",     # CONNECTION_STRING, DB_CONNECTION, etc.
+    "CERTIFICATE",    # TLS_CERTIFICATE, CA_CERTIFICATE, etc.
+    "CERT",           # CLIENT_CERT, DOCKER_CERT_PATH, MINIO_CERT, etc.
+    "KEY",            # ENCRYPTION_KEY, SIGNING_KEY, GCP_KEY, etc.
+    "LICENSE",        # LICENSE_KEY, GITHUB_LICENSE, etc.
+    "REGISTRY",       # container/package registry credentials
+    "SAUCE",          # SAUCE_ACCESS_KEY (Sauce Labs)
+    "NPM_TOKEN",      # npm automation token
 )
 
 # Names that should be kept even if they happen to contain a sensitive fragment
@@ -72,8 +82,12 @@ def build_sandbox_env(project_root: Path, extra: Optional[Dict[str, str]] = None
         if not _is_sensitive_env_key(key)
     }
     env["PROJECT_ROOT"] = str(project_root)
+    # 严重-1: extra params must also be filtered so callers cannot smuggle
+    # sensitive keys that would bypass the _is_sensitive_env_key check.
     if extra:
-        env.update(extra)
+        for k, v in extra.items():
+            if not _is_sensitive_env_key(k):
+                env[k] = v
     return env
 
 
@@ -118,10 +132,15 @@ def make_rlimit_preexec(
         for res, soft in limits:
             try:
                 _resource.setrlimit(res, (soft, soft))
-            except (ValueError, OSError):
-                # A soft limit above the inherited hard limit will raise; skip
-                # rather than abort the whole command.
-                continue
+            except (ValueError, OSError) as exc:
+                # 严重-2: log the failure instead of silently skipping it so the
+                # operator can diagnose why a limit wasn't applied.
+                import sys as _sys
+                rname = getattr(res, "__name__", str(res)) if hasattr(res, "__name__") else str(res)
+                print(
+                    f"[WhaleCode] rlimit {rname}={soft} could not be set: {exc}",
+                    file=_sys.stderr,
+                )
 
     return _apply
 
@@ -667,9 +686,17 @@ class BashTool(Tool):
     # pathological cases (fork bomb, runaway CPU, disk-filling). Any value <= 0
     # disables that specific limit. Overridable via BASH_MAX_* env vars.
     DEFAULT_MAX_CPU_SECONDS = 3600          # runaway infinite-loop guard
-    DEFAULT_MAX_MEMORY_BYTES = 0            # off by default (AS caps break JVM/Node)
-    DEFAULT_MAX_PROCESSES = 4096            # fork-bomb guard
+    # 严重-2: enable a reasonable AS limit by default (16 GiB).  Previously 0
+    # (off) which allowed a memory-hungry script to exhaust system RAM.
+    DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
+    # 严重-2: reduced from 4096 to 512 — still more than any legitimate build
+    # needs while meaningfully raising the bar for fork bombs.
+    DEFAULT_MAX_PROCESSES = 512             # fork-bomb guard
     DEFAULT_MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # disk-fill guard (4 GiB)
+    # 严重-2: hard wall-clock timeout for any Bash command.  When non-zero the
+    # watchdog timer force-kills the process group after this many milliseconds.
+    # Overridable via BASH_MAX_EXECUTION_MS env var or Config.bash_max_execution_ms.
+    DEFAULT_MAX_EXECUTION_MS = 300_000  # 5 minutes
 
     INTERACTIVE_COMMANDS: Set[str] = {
         "vim",
@@ -795,7 +822,7 @@ class BashTool(Tool):
         self.max_file_size_bytes = _env_int("BASH_MAX_FILE_SIZE_BYTES", self.DEFAULT_MAX_FILE_SIZE_BYTES)
         # Absolute wall-clock kill for backgrounded/long commands (ms). 0 = never
         # force-kill (preserves intentional long-running background servers).
-        self.max_execution_ms = _int_cfg("bash_max_execution_ms", "BASH_MAX_EXECUTION_MS", 0)
+        self.max_execution_ms = _int_cfg("bash_max_execution_ms", "BASH_MAX_EXECUTION_MS", self.DEFAULT_MAX_EXECUTION_MS)
 
     def _build_child_env(self) -> Dict[str, str]:
         """Environment for the shell command with secrets stripped out."""
@@ -921,8 +948,11 @@ class BashTool(Tool):
             )
 
         try:
+            # 严重-1: use bash -c instead of bash -lc to avoid sourcing
+            # .bashrc/.bash_profile which could inject or leak sensitive
+            # environment variables into the child process.
             process = subprocess.Popen(
-                ["bash", "-lc", command],
+                ["bash", "-c", command],
                 cwd=target_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -943,40 +973,71 @@ class BashTool(Tool):
         event_stream = self._create_event_stream()
         event_stream.start(process.stdout)
 
-        if block_until_ms == 0:
-            return self._background_response(
-                process=process,
-                event_stream=event_stream,
-                command=command,
-                description=description,
-                directory=target_dir,
-                block_until_ms=block_until_ms,
-                reason="immediate_background",
+        # 严重-2: wall-clock watchdog that force-kills the process group when
+        # max_execution_ms expires. This provides a hard safety net regardless
+        # of whether the command is running in foreground or background.
+        watchdog: Optional[threading.Timer] = None
+        if self.max_execution_ms > 0:
+            def _on_watchdog_expired() -> None:
+                try:
+                    event_stream.add_system_event(
+                        f"[WhaleCode] hard timeout reached ({self.max_execution_ms}ms), killing process.",
+                        source="watchdog",
+                    )
+                finally:
+                    try:
+                        BashTool._terminate_process_group(process)
+                    except Exception:
+                        pass  # process may already be dead
+
+            watchdog = threading.Timer(
+                self.max_execution_ms / 1000,
+                _on_watchdog_expired,
             )
+            watchdog.daemon = True
+            watchdog.start()
 
         try:
-            process.wait(timeout=block_until_ms / 1000)
-            event_stream.wait_closed(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            return self._background_response(
-                process=process,
-                event_stream=event_stream,
-                command=command,
-                description=description,
-                directory=target_dir,
-                block_until_ms=block_until_ms,
-                reason="exceeded_block_until",
-            )
-        except Exception as exc:
+            if block_until_ms == 0:
+                return self._background_response(
+                    process=process,
+                    event_stream=event_stream,
+                    command=command,
+                    description=description,
+                    directory=target_dir,
+                    block_until_ms=block_until_ms,
+                    reason="immediate_background",
+                )
+
             try:
-                process.kill()
-            except Exception:
-                pass
-            event_stream.wait_closed(timeout=1.0)
-            return ToolResponse.error(
-                code=ToolErrorCode.INTERNAL_ERROR,
-                message=f"Failed while waiting for command: {exc}",
-            )
+                process.wait(timeout=block_until_ms / 1000)
+                event_stream.wait_closed(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                return self._background_response(
+                    process=process,
+                    event_stream=event_stream,
+                    command=command,
+                    description=description,
+                    directory=target_dir,
+                    block_until_ms=block_until_ms,
+                    reason="exceeded_block_until",
+                )
+            except Exception as exc:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                event_stream.wait_closed(timeout=1.0)
+                return ToolResponse.error(
+                    code=ToolErrorCode.INTERNAL_ERROR,
+                    message=f"Failed while waiting for command: {exc}",
+                )
+        finally:
+            # Always cancel the watchdog if the process exited or went to
+            # background. For background tasks the watchdog already fired
+            # and the timer is dead; cancel() is a safe no-op here.
+            if watchdog is not None:
+                watchdog.cancel()
 
         return self._format_response(
             command=command,

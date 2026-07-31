@@ -74,12 +74,15 @@ profile = "black"
 multi_line_output = 3
 line_length = 88
 
+[tool.coverage.run]
+source = ["code"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short --cov --cov-report=term-missing"
 markers = [
     "integration: tests that require the real SWEV dataset on disk",
 ]

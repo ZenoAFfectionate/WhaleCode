@@ -7,6 +7,7 @@ and should not block the critical path.
 
 from __future__ import annotations
 
+import json as _json
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -140,14 +141,37 @@ class TokenCounter:
         return sum(self.count_message(message) for message in messages)
 
     def count_message(self, message: Message) -> int:
-        """Calculate the token count for one message, including role overhead."""
-        cache_key = f"{message.role}:{message.content}"
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
+        """Calculate the token count for one message, including role overhead.
 
-        tokens = self._count_text(message.content) + 4
-        self._cache.put(cache_key, tokens)
+        重要-7: assistant 工具调用消息的真实负载在 metadata.tool_calls 中的
+        arguments 里（例如 Write 会把整份文件塞进 arguments）。不计会低估 prompt
+        规模，导致压缩决策偏晚，下一次请求可能超窗。
+        含 tool_calls 的消息不缓存（arguments 差异大，命中率低）。
+        """
+        content_tokens = self._count_text(message.content)
+        tool_calls = (message.metadata or {}).get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            cache_key = f"{message.role}:{message.content}"
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+            tokens = content_tokens + 4
+            self._cache.put(cache_key, tokens)
+            return tokens
+
+        # tool_calls 消息：content + 每个 tool_call 的 name + arguments
+        tokens = content_tokens + 4
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name", ""))
+            tokens += self._count_text(name) + 4
+            arguments = tc.get("arguments", {})
+            if isinstance(arguments, dict):
+                arguments = _json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            elif not isinstance(arguments, str):
+                arguments = str(arguments)
+            tokens += self._count_text(arguments or "") + 4
         return tokens
 
     def count_text(self, text: str) -> int:

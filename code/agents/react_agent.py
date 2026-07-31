@@ -1,6 +1,8 @@
 """ReAct agent built on top of tool-calling chat models."""
 
+import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -1261,44 +1263,94 @@ class ReActAgent(Agent):
         current_step: int,
         structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> List[tuple]:
-        results: List[tuple] = []
+        """Execute tool calls with parallelism for independent tools.
+
+        Phases:
+        1. Decode all tool calls + emit pre-execution trace/render events (sequential).
+        2. Execute all valid tools in parallel via ThreadPoolExecutor.
+        3. Record results in original tool_calls order (sequential).
+        """
         invalid_finalizing_calls = self._invalid_finalizing_tool_calls(
             tool_calls,
             structured_output=structured_output,
         )
 
-        for tool_call in tool_calls:
+        # results[i] corresponds to tool_calls[i]
+        results: List[Any] = [None] * len(tool_calls)
+        # Tools that need parallel execution: (idx, tool_name, tool_call_id, arguments)
+        to_execute: List[tuple] = []
+
+        # ---- Phase 1: Decode + pre-execution events (sequential) ----
+        for i, tool_call in enumerate(tool_calls):
             tool_name = tool_call.function.name
             tool_call_id = tool_call.id
 
             usage_error = invalid_finalizing_calls.get(tool_call_id)
             if usage_error is not None:
-                results.append(
-                    self._tool_error_result(
-                        tool_name,
-                        tool_call_id,
-                        f"Error: {usage_error}",
-                        step=current_step,
-                    )
+                results[i] = self._tool_error_result(
+                    tool_name,
+                    tool_call_id,
+                    f"Error: {usage_error}",
+                    step=current_step,
                 )
                 continue
 
             tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tool_call)
             if error_content is not None:
-                results.append(
-                    self._tool_error_result(tool_name, tool_call_id, error_content, step=current_step)
+                results[i] = self._tool_error_result(
+                    tool_name, tool_call_id, error_content, step=current_step,
                 )
                 continue
 
-            results.append(
-                self._execute_one_tool_call(
-                    tool_name,
-                    tool_call_id,
-                    arguments,
-                    current_step=current_step,
+            # Pre-execution trace + render (fire-and-forget, safe to do here)
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+
+            is_structured = self._is_structured_output_tool_name(
+                tool_name, structured_output,
+            )
+            if not self._is_builtin_tool_name(tool_name) and not is_structured:
+                self._render_tool_call(
+                    tool_name, arguments, tool_call_id=tool_call_id, step=current_step,
+                )
+
+            if is_structured:
+                # Structured output is instant — execute and record inline
+                exec_result = self._build_structured_output_result(arguments)
+                results[i] = self._record_tool_execution_result(
+                    tool_name, tool_call_id, exec_result,
+                    step=current_step,
                     structured_output=structured_output,
                 )
-            )
+            else:
+                to_execute.append((i, tool_name, tool_call_id, arguments))
+
+        # ---- Phase 2: Execute in parallel (ThreadPoolExecutor) ----
+        if to_execute:
+            raw_conc = getattr(self.config, 'max_concurrent_tools', 3)
+            max_conc = max(1, int(raw_conc) if raw_conc else 1)
+            future_to_meta: Dict[Any, tuple] = {}
+
+            with ThreadPoolExecutor(max_workers=max_conc) as executor:
+                for idx, tool_name, tool_call_id, arguments in to_execute:
+                    future = executor.submit(
+                        self._execute_tool_call_result, tool_name, arguments,
+                    )
+                    future_to_meta[future] = (idx, tool_name, tool_call_id)
+
+                # Collect results keyed by original index
+                executed: Dict[int, tuple] = {}
+                for future in as_completed(future_to_meta):
+                    idx, tool_name, tool_call_id = future_to_meta[future]
+                    executed[idx] = (tool_name, tool_call_id, future.result())
+
+            # ---- Phase 3: Record results in original order (sequential) ----
+            for idx in sorted(executed):
+                tool_name, tool_call_id, exec_result = executed[idx]
+                results[idx] = self._record_tool_execution_result(
+                    tool_name, tool_call_id, exec_result,
+                    step=current_step,
+                    structured_output=structured_output,
+                )
 
         return results
 
@@ -1620,45 +1672,89 @@ class ReActAgent(Agent):
         on_tool_call: LifecycleHook = None,
         structured_output: Optional[_StructuredOutputSpec] = None,
     ) -> List[tuple]:
-        results: List[tuple] = []
+        """Execute tool calls with parallelism for independent tools (async).
+
+        Phases:
+        1. Decode all tool calls + emit pre-execution trace/render events (sequential).
+        2. Execute all valid tools in parallel via asyncio.gather + Semaphore.
+        3. Record results in original tool_calls order (sequential).
+        """
         invalid_finalizing_calls = self._invalid_finalizing_tool_calls(
             tool_calls,
             structured_output=structured_output,
         )
 
-        for tool_call in tool_calls:
+        # results[i] corresponds to tool_calls[i]
+        results: List[Any] = [None] * len(tool_calls)
+        # Tools that need parallel execution: (idx, tool_name, tool_call_id, arguments, is_structured)
+        pending: List[tuple] = []
+
+        # ---- Phase 1: Decode + pre-execution events (sequential) ----
+        for i, tool_call in enumerate(tool_calls):
             tool_name = tool_call.function.name
             tool_call_id = tool_call.id
 
             usage_error = invalid_finalizing_calls.get(tool_call_id)
             if usage_error is not None:
-                results.append(
-                    self._tool_error_result(
-                        tool_name,
-                        tool_call_id,
-                        f"Error: {usage_error}",
-                        step=current_step,
-                    )
+                results[i] = self._tool_error_result(
+                    tool_name,
+                    tool_call_id,
+                    f"Error: {usage_error}",
+                    step=current_step,
                 )
                 continue
 
             tool_name, tool_call_id, arguments, error_content = self._decode_tool_call(tool_call)
             if error_content is not None:
-                results.append(
-                    self._tool_error_result(tool_name, tool_call_id, error_content, step=current_step)
+                results[i] = self._tool_error_result(
+                    tool_name, tool_call_id, error_content, step=current_step,
                 )
                 continue
 
-            results.append(
-                await self._aexecute_one_tool_call(
-                    tool_name,
-                    tool_call_id,
-                    arguments,
-                    current_step=current_step,
-                    on_tool_call=on_tool_call,
+            # Pre-execution trace + emit + render (fire-and-forget, safe here)
+            self._trace_tool_call(tool_name, tool_call_id, arguments, step=current_step)
+            await self._emit_tool_call_event(
+                on_tool_call, tool_name, tool_call_id, arguments, current_step,
+            )
+
+            is_structured = self._is_structured_output_tool_name(
+                tool_name, structured_output,
+            )
+            if not self._is_builtin_tool_name(tool_name) and not is_structured:
+                self._render_tool_call(
+                    tool_name, arguments, tool_call_id=tool_call_id, step=current_step,
+                )
+
+            pending.append((i, tool_name, tool_call_id, arguments, is_structured))
+
+        # ---- Phase 2: Execute all in parallel (asyncio.gather + Semaphore) ----
+        if pending:
+            raw_conc = getattr(self.config, 'max_concurrent_tools', 3)
+            max_conc = max(1, int(raw_conc) if raw_conc else 1)
+            sem = asyncio.Semaphore(max_conc)
+
+            async def _execute_one(idx, tool_name, tool_call_id, arguments, is_structured):
+                async with sem:
+                    if is_structured:
+                        exec_result = self._build_structured_output_result(arguments)
+                    else:
+                        exec_result = await self._aexecute_tool_call_result(
+                            tool_name, arguments,
+                        )
+                    return (idx, tool_name, tool_call_id, exec_result)
+
+            executed = await asyncio.gather(*[
+                _execute_one(idx, tn, tcid, args, is_struct)
+                for idx, tn, tcid, args, is_struct in pending
+            ])
+
+            # ---- Phase 3: Record results in original order (sequential) ----
+            for idx, tool_name, tool_call_id, exec_result in executed:
+                results[idx] = self._record_tool_execution_result(
+                    tool_name, tool_call_id, exec_result,
+                    step=current_step,
                     structured_output=structured_output,
                 )
-            )
 
         return results
 

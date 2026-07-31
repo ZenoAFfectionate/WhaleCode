@@ -108,11 +108,7 @@ Please focus on solving the current step and output the final answer for that st
         self.max_tool_iterations = max_tool_iterations
         # 重要-10: build tool schemas once instead of instantiating a full
         # SimpleAgent (TokenCounter + HistoryManager + TraceLogger + SkillLoader
-        # + TodoWrite registration) on every single plan step.
-        self._tool_schemas = build_tool_schemas(tool_registry) if self.enable_tool_calling else []
-        # 重要-10: build tool schemas once instead of instantiating a full
-        # SimpleAgent (with TokenCounter/HistoryManager/TraceLogger/SkillLoader/
-        # SessionStore and a TodoWrite registration) on every single step.
+        # + SessionStore + TodoWrite registration) on every single plan step.
         self._tool_schemas = build_tool_schemas(tool_registry) if self.enable_tool_calling else []
 
     def execute(self, question: str, plan: List[str], **kwargs) -> str:

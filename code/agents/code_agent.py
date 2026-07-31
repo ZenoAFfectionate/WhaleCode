@@ -167,6 +167,28 @@ class CodeAgent(ReActAgent):
         if enable_task_tool and self.config.todowrite_enabled and self.tool_registry.get_tool("TodoWrite") is None:
             self._register_todowrite_tool()
 
+        # LSP tools — always available (graceful degradation when server absent)
+        from ..tools.lsp import (
+            LSPDefinitionTool,
+            LSPDiagnosticsTool,
+            LSPHoverTool,
+            LSPReferencesTool,
+            LSPManager,
+        )
+        manager = LSPManager(self.project_root)
+        self.tool_registry.register_tool(
+            LSPDefinitionTool(workspace_root=str(self.project_root), manager=manager)
+        )
+        self.tool_registry.register_tool(
+            LSPReferencesTool(workspace_root=str(self.project_root), manager=manager)
+        )
+        self.tool_registry.register_tool(
+            LSPHoverTool(workspace_root=str(self.project_root), manager=manager)
+        )
+        self.tool_registry.register_tool(
+            LSPDiagnosticsTool(workspace_root=str(self.project_root), manager=manager)
+        )
+
     def set_working_dir(self, working_dir: str) -> None:
         """Update the agent and file tools to a new working directory."""
         new_working_dir = Path(working_dir).expanduser().resolve()

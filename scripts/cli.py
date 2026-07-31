@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import selectors
 import shutil
@@ -27,6 +28,7 @@ try:
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.rule import Rule
+    from rich.syntax import Syntax
     from rich.table import Table
     from rich.text import Text
     from rich.theme import Theme
@@ -34,6 +36,7 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     Align = Console = Markdown = Panel = Rule = Table = Text = Theme = None
+    Syntax = None
     HEAVY = ROUNDED = None
     RICH_AVAILABLE = False
 
@@ -54,6 +57,9 @@ class Palette:
     ERROR = "#ef4444"        # errors
     MUTED = "#64748b"        # metadata (elapsed, sizes, paths)
     TEXT = "#f1f5f9"         # body text
+    # Pygments theme for fenced code blocks and diff highlighting; chosen to
+    # stay legible on the deep-navy panel background.
+    CODE_THEME = "monokai"
 
 
 # A Rich theme built from the same palette so markup can use semantic names
@@ -88,6 +94,29 @@ try:
 except ImportError:
     PromptSession = HTML = FileHistory = KeyBindings = Keys = PromptStyle = None
     PROMPT_TOOLKIT_AVAILABLE = False
+
+
+# Tools whose output is typically a unified diff — used to pick the diff lexer.
+_DIFF_OUTPUT_TOOLS = {"Edit", "MultiEdit", "Write", "GitDiff"}
+
+
+def _guess_output_lexer(tool_name: str, raw: str) -> Optional[str]:
+    """Guess a Rich lexer for a tool-result body (None → render as plain text).
+
+    Deliberately conservative: only unified-diff content is highlighted, since
+    regular tool output (logs, grep hits, numbered file reads) has no reliable
+    grammar and a wrong lexer looks worse than no highlighting. Module-level
+    pure function so it can be unit-tested without a console.
+    """
+    if not raw:
+        return None
+    sample = raw[:4000]
+    has_hunk = "@@" in sample and ("--- " in sample or "+++ " in sample)
+    if tool_name in _DIFF_OUTPUT_TOOLS and ("diff --git" in sample or has_hunk):
+        return "diff"
+    if "diff --git" in sample:
+        return "diff"
+    return None
 
 
 TODO_MUTATING_ACTIONS = {"create", "update", "bulk_create", "delete"}
@@ -263,6 +292,45 @@ class CLIUI:
         self.console = (
             Console(record=True, theme=WHALE_THEME) if self.use_rich else None
         )
+        # Active rich.status.Status while a turn spinner runs (None otherwise).
+        self._live_status = None
+
+    @property
+    def _spinner_ok(self) -> bool:
+        """Animated spinner only makes sense on a real Rich terminal."""
+        return bool(self.use_rich and self.console is not None and self.console.is_terminal)
+
+    def turn_spinner(self, message: str = "Thinking..."):
+        """Context manager: animated spinner while the agent works.
+
+        Rich renders concurrent ``console.print`` output (from the agent
+        thread) above the live region, so event rendering keeps working while
+        the spinner animates. ``ui.status()`` routes its text into the spinner
+        for the duration. Falls back to a no-op in plain/non-TTY mode.
+        """
+        ui = self
+
+        class _SpinnerCtx:
+            def __enter__(self):
+                if not ui._spinner_ok:
+                    return None
+                status = ui.console.status(
+                    f"[dim cyan]{message}[/dim cyan]",
+                    spinner="dots",
+                    spinner_style=Palette.CYAN,
+                )
+                status.__enter__()
+                ui._live_status = status
+                return status
+
+            def __exit__(self, *exc_info):
+                if ui._live_status is not None:
+                    status = ui._live_status
+                    ui._live_status = None
+                    status.__exit__(*exc_info)
+                return False
+
+        return _SpinnerCtx()
 
     def spacer(self, n: int = 1) -> None:
         """Emit *n* blank lines to keep a consistent vertical rhythm (VR-5)."""
@@ -553,7 +621,7 @@ class CLIUI:
             self.spacer(1)
             self.console.print(
                 Panel(
-                    Markdown(text),
+                    Markdown(text, code_theme=Palette.CODE_THEME),
                     title="Whale ▸ Assistant",
                     title_align="left",
                     border_style=Palette.ACCENT,
@@ -719,7 +787,15 @@ class CLIUI:
             tail += f" · {meta}"
         subtitle.append(tail, style=Palette.MUTED)
 
-        card_body = Text(body if body else "(no output)", style=Palette.MUTED)
+        # Syntax-highlight unified-diff bodies (Edit/Write/GitDiff results);
+        # everything else stays plain muted text (see _guess_output_lexer).
+        body_lexer = _guess_output_lexer(tool_name, body) if body else None
+        if body_lexer and Syntax is not None:
+            card_body = Syntax(
+                body, body_lexer, theme=Palette.CODE_THEME, word_wrap=True,
+            )
+        else:
+            card_body = Text(body if body else "(no output)", style=Palette.MUTED)
         self.spacer(1)
         self.console.print(
             Panel(
@@ -736,7 +812,17 @@ class CLIUI:
         )
 
     def status(self, message: str) -> None:
-        """Render a compact current-phase hint."""
+        """Render a compact current-phase hint.
+
+        While a turn spinner is active the hint updates the spinner line
+        instead of printing a new line each time (no scroll spam).
+        """
+        if self._live_status is not None:
+            try:
+                self._live_status.update(f"[dim cyan]{message}[/dim cyan]")
+                return
+            except Exception:
+                pass  # fall through to a plain status line
         if self.use_rich:
             self.console.print(f"[dim cyan]{message}[/dim cyan]")
         else:
@@ -1724,10 +1810,12 @@ def run_agent_turn(
     thread = threading.Thread(target=_agent_work, daemon=True)
     thread.start()
 
-    if input_buffer is not None and sys.stdin.isatty():
-        _collect_buffered_input(thread, input_buffer, ui)
-    else:
-        thread.join()
+    # Animated spinner (rich TTY only); agent events retitle it via ui.status().
+    with ui.turn_spinner("Thinking..."):
+        if input_buffer is not None and sys.stdin.isatty():
+            _collect_buffered_input(thread, input_buffer, ui)
+        else:
+            thread.join()
 
     if error_holder[0] is not None:
         raise error_holder[0]
@@ -1747,29 +1835,295 @@ def run_agent_turn(
     return response
 
 
+# Single source of truth for slash commands: drives both /help output and
+# the prompt_toolkit completer, so they can never drift apart.
+SLASH_COMMANDS: tuple = (
+    ("/help", "Show this help message"),
+    ("/info", "Show workspace, model, and runtime info"),
+    ("/tools", "Show registered tools grouped by category (--full for schemas)"),
+    ("/pwd", "Show the current working directory"),
+    ("/cd", "Change the agent working directory within the workspace: /cd <path>"),
+    ("/history", "Show recent conversation turns; /history --events [n] for structured events"),
+    ("/trace", "Show the structured event timeline: /trace [n]"),
+    ("/log", "View all terminal output in a scrollable pager"),
+    ("/clear", "Clear in-memory conversation history"),
+    ("/save", "Save a session snapshot: /save [name]"),
+    ("/resume", "Load a saved session: /resume [path|name] (default: session-latest)"),
+    ("/sessions", "List saved sessions"),
+    ("/compact", "Compact conversation context: /compact [focus]"),
+    ("/review", "Code review: (none)=working diff, --staged, <files...>, <pr_url|#num>, --focus <dim>"),
+    ("/orchestra", "Multi-agent run: /orchestra [--parallel|--pipeline] [--confirm] <task>"),
+)
+
+
 def print_help(ui: CLIUI) -> None:
-    lines = [
-        "Commands:",
-        "- /help                 Show this help message",
-        "- /info                 Show workspace, model, and runtime info",
-        "- /tools [--full]       Show registered tools grouped by category (--full for schemas)",
-        "- /pwd                  Show the current working directory",
-        "- /cd <path>            Change the agent working directory within the workspace",
-        "- /history [n]          Show recent conversation turns",
-        "- /history --events [n] Show recent structured step/tool/model events",
-        "- /trace [n]            Show the structured event timeline",
-        "- /log                  View all terminal output in a scrollable pager",
-        "- /clear                Clear in-memory conversation history",
-        "- /save [name]          Save a session snapshot into the session directory",
-        "- /resume [path|name]   Load a saved session (default: session-latest)",
-        "- /sessions             List saved sessions",
-        "- /compact [focus]      Compact conversation context",
-        "- exit                  Exit the CLI",
-    ]
+    width = max(len(name) for name, _ in SLASH_COMMANDS) + 2
+    lines = ["Commands:"]
+    lines += [f"- {name:<{width}} {desc}" for name, desc in SLASH_COMMANDS]
+    lines.append(f"- {'exit':<{width}} Exit the CLI")
     if ui.use_rich:
         ui.console.print(Panel("\n".join(lines), title="Help", border_style="cyan", width=ui.console.width))
     else:
         print("\n".join(lines))
+
+
+if PROMPT_TOOLKIT_AVAILABLE:
+    from prompt_toolkit.completion import Completer, Completion, PathCompleter
+    from prompt_toolkit.document import Document as _PromptDocument
+
+    class WhaleCompleter(Completer):
+        """Context-aware completion for the interactive prompt.
+
+        - ``/…`` at line start  → slash command names (with descriptions)
+        - ``/cd <arg>``         → directories only
+        - ``/review <arg>``     → filesystem paths
+        - ``/resume <arg>``     → saved session names (via *get_sessions*)
+        Anything else (natural-language prompts) is left untouched.
+        """
+
+        _DIR_COMMANDS = ("/cd",)
+        _PATH_COMMANDS = ("/review",)
+        _SESSION_COMMANDS = ("/resume",)
+
+        def __init__(self, get_sessions=None, commands=SLASH_COMMANDS):
+            self._commands = commands
+            self._get_sessions = get_sessions
+            self._dir_completer = PathCompleter(only_directories=True, expanduser=True)
+            self._file_completer = PathCompleter(expanduser=True)
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            stripped = text.lstrip()
+            if not stripped:
+                return
+
+            first, _, rest = stripped.partition(" ")
+            if " " not in stripped:
+                # Completing the command word itself (only for slash input).
+                if first.startswith("/"):
+                    for name, desc in self._commands:
+                        if name.startswith(first):
+                            yield Completion(
+                                name, start_position=-len(first),
+                                display=name, display_meta=desc,
+                            )
+                return
+
+            cmd = first.lower()
+            arg_text = rest
+            sub_doc = _PromptDocument(arg_text, cursor_position=len(arg_text))
+            if cmd in self._DIR_COMMANDS:
+                yield from self._dir_completer.get_completions(sub_doc, complete_event)
+            elif cmd in self._PATH_COMMANDS:
+                yield from self._file_completer.get_completions(sub_doc, complete_event)
+            elif cmd in self._SESSION_COMMANDS and self._get_sessions is not None:
+                word = arg_text.split()[-1] if arg_text.split() else ""
+                try:
+                    sessions = self._get_sessions() or []
+                except Exception:
+                    sessions = []
+                for name in sessions:
+                    if name.startswith(word):
+                        yield Completion(
+                            name, start_position=-len(word),
+                            display=name, display_meta="session",
+                        )
+
+
+# ── /review & /orchestra: 参数解析与渲染 (模块级纯函数, 便于单测) ──
+
+
+def _parse_review_args(raw: str) -> dict:
+    """Parse `/review` args → {"focus": str|None, "staged": bool, "targets": [str]}.
+
+    /review                          → targets=[] → working diff
+    /review --staged                 → staged diff
+    /review --focus security a.py    → focus + files
+    /review <pr_url|#num>            → PR review
+    """
+    parts = raw.split()
+    focus: Optional[str] = None
+    staged = False
+    targets: list[str] = []
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        if tok == "--focus" and i + 1 < len(parts):
+            focus = parts[i + 1]
+            i += 2
+        elif tok == "--focus":  # 无参数值: 忽略, 不落入 targets
+            i += 1
+        elif tok == "--full":
+            focus = None
+            i += 1
+        elif tok == "--staged":
+            staged = True
+            i += 1
+        else:
+            targets.append(tok)
+            i += 1
+    return {"focus": focus, "staged": staged, "targets": targets}
+
+
+def _parse_orchestra_args(raw: str):
+    """Parse `/orchestra` args → (mode, confirm, task). Flags may appear in any order."""
+    from hello_agents.agents.orchestra import ExecutionMode
+
+    parts = raw.split(maxsplit=1)
+    task = parts[1].strip() if len(parts) > 1 else ""
+    mode = ExecutionMode.HYBRID
+    confirm = False
+    progressed = True
+    while progressed and task:
+        progressed = False
+        for prefix, m in (("--parallel", ExecutionMode.PARALLEL), ("--pipeline", ExecutionMode.PIPELINE)):
+            if task == prefix or task.startswith(prefix + " "):
+                mode = m
+                task = task[len(prefix):].strip()
+                progressed = True
+        if task == "--confirm" or task.startswith("--confirm "):
+            confirm = True
+            task = task[len("--confirm"):].strip()
+            progressed = True
+    return mode, confirm, task
+
+
+_REVIEW_SEVERITY_STYLE = {
+    "critical": "bold red",
+    "high": "red",
+    "medium": "yellow",
+    "low": "dim",
+    "info": "dim cyan",
+}
+
+
+def _render_review_report(ui: CLIUI, report) -> None:
+    """Render a ReviewReport; plain mode falls back to markdown text."""
+    if getattr(report, "error", None) and not report.findings:
+        ui.warning(report.summary)
+        return
+    if not report.findings:
+        ui.success(report.summary or "No issues found.")
+        return
+    if not ui.use_rich:
+        ui.print(report.to_markdown())
+        return
+
+    ui.console.print(
+        Panel(report.summary or "(no summary)", title="Whale ▸ Review Report", border_style="cyan")
+    )
+    if report.score:
+        score_text = "\n".join(
+            f"  {cat}: {'█' * (s // 2)}{'░' * (5 - s // 2)} {s}/10"
+            for cat, s in report.score.items()
+        )
+        ui.console.print(Panel(score_text, title="Scores", border_style="cyan"))
+    for sev in ("critical", "high", "medium", "low", "info"):
+        style = _REVIEW_SEVERITY_STYLE[sev]
+        for f in [x for x in report.findings if x.severity == sev]:
+            loc = f.file + (f":{f.line}" if f.line else "")
+            ui.console.print(
+                Panel(
+                    f"[bold]{f.title}[/bold]\n"
+                    f"Category: {f.category}  |  File: {loc}\n\n"
+                    f"{f.description}\n\n"
+                    f"[dim]Suggestion: {f.suggestion}[/dim]",
+                    title=f"[{style}]{sev.upper()}[/{style}]",
+                    border_style=style.split()[-1],
+                )
+            )
+    if report.recommendations:
+        rec_text = "\n".join(f"{i}. {r}" for i, r in enumerate(report.recommendations, 1))
+        ui.console.print(Panel(rec_text, title="Recommendations", border_style="green"))
+
+
+def _render_orchestra_plan(ui: CLIUI, plan) -> None:
+    """Render an ExecutionPlan (stages + subtasks) for user review.
+
+    Rich mode draws a bordered table with a role column (SubAgent 身份一眼可辨);
+    plain mode keeps the simple indented text layout.
+    """
+    if ui.use_rich and Table is not None:
+        stage_of = {sid: idx for idx, stage in enumerate(plan.stages, 1) for sid in stage}
+        table = Table(
+            title=f"Whale ▸ Execution Plan — {plan.mode.value} mode · {len(plan.subtasks)} subtasks",
+            title_justify="left",
+            box=ROUNDED,
+            border_style=Palette.BORDER_DIM,
+            header_style=f"bold {Palette.CYAN}",
+            expand=True,
+        )
+        table.add_column("#", style=Palette.MUTED, width=3, justify="right")
+        table.add_column("Role", style=f"bold {Palette.THINKING}", no_wrap=True)
+        table.add_column("Subtask", style=Palette.CYAN, no_wrap=True)
+        if plan.stages:
+            table.add_column("Stage", style=Palette.MUTED, width=5, justify="center")
+        table.add_column("Description", style=Palette.TEXT, overflow="fold")
+        for idx, st in enumerate(plan.subtasks, 1):
+            row = [str(idx), str(st.role), str(st.id)]
+            if plan.stages:
+                row.append(str(stage_of.get(st.id, "·")))
+            row.append(str(st.description))
+            table.add_row(*row)
+        ui.spacer(1)
+        ui.console.print(table)
+        return
+
+    lines = [f"Mode: {plan.mode.value}", ""]
+    if plan.stages:
+        for idx, stage in enumerate(plan.stages, 1):
+            lines.append(f"Stage {idx}:")
+            for st in plan.subtasks:
+                if st.id in stage:
+                    lines.append(f"  - [{st.role}] {st.id}: {st.description}")
+    else:
+        for st in plan.subtasks:
+            lines.append(f"  - [{st.role}] {st.id}: {st.description}")
+    ui.print("\n".join(lines))
+
+
+def _render_subtask_start(ui: CLIUI, st, index: Optional[int] = None, total: Optional[int] = None) -> None:
+    """One compact line announcing a sub-agent starting its subtask."""
+    tag = f"[{index}/{total}] " if index and total else ""
+    msg = f"⎇ {tag}[{st.role}] {st.id} — {st.description}"
+    if ui.use_rich:
+        # Text (not markup): the "[role]"/"[i/n]" brackets must not be parsed
+        # as Rich style tags.
+        ui.console.print(Text(msg, style=Palette.THINKING))
+    else:
+        ui.status(msg)
+
+
+def _render_subtask_finish(ui: CLIUI, st, result, elapsed: float = 0.0) -> None:
+    """Render a finished subtask as a compact card with an output preview.
+
+    Mirrors the tool-card visual language (status marker + elapsed + preview)
+    so SubAgent results read as first-class citizens of the transcript.
+    """
+    secs = result.metadata.get("duration_seconds", None)
+    try:
+        secs = float(secs) if secs is not None else float(elapsed)
+    except (TypeError, ValueError):
+        secs = float(elapsed or 0.0)
+    preview_source = str(getattr(result, "summary", "") or getattr(result, "full_result", "") or "")
+    preview_lines = [ln for ln in preview_source.strip().splitlines() if ln.strip()][:4]
+    preview = "\n".join(preview_lines)
+    if len(preview) > 300:
+        preview = preview[:297] + "..."
+    if ui.use_rich and hasattr(ui, "render_tool_card"):
+        ui.render_tool_card(
+            f"⎇ [{st.role}] {st.id}",
+            "",
+            is_error=not result.success,
+            elapsed=secs,
+            meta="subagent",
+            body=preview or "(no output)",
+        )
+    else:
+        marker = "✓" if result.success else "✗"
+        ui.info(f"{marker} [{st.role}] {st.id} ({secs:.1f}s)")
+        if preview:
+            ui.print(preview)
 
 
 def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
@@ -1825,7 +2179,7 @@ def _input_style_tokens() -> dict:
     }
 
 
-def build_prompt_reader(history_file: Path, status_provider=None):
+def build_prompt_reader(history_file: Path, status_provider=None, session_lister=None):
     if PROMPT_TOOLKIT_AVAILABLE and sys.stdin.isatty():
         from prompt_toolkit.filters import in_paste_mode
 
@@ -1878,8 +2232,10 @@ def build_prompt_reader(history_file: Path, status_provider=None):
             mouse_support=False,
             key_bindings=bindings,
             bottom_toolbar=_bottom_toolbar,
+            completer=WhaleCompleter(get_sessions=session_lister),
+            complete_while_typing=True,
             placeholder=HTML(
-                "<placeholder>输入需求，Enter 发送 · Esc+Enter 换行 · /help 查看命令</placeholder>"
+                "<placeholder>输入需求，Enter 发送 · Esc+Enter 换行 · Tab 补全 · /help 查看命令</placeholder>"
             ),
             prompt_continuation=lambda width, line_number, wrap_count: " " * width,
         )
@@ -1921,7 +2277,19 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             pass
         return f"{model}  ·  reasoning:{mode}  ·  {wd}"
 
-    read_prompt = build_prompt_reader(history_file, status_provider=_prompt_status)
+    def _session_lister() -> list:
+        store = getattr(agent, "session_store", None)
+        session_dir = getattr(store, "session_dir", None) if store else None
+        if not session_dir:
+            return []
+        try:
+            return sorted(p.stem for p in Path(session_dir).glob("*.json"))
+        except Exception:
+            return []
+
+    read_prompt = build_prompt_reader(
+        history_file, status_provider=_prompt_status, session_lister=_session_lister
+    )
 
     input_buffer = InputBuffer()
 
@@ -2048,6 +2416,94 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         except Exception as exc:
             ui.error(f"Compact failed: {exc}")
 
+    def _cmd_review(raw, lowered):
+        if not getattr(agent.config, "orchestra_enabled", True):
+            ui.warning("Orchestra/review features are disabled (orchestra_enabled=False).")
+            return
+        from hello_agents.agents.review_agent import review_staged_diff, review_working_diff
+        from hello_agents.agents.roles.reviewer import ReviewerRole
+
+        opts = _parse_review_args(raw)
+        targets, focus, staged = opts["targets"], opts["focus"], opts["staged"]
+        project_root = str(agent.project_root)
+
+        ui.status("Reviewing...")
+        try:
+            if not targets:
+                coro = (review_staged_diff if staged else review_working_diff)(
+                    project_root, agent.llm, agent.config, focus=focus
+                )
+            elif len(targets) == 1 and (targets[0].startswith("http") or targets[0].startswith("#")):
+                coro = ReviewerRole.review_pr(
+                    agent.llm, agent.config, project_root, targets[0], review_focus=focus
+                )
+            else:
+                coro = ReviewerRole.review_files(
+                    agent.llm, agent.config, project_root, targets, review_focus=focus
+                )
+            report = asyncio.run(coro)
+        except Exception as exc:
+            ui.error(f"Review failed: {exc}")
+            return
+        _render_review_report(ui, report)
+
+    def _cmd_orchestra(raw, lowered):
+        if not getattr(agent.config, "orchestra_enabled", True):
+            ui.warning("Orchestra is disabled (orchestra_enabled=False).")
+            return
+        from hello_agents.agents.orchestra import AgentOrchestra, SubtaskHooks
+
+        mode, confirm, task = _parse_orchestra_args(raw)
+        if not task:
+            ui.warning("Usage: /orchestra [--parallel|--pipeline] [--confirm] <task>")
+            return
+
+        plan_holder: dict = {}
+
+        async def _on_start(st):
+            plan = plan_holder.get("plan")
+            total = len(plan.subtasks) if plan else None
+            index = None
+            if plan:
+                for i, sub in enumerate(plan.subtasks, 1):
+                    if sub.id == st.id:
+                        index = i
+                        break
+            _render_subtask_start(ui, st, index=index, total=total)
+
+        async def _on_finish(st, result):
+            _render_subtask_finish(ui, st, result)
+
+        async def _on_error(st, exc):
+            ui.warning(f"✗ [{st.role}] {st.id}: {exc}")
+
+        async def _run():
+            orchestra = AgentOrchestra(agent)
+            with ui.turn_spinner(f"Decomposing task ({mode.value} mode)..."):
+                plan = await orchestra.decompose(task, mode)
+            plan_holder["plan"] = plan
+            _render_orchestra_plan(ui, plan)
+            if confirm:
+                answer = input("Execute this plan? [y/N] ").strip().lower()
+                if answer not in ("y", "yes"):
+                    ui.info("Cancelled.")
+                    return
+            hooks = SubtaskHooks(
+                on_subtask_start=_on_start,
+                on_subtask_finish=_on_finish,
+                on_subtask_error=_on_error,
+            )
+            with ui.turn_spinner("Executing subtasks..."):
+                results = await orchestra.execute(plan, hooks=hooks)
+            with ui.turn_spinner("Aggregating results..."):
+                answer_text = await orchestra.aggregate(plan, results)
+            ui.render_assistant(answer_text)
+
+        try:
+            asyncio.run(_run())
+        except Exception as exc:
+            ui.error(f"Orchestra failed: {exc}")
+
     # Exact-match commands (lowered == key)
     _exact_cmds = {
         "/help": _cmd_help,
@@ -2067,6 +2523,8 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         ("/save", _cmd_save),
         ("/resume", _cmd_resume),
         ("/compact", _cmd_compact),
+        ("/review", _cmd_review),
+        ("/orchestra", _cmd_orchestra),
     ]
 
     def _dispatch_command(raw: str, lowered: str) -> bool:

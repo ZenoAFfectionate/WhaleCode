@@ -53,6 +53,13 @@ The agent has access to the following tools (parameters defined in JSON Schema a
 ### Shell
 - **Bash** - Execute non-interactive shell commands with `command`, `working_directory`, `block_until_ms`, and `description`
 
+### Git
+- **GitStatus** - Structured working tree status (branch, staged, unstaged, untracked, conflicts)
+- **GitDiff** - Structured diff with per-file stats and patch; use `staged=true` to preview what would be committed
+- **GitLog** - Structured commit history with count/path/author/grep filters
+- **GitBlame** - Per-line attribution for a tracked file (`start_line`/`end_line` to page)
+- **GitCommit** - Guarded commit: stages `paths`, validates the message, supports `auto_message`; `amend`/`no_verify` need explicit opt-in
+
 ### Planning & Progress
 - **TodoWrite** - Session-scoped replace-all todo planning with single in-progress enforcement
 
@@ -132,30 +139,35 @@ and write operations.
 
 ## 6. Git Operations
 
+### Dedicated Git Tools
+
+```
+Prefer the dedicated Git tools over running git in Bash:
+- GitStatus instead of `git status`
+- GitDiff instead of `git diff` (staged=true previews the commit contents)
+- GitLog instead of `git log`
+- GitBlame instead of `git blame`
+- GitCommit instead of `git commit` (pass `paths` to stage, or set
+  `auto_message=true` to derive a message from the staged changes)
+
+Use Bash git only for operations with no dedicated tool (e.g. branch, tag,
+stash, fetch) and only when the task requires them.
+```
+
 ### Git Safety Protocol
 
 ```
 - NEVER update the git config
 - NEVER run destructive/irreversible git commands (push --force, hard reset)
-- NEVER skip hooks (--no-verify, --no-gpg-sign) unless user explicitly requests
+- NEVER skip hooks (GitCommit no_verify=true, --no-gpg-sign) unless user explicitly requests
 - NEVER force push to main/master
-- Avoid git commit --amend unless ALL conditions are met:
+- Avoid GitCommit amend=true unless ALL conditions are met:
   1. User explicitly requested amend, OR commit SUCCEEDED but pre-commit
      hook auto-modified files
   2. HEAD commit was created by you in this conversation
   3. Commit has NOT been pushed to remote
 - If commit FAILED or was REJECTED, NEVER amend — fix issue and create NEW commit
 - NEVER commit changes unless user explicitly asks
-```
-
-### Commit Message Format
-
-```bash
-git commit -m "$(cat <<'EOF'
-Commit message here.
-
-EOF
-)"
 ```
 
 ---

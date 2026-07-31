@@ -17,13 +17,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from code.tools.lsp.client import (
+from hello_agents.tools.lsp.client import (
     LSPClient,
     LSPError,
     LSPServerStartError,
 )
-from code.tools.lsp.manager import LSPManager
-from code.tools.lsp.tools import (
+from hello_agents.tools.lsp.manager import LSPManager
+from hello_agents.tools.lsp.tools import (
     LSPDefinitionTool,
     LSPDiagnosticsTool,
     LSPHoverTool,
@@ -33,7 +33,7 @@ from code.tools.lsp.tools import (
     _format_location,
     _position_from_params,
 )
-from code.tools.response import ToolStatus
+from hello_agents.tools.response import ToolStatus
 
 
 # ============================================================================
@@ -506,8 +506,8 @@ class TestCodeAgentLSPIntegration:
     """Verify LSP tools are registered in CodeAgent's default tool set."""
 
     def test_lsp_tools_registered(self, tmp_path):
-        from code.agents.code_agent import CodeAgent
-        from code.core.llm import HelloAgentsLLM
+        from hello_agents.agents.code_agent import CodeAgent
+        from hello_agents.core.llm import HelloAgentsLLM
 
         llm = MagicMock(spec=HelloAgentsLLM)
         llm.model = "test-model"
@@ -527,8 +527,8 @@ class TestCodeAgentLSPIntegration:
 
     def test_lsp_tools_have_valid_schemas(self, tmp_path):
         """Each LSP tool should produce a valid OpenAI function schema."""
-        from code.agents.code_agent import CodeAgent
-        from code.core.llm import HelloAgentsLLM
+        from hello_agents.agents.code_agent import CodeAgent
+        from hello_agents.core.llm import HelloAgentsLLM
 
         llm = MagicMock(spec=HelloAgentsLLM)
         llm.model = "test-model"
@@ -988,10 +988,10 @@ class TestLSPManagerStartupLogging:
         """When LSPServerStartError is raised, a warning is logged."""
         mgr = LSPManager(workspace)
 
-        with patch("code.tools.lsp.manager._check_executable", return_value="/fake/pylsp"), \
-             patch("code.tools.lsp.manager.LSPClient") as mock_cls, \
-             patch("code.tools.lsp.manager._logger") as mock_logger:
-            from code.tools.lsp.client import LSPServerStartError
+        with patch("hello_agents.tools.lsp.manager._check_executable", return_value="/fake/pylsp"), \
+             patch("hello_agents.tools.lsp.manager.LSPClient") as mock_cls, \
+             patch("hello_agents.tools.lsp.manager._logger") as mock_logger:
+            from hello_agents.tools.lsp.client import LSPServerStartError
             mock_cls.side_effect = LSPServerStartError("test failure")
             result = mgr.server_for("test.py")
             assert result is None
@@ -1112,7 +1112,7 @@ class TestServerForRaceCondition:
 
     def test_creation_lock_exists(self, workspace):
         """LSPManager has a creation lock for thread-safe server creation."""
-        from code.tools.lsp.manager import LSPManager
+        from hello_agents.tools.lsp.manager import LSPManager
         mgr = LSPManager(workspace)
         assert hasattr(mgr, "_creation_lock")
 
@@ -1134,8 +1134,8 @@ class TestDiagnosticsFStringFix:
 
     def test_error_message_contains_file_path(self, workspace):
         """When diagnostics fails, the error message should contain the actual file path."""
-        from code.tools.lsp.client import LSPClient, LSPError
-        from code.tools.lsp.tools import LSPDiagnosticsTool
+        from hello_agents.tools.lsp.client import LSPClient, LSPError
+        from hello_agents.tools.lsp.tools import LSPDiagnosticsTool
 
         mgr = LSPManager(workspace)
         client = MagicMock(spec=LSPClient)
@@ -1160,8 +1160,8 @@ class TestBenchmarkLSPRegistration:
 
     def test_benchmark_agent_has_lsp_tools(self, tmp_path):
         """Benchmark-created agents should have LSP tools registered."""
-        from code.benchmark.base import BenchmarkCodeAgent
-        from code.tools.registry import ToolRegistry
+        from hello_agents.benchmark.base import BenchmarkCodeAgent
+        from hello_agents.tools.registry import ToolRegistry
 
         ws = tmp_path / "bench_ws"
         ws.mkdir()

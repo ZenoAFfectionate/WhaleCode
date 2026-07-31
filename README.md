@@ -32,7 +32,9 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
 | Feature | Description |
 |---------|-------------|
 | 🧠 **ReAct Loop** | Structured Think → Act → Observe → Re-think cycle via OpenAI function calling — no fragile text parsing |
-| 🔧 **Atomized Tools** | 13+ specialized tools (Read, Write, Edit, Grep, Glob, Bash, TodoWrite, …) with typed responses |
+| 🔧 **Atomized Tools** | 23 specialized tools across 8 categories — Git, LSP, file ops, search, execution — all with typed `ToolResponse` |
+| 🎭 **Multi-Agent Orchestra** | LLM-driven task decomposition → role-based parallel sub-agents → structured result aggregation |
+| 🔍 **Code Review Agent** | Automated PR/code review with multi-lens verification, severity ranking, and structured findings |
 | 🗜️ **Three-Layer Compact** | micro / auto / manual context compaction keeps long sessions manageable |
 | 📋 **Persistent Task System** | TodoWrite with atomic JSON snapshots — plans survive compaction and session resume |
 | 🛡️ **Sandbox Safety** | Static + runtime guards for benchmark execution; circuit breaker for failing tools |
@@ -48,6 +50,10 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
   - [Slash Commands](#slash-commands)
 - [🏗️ Architecture Overview](#️-architecture-overview)
 - [🤖 CodeAgent Implementation Details](#-codeagent-implementation-details)
+- [🎭 Multi-Agent Orchestration](#-multi-agent-orchestration)
+  - [AgentOrchestra — Decompose & Execute](#agentorchestra--decompose--execute)
+  - [Role System — Explorer / Reviewer / Tester](#role-system--explorer--reviewer--tester)
+  - [Code Review with Structured Findings](#code-review-with-structured-findings)
 - [🗜️ Context Management](#️-context-management)
 - [🔧 Atomized Tool System](#-atomized-tool-system)
   - [Why Atomized Tools Instead of Bash?](#why-atomized-tools-instead-of-bash)
@@ -186,7 +192,7 @@ CodeAgent adds **repository awareness** and **coding-specific behavior** to the 
 | 📝 **Coding system prompt** | `code/prompts/system_prompt.md` teaches the model to inspect before editing, prefer specialized tools over raw shell commands, use TodoWrite for multi-step work, and verify changes when possible. |
 | 🔧 **Default tool registration** | `CodeAgent.register_default_tools()` wires the core coding tools into one `ToolRegistry`. |
 | ⏱️ **Finite step budget** | The default coding loop is bounded, preventing runaway tool-call loops. |
-| 🔒 **Sub-agent isolation** | Sub-agents receive separate registries and history, with interactive `AskUser` disabled for delegated work. |
+| 🔒 **Sub-agent isolation** | Sub-agents receive separate registries and history, with interactive `AskUser` disabled for delegated work. Read-only tools (`GitStatus`, `GitDiff`, `GitBlame`, `GitLog`, `Glob`, `Grep`) are auto-filtered for explore/plan/review sub-agents via category-based `ToolFilter`. |
 
 **A typical coding task flow:**
 
@@ -211,6 +217,65 @@ HistoryManager + compaction keep long-running context usable
   ▼
 Agent returns a concise engineering handoff
 ```
+
+---
+
+## 🎭 Multi-Agent Orchestration
+
+> **Source**: `code/agents/orchestra.py`, `code/agents/roles/`, `code/agents/review_agent.py`
+
+The single CodeAgent excels at focused tasks, but real-world engineering work often spans **exploration → implementation → review → testing** — phases with different skill requirements and safety constraints. Whale Code introduces an **orchestrator-worker** pattern to decompose complex tasks and execute them through role-specialized sub-agents in parallel.
+
+### AgentOrchestra — Decompose & Execute
+
+The orchestra pipeline has four stages:
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐
+│  Decompose   │ →  │    Plan      │ →  │  Parallel Exec   │ →  │  Aggregate   │
+│  (LLM)       │    │  (topo sort) │    │  (Semaphore N)   │    │  (LLM)       │
+└──────────────┘    └──────────────┘    └──────────────────┘    └──────────────┘
+```
+
+| Stage | Description |
+|:------|:------------|
+| 🔀 **Decompose** | LLM breaks the user task into subtasks with role assignments (`explorer` / `reviewer` / `tester`) and dependency edges. |
+| 📊 **Plan** | Topological sort resolves execution stages. Subtasks with satisfied dependencies run concurrently within each stage. |
+| ⚡ **Execute** | Role-specialized sub-agents run in parallel with `asyncio.Semaphore` throttling. Upstream results are injected as `context_hint` into dependent subtasks. |
+| 🧩 **Aggregate** | LLM synthesizes all sub-agent outputs into a coherent final response. |
+
+Key design decisions:
+
+| Decision | Rationale |
+|:---------|:----------|
+| **Stage-parallel, not fully-parallel** | Dependencies matter — exploration must complete before code changes; reviews must see final diffs. Topological staging lets independent work fan out while respecting order. |
+| **Semaphore throttling** | Prevents explosion of concurrent LLM calls when the task DAG has high fan-out. |
+| **Timeout → graceful degrade** | Python thread-pool tasks can't be killed; timed-out sub-agents are discarded and their results excluded from aggregation rather than crashing the whole run. |
+| **Full isolation** | Each sub-agent gets a cloned `ToolRegistry`, separate history, and `AskUser` disabled. This prevents accidental cross-contamination and keeps interactive prompts contained. |
+
+### Role System — Explorer / Reviewer / Tester
+
+Roles are pre-configured sub-agent profiles that control **system prompt**, **tool availability**, and **behavior**:
+
+| Role | Category | Tools | Purpose |
+|:-----|:---------|:------|:--------|
+| 🔍 **Explorer** | `readonly` | Glob, Grep, Read, LS, GitStatus, GitDiff, GitLog, GitBlame, Bash (restricted) | Understand codebase structure, trace dependencies, locate relevant code |
+| 📝 **Reviewer** | `readonly` | Glob, Grep, Read, LS, GitDiff, GitLog, GitBlame, Bash (restricted) | Multi-lens code review: correctness, security, performance, idiomatic style |
+| 🧪 **Tester** | `write` | Read, Write, Edit, Bash, GitDiff | Write and run tests, verify fixes |
+
+> 💡 **Why roles instead of one generic sub-agent?** Different phases have different safety profiles. An explorer should never edit files; a reviewer needs structured output templates; a tester needs write access. Role-based dispatch keeps these boundaries explicit and enforceable via `ToolFilter` rather than relying on prompt instructions alone.
+
+### Code Review with Structured Findings
+
+The **Reviewer role** (`ReviewerRole`) and standalone **ReviewAgent** provide automated code review with:
+
+- 📌 **Multi-lens analysis** — correctness, security, performance, and style each checked independently
+- 🏷️ **Severity ranking** — `critical` / `high` / `medium` / `low` / `info` with concrete failure scenarios
+- ✅ **Adversarial verification** — findings pass through a second pass to reduce false positives
+- 📋 **Structured output** — `ReviewFinding` and `ReviewReport` with line-anchored, machine-readable results
+- 🔄 **PR integration** — `review_pr()` and `review_diff()` accept git refs or raw diffs, process through `git diff --stat` → focused review → report aggregation
+
+> 🛡️ The reviewer sees only `readonly` tools — it cannot modify code, only report findings. This makes it safe to run automatically on every commit or PR.
 
 ---
 
@@ -290,7 +355,7 @@ Long-running coding tasks quickly produce large tool outputs, repeated observati
 
 ## 🔧 Atomized Tool System
 
-Whale Code intentionally uses **specialized tools** instead of relying on one unrestricted Bash interface. This makes common coding actions **safer**, **easier to audit**, and **cheaper in context**.
+Whale Code intentionally uses **specialized tools** instead of relying on one unrestricted Bash interface. Beyond the classic file/search/execution tools, this principle extends to **native Git integration** and **LSP-powered code intelligence** — operations where parsing raw terminal output would be fragile and token-inefficient.
 
 ### Why Atomized Tools Instead of Bash?
 
@@ -302,7 +367,7 @@ A Bash-only agent can run `cat`, `grep`, `sed`, `rm`, or arbitrary shell pipelin
 | 🔒 **Optimistic locking** | `Read` returns file metadata that `Write` and `Edit` can check before mutation. |
 | 📋 **Structured errors** | Failures return typed error codes instead of only `stderr`. |
 | ⚡ **Circuit breaker** | Repeatedly failing tools are temporarily disabled. |
-| 📉 **Context efficiency** | Tool responses are designed for LLM consumption instead of raw terminal output. |
+| 📉 **Context efficiency** | Tool responses are designed for LLM consumption instead of raw terminal output. For example, `GitDiff` returns structured `{files: [{path, status, additions, deletions, patch}]}` — one token-efficient object instead of screenfuls of raw unified diff text. |
 
 ### Tool List
 
@@ -319,6 +384,15 @@ A Bash-only agent can run `cat`, `grep`, `sed`, `rm`, or arbitrary shell pipelin
 | 📋 **Planning** | `TodoWrite` | Session-scoped replace-all task manager with one active task and atomic snapshots |
 | 🌐 **Web** | `WebSearch` | Search the web when enabled |
 | | `WebFetch` | Fetch and extract readable web content when enabled |
+| 🐙 **Git** | `GitStatus` | Structured `git status --porcelain=v2` with branch, staged/unstaged/untracked/conflict info and stash count |
+| | `GitDiff` | Structured diff (numstat + name-status + unified patch) between worktree, index, or arbitrary commits |
+| | `GitLog` | Structured commit history with author, date, message, and changed files |
+| | `GitBlame` | Line-level authorship with `--porcelain` parsing |
+| | `GitCommit` | Safe commit wrapper: auto-message generation, `--amend`/`--no-verify` guard, empty-staging protection |
+| 📐 **LSP** | `LSPDefinition` | Go-to-definition via LSP — locate symbol declarations with line/column precision |
+| | `LSPReferences` | Find all references to a symbol across the codebase |
+| | `LSPHover` | Hover-type information: docstrings, type signatures, inferred types |
+| | `LSPDiagnostics` | Compiler/linter diagnostics: errors, warnings, hints for the current file |
 | 💬 **Interaction** | `AskUser` | Ask a clarifying question in the main interactive agent only |
 | 🎛️ **Control** | `Thought` | Record concise reasoning inside the structured ReAct loop |
 | | `Finish` | End a run explicitly when benchmark or structured-output mode requires it |

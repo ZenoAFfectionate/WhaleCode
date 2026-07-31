@@ -16,13 +16,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from code.context.history import (
+from hello_agents.context.history import (
     HistoryManager,
     format_compact_summary,
 )
-from code.context.token_counter import TokenCounter
-from code.context.truncator import ObservationTruncator
-from code.core.message import Message
+from hello_agents.context.token_counter import TokenCounter
+from hello_agents.context.truncator import ObservationTruncator
+from hello_agents.core.message import Message
 
 
 # ────────────────────────────────────────────────────────────────────────────

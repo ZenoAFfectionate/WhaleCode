@@ -6,9 +6,9 @@ Covers:
 - WebSearchTool lazy backend init
 """
 
-from code.context.token_counter import TokenCounter
-from code.context.history import HistoryManager
-from code.core.message import Message
+from hello_agents.context.token_counter import TokenCounter
+from hello_agents.context.history import HistoryManager
+from hello_agents.core.message import Message
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +191,13 @@ class TestWebSearchLazyBackend:
 
     def test_backend_not_created_on_init(self, tmp_path):
         """Backend should NOT be created eagerly in __init__."""
-        from code.tools.builtin.web_tool import WebSearchTool
+        from hello_agents.tools.builtin.web_tool import WebSearchTool
         tool = WebSearchTool(project_root=str(tmp_path))
         assert tool._search_backend is None
 
     def test_backend_created_on_first_access(self, tmp_path):
         """First access to search_backend property creates the backend."""
-        from code.tools.builtin.web_tool import WebSearchTool
+        from hello_agents.tools.builtin.web_tool import WebSearchTool
         tool = WebSearchTool(project_root=str(tmp_path))
         backend = tool.search_backend
         assert backend is not None
@@ -205,7 +205,7 @@ class TestWebSearchLazyBackend:
 
     def test_backend_returns_same_instance(self, tmp_path):
         """Multiple accesses return the same backend instance."""
-        from code.tools.builtin.web_tool import WebSearchTool
+        from hello_agents.tools.builtin.web_tool import WebSearchTool
         tool = WebSearchTool(project_root=str(tmp_path))
         b1 = tool.search_backend
         b2 = tool.search_backend
@@ -213,7 +213,7 @@ class TestWebSearchLazyBackend:
 
     def test_custom_backend_used_directly(self, tmp_path):
         """If a custom backend is passed, it's used without lazy default."""
-        from code.tools.builtin.web_tool import WebSearchTool
+        from hello_agents.tools.builtin.web_tool import WebSearchTool
 
         class FakeBackend:
             def search_text(self, **kwargs):

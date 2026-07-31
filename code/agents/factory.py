@@ -10,6 +10,8 @@ from ..core.config import Config
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
+    from .code_agent import CodeAgent
+    from .orchestra import AgentOrchestra
 
 
 def create_agent(
@@ -143,6 +145,24 @@ def default_subagent_factory(
         subagent.max_steps = config.subagent_max_steps
     
     return subagent
+
+
+def create_orchestra(
+    main_agent: "CodeAgent",
+    config: Optional[Config] = None,
+) -> "AgentOrchestra":
+    """Create an AgentOrchestra bound to a CodeAgent (main orchestrator).
+
+    Args:
+        main_agent: 主 Agent (必须提供 llm / project_root / working_dir)
+        config: 可选配置覆盖 (默认复用 main_agent.config)
+
+    Returns:
+        AgentOrchestra instance
+    """
+    from .orchestra import AgentOrchestra
+
+    return AgentOrchestra(main_agent=main_agent, config=config)
 
 
 def _get_system_prompt_for_type(agent_type: str) -> str:

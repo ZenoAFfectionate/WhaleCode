@@ -29,7 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
-from code.context.builder import (
+from hello_agents.context.builder import (
     ContextBuilder,
     ContextConfig,
     ContextPacket,
@@ -37,7 +37,7 @@ from code.context.builder import (
     _tokenize_for_relevance,
     count_tokens,
 )
-from code.core.message import Message
+from hello_agents.core.message import Message
 
 
 # ============================================================================
@@ -89,7 +89,7 @@ class TestCountTokens:
 
     def test_get_default_counter_is_reused(self):
         """_get_default_token_counter uses LRU cache — same model returns same instance."""
-        from code.context.token_counter import TokenCounter
+        from hello_agents.context.token_counter import TokenCounter
         c1 = _get_default_token_counter()
         c2 = _get_default_token_counter()
         assert isinstance(c1, TokenCounter)

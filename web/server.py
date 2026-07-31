@@ -550,13 +550,17 @@ class JobManager:
             job.error = reason
             job.updated_at = now_iso()
 
-    def subscribe(self, job_id: str) -> queue.Queue:
+    def subscribe(self, job_id: str, last_event_id: int = 0) -> queue.Queue:
         with self._lock:
             job = self._jobs[job_id]
             subscriber: queue.Queue = queue.Queue()
             job.subscribers.append(subscriber)
+            # Replay backlog, but only events the client has not seen yet
+            # (EventSource sends Last-Event-ID on automatic reconnects —
+            # without this filter every reconnect would duplicate the trace).
             for event in job.events[-200:]:
-                subscriber.put(event)
+                if int(event.get("id", 0)) > last_event_id:
+                    subscriber.put(event)
             return subscriber
 
     def unsubscribe(self, job_id: str, subscriber: queue.Queue) -> None:
@@ -582,6 +586,9 @@ class JobManager:
             if job.status == "cancelled" and event_type != "cancelled":
                 return
             event = {
+                # 1-based monotonic position within this job's event log; used
+                # as the SSE `id:` frame for Last-Event-ID resume support.
+                "id": len(job.events) + 1,
                 "timestamp": now_iso(),
                 "type": event_type,
                 "payload": json_safe(payload or {}),
@@ -1293,7 +1300,12 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
             return super().do_GET()
         if path == "/api/status":
-            return self.send_json({"ok": True, "project_root": str(PROJECT_ROOT), "model": models.snapshot()})
+            return self.send_json({
+                "ok": True,
+                "project_root": str(PROJECT_ROOT),
+                "model": models.snapshot(),
+                "gpu": models._gpu_snapshot(),
+            })
         if path == "/api/models":
             return self.send_json(models.snapshot())
         if path == "/api/datasets":
@@ -1379,7 +1391,11 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
     def stream_events(self, job_id: str) -> None:
         if not jobs.get(job_id):
             return self.send_json({"error": "job not found"}, HTTPStatus.NOT_FOUND)
-        subscriber = jobs.subscribe(job_id)
+        try:
+            last_event_id = int(self.headers.get("Last-Event-ID") or 0)
+        except (TypeError, ValueError):
+            last_event_id = 0
+        subscriber = jobs.subscribe(job_id, last_event_id=last_event_id)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1390,6 +1406,7 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                 try:
                     event = subscriber.get(timeout=15)
                     payload = json.dumps(event, ensure_ascii=False)
+                    self.wfile.write(f"id: {event.get('id', 0)}\n".encode("utf-8"))
                     self.wfile.write(f"event: {event['type']}\n".encode("utf-8"))
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()

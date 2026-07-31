@@ -15,20 +15,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from code.agents.code_agent import CodeAgent
-from code.agents.react_agent import (
+from hello_agents.agents.code_agent import CodeAgent
+from hello_agents.agents.react_agent import (
     FINISH_TOOL_NAME,
     THOUGHT_TOOL_NAME,
     _FinishTool,
     _ThoughtTool,
     ReActAgent,
 )
-from code.core.config import Config
-from code.core.llm import HelloAgentsLLM
-from code.core.message import Message
-from code.tools.base import Tool, ToolParameter
-from code.tools.registry import ToolRegistry
-from code.tools.response import ToolResponse, ToolStatus
+from hello_agents.core.config import Config
+from hello_agents.core.llm import HelloAgentsLLM
+from hello_agents.core.message import Message
+from hello_agents.tools.base import Tool, ToolParameter
+from hello_agents.tools.registry import ToolRegistry
+from hello_agents.tools.response import ToolResponse, ToolStatus
 
 
 def _mock_llm():
@@ -300,7 +300,8 @@ class TestCodeAgent:
         a = CodeAgent("c", _mock_llm(), project_root=tmp, register_default_tools=True,
                       enable_task_tool=False, interactive=False)
         tools = a.tool_registry.list_tools()
-        for t in ("Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS", "Delete"):
+        for t in ("Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS", "Delete",
+                  "GitStatus", "GitDiff", "GitLog", "GitBlame", "GitCommit"):
             assert t in tools
 
     def test_set_working_dir(self, tmp):
@@ -368,7 +369,7 @@ class TestReActAgentSession:
 
     def test_schema_hash_no_registry(self):
         """_compute_tool_schema_hash returns 'no-tools' when registry is None."""
-        from code.agents.react_agent import ReActAgent
+        from hello_agents.agents.react_agent import ReActAgent
         a = ReActAgent("t", _mock_llm(), config=Config())
         a.tool_registry = None
         assert a._compute_tool_schema_hash() == "no-tools"
@@ -424,7 +425,7 @@ class TestReActAgentSubagent:
         agent.tool_registry.register_tool(_SimpleTool(name="b"))
         agent.tool_registry.register_tool(_SimpleTool(name="c"))
 
-        from code.tools.tool_filter import CustomFilter
+        from hello_agents.tools.tool_filter import CustomFilter
 
         f = CustomFilter(allowed=["a", "b"], mode="whitelist")
         orig = agent._apply_tool_filter(f)
@@ -445,7 +446,7 @@ class TestReActAgentStructuredOutput:
         return ReActAgent("test", _mock_llm(), config=Config())
 
     def test_structured_output_schema(self):
-        from code.agents.react_agent import _StructuredOutputSpec
+        from hello_agents.agents.react_agent import _StructuredOutputSpec
         spec = _StructuredOutputSpec(
             name="CustomOutput",
             description="Custom structured output",
@@ -457,13 +458,13 @@ class TestReActAgentStructuredOutput:
         assert "result" in schema["function"]["parameters"]["properties"]
 
     def test_tool_choice_for_structured_output(self):
-        from code.agents.react_agent import _StructuredOutputSpec
+        from hello_agents.agents.react_agent import _StructuredOutputSpec
         spec = _StructuredOutputSpec(name="Out", description="d", schema={"type": "object"})
         assert ReActAgent._tool_choice_for(spec) == "required"
         assert ReActAgent._tool_choice_for(None) == "auto"
 
     def test_structured_output_instruction(self):
-        from code.agents.react_agent import _StructuredOutputSpec
+        from hello_agents.agents.react_agent import _StructuredOutputSpec
         spec = _StructuredOutputSpec(name="Out", description="d", schema={"type": "object"})
         instr = ReActAgent._structured_output_instruction(spec)
         assert "Structured output" in instr

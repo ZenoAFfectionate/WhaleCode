@@ -776,17 +776,24 @@ class ReActAgent(Agent):
         state.last_reasoning_content = reasoning_content
         state.last_reasoning_source = reasoning_source
 
-        if reasoning_content is not None:
-            self._render_event(
-                "model_output",
-                {
-                    "content": response_message.content or "",
-                    "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
-                    "reasoning_content": reasoning_content,
-                    "reasoning_source": reasoning_source,
-                    "step": current_step,
-                },
-            )
+        # Emit model_output for the web/SSE consumers whenever the assistant
+        # produced something displayable: reasoning content, or intermediate
+        # text accompanying tool calls. The final no-tool-call response is
+        # intentionally excluded — it is delivered via final_answer and would
+        # otherwise render twice. (The console renderer has no model_output
+        # case, so CLI output is unaffected.)
+        response_content = response_message.content or ""
+        has_tool_calls = bool(response_message.tool_calls)
+        if reasoning_content is not None or (response_content and has_tool_calls):
+            model_output_payload: Dict[str, Any] = {
+                "content": response_content,
+                "tool_calls": len(response_message.tool_calls) if response_message.tool_calls else 0,
+                "step": current_step,
+            }
+            if reasoning_content is not None:
+                model_output_payload["reasoning_content"] = reasoning_content
+                model_output_payload["reasoning_source"] = reasoning_source
+            self._render_event("model_output", model_output_payload)
 
         if self.trace_logger:
             trace_payload = {

@@ -13,12 +13,15 @@ A collection of built-in tools for the HelloAgents framework, including:
 - AskUserTool: User interaction tool
 - WebSearchTool: Web search tool (DuckDuckGo)
 - WebFetchTool: Web content scraping tool
+- GitStatusTool / GitDiffTool / GitLogTool / GitBlameTool: Structured read-only git tools
+- GitCommitTool: Guarded git commit tool
 """
 
 from .bash import BashTool
 from .ask_user import AskUserTool
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
+from .git_tools import GitBlameTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool
 from .skill_tool import SkillTool
 from .file_tools import ListFilesTool, ReadTool, WriteTool, DeleteTool, EditTool
 from .todowrite_tool import TodoSessionStore, TodoWriteTool
@@ -34,6 +37,11 @@ __all__ = [
     "EditTool",
     "GlobTool",
     "GrepTool",
+    "GitStatusTool",
+    "GitDiffTool",
+    "GitLogTool",
+    "GitBlameTool",
+    "GitCommitTool",
     "TodoWriteTool",
     "TodoSessionStore",
     "SkillTool",

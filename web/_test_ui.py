@@ -95,6 +95,9 @@ try:
         check("passed & failed cases both present",
               page.locator(".case-row.passed").count() >= 1 and page.locator(".case-row.failed").count() >= 1)
         check("trajectory buttons render", page.locator(".trajectory-button").count() >= 1)
+        # case rows are collapsed by default; open one to reveal its actions
+        page.locator(".case-row:has(.trajectory-button) summary").first.click()
+        page.wait_for_timeout(200)
         page.locator(".trajectory-button").first.click()
         page.wait_for_selector(".trajectory-panel", timeout=8000)
         check("trajectory panel renders", page.locator(".trajectory-panel").count() >= 1)

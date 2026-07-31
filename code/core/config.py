@@ -64,6 +64,7 @@ class Config(BaseModel):
     bash_max_execution_ms: int = 0              # BASH_MAX_EXECUTION_MS（硬超时，0=不强杀）
     web_tools_enabled: bool = True              # WEB_TOOLS_ENABLED
     web_fetch_allow_private: bool = False       # WEBFETCH_ALLOW_PRIVATE（严重-3 SSRF 放行）
+    git_tools_enabled: bool = True              # GIT_TOOLS_ENABLED（Git 原生工具注册开关）
 
     # LLM 调用重试（重要-12）
     llm_max_retries: int = 2                    # LLM_MAX_RETRIES
@@ -87,6 +88,16 @@ class Config(BaseModel):
     bench_eval_network: bool = False
     bench_eval_artifact_retention: int = 200
 
+    # 多智能体编排配置（Agent Orchestra）
+    orchestra_enabled: bool = True              # ORCHESTRA_ENABLED
+    orchestra_max_parallel: int = 2             # ORCHESTRA_MAX_PARALLEL
+    subagent_timeout_seconds: float = 300.0     # SUBAGENT_TIMEOUT_SECONDS
+
+    # Code Review 配置
+    review_max_files: int = 50                  # REVIEW_MAX_FILES
+    review_max_findings: int = 30               # REVIEW_MAX_FINDINGS
+    review_gh_cli_enabled: bool = True          # REVIEW_GH_CLI_ENABLED
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置
@@ -96,11 +107,14 @@ class Config(BaseModel):
             CIRCUIT_ENABLED, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT,
             BASH_ALLOW_NETWORK, BASH_MAX_CPU_SECONDS, BASH_MAX_PROCESSES,
             BASH_MAX_EXECUTION_MS, WEB_TOOLS_ENABLED, WEBFETCH_ALLOW_PRIVATE,
+            GIT_TOOLS_ENABLED,
             LLM_MAX_RETRIES, LLM_RETRY_BASE_DELAY, LLM_RETRY_MAX_DELAY,
             CODE_AGENT_MAX_STEPS, WHALE_BENCH_EVAL_CPU_SECONDS,
             WHALE_BENCH_EVAL_MEMORY_BYTES, WHALE_BENCH_EVAL_MAX_PROCESSES,
             WHALE_BENCH_EVAL_FILE_SIZE_BYTES, WHALE_BENCH_EVAL_NETWORK,
-            WHALE_BENCH_EVAL_ARTIFACT_RETENTION
+            WHALE_BENCH_EVAL_ARTIFACT_RETENTION,
+            ORCHESTRA_ENABLED, ORCHESTRA_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS,
+            REVIEW_MAX_FILES, REVIEW_MAX_FINDINGS, REVIEW_GH_CLI_ENABLED
         """
         def _bool(name: str, default: bool) -> bool:
             raw = os.getenv(name)
@@ -152,6 +166,7 @@ class Config(BaseModel):
         kwargs["bash_max_execution_ms"] = _int("BASH_MAX_EXECUTION_MS", cls.model_fields["bash_max_execution_ms"].default)
         kwargs["web_tools_enabled"] = _bool("WEB_TOOLS_ENABLED", cls.model_fields["web_tools_enabled"].default)
         kwargs["web_fetch_allow_private"] = _bool("WEBFETCH_ALLOW_PRIVATE", cls.model_fields["web_fetch_allow_private"].default)
+        kwargs["git_tools_enabled"] = _bool("GIT_TOOLS_ENABLED", cls.model_fields["git_tools_enabled"].default)
         kwargs["llm_max_retries"] = _int("LLM_MAX_RETRIES", cls.model_fields["llm_max_retries"].default)
         kwargs["llm_retry_base_delay"] = _float("LLM_RETRY_BASE_DELAY", cls.model_fields["llm_retry_base_delay"].default)
         kwargs["llm_retry_max_delay"] = _float("LLM_RETRY_MAX_DELAY", cls.model_fields["llm_retry_max_delay"].default)
@@ -162,6 +177,14 @@ class Config(BaseModel):
         kwargs["bench_eval_file_size_bytes"] = _int("WHALE_BENCH_EVAL_FILE_SIZE_BYTES", cls.model_fields["bench_eval_file_size_bytes"].default)
         kwargs["bench_eval_network"] = _bool("WHALE_BENCH_EVAL_NETWORK", cls.model_fields["bench_eval_network"].default)
         kwargs["bench_eval_artifact_retention"] = _int("WHALE_BENCH_EVAL_ARTIFACT_RETENTION", cls.model_fields["bench_eval_artifact_retention"].default)
+
+        # Orchestra / Review
+        kwargs["orchestra_enabled"] = _bool("ORCHESTRA_ENABLED", cls.model_fields["orchestra_enabled"].default)
+        kwargs["orchestra_max_parallel"] = _int("ORCHESTRA_MAX_PARALLEL", cls.model_fields["orchestra_max_parallel"].default)
+        kwargs["subagent_timeout_seconds"] = _float("SUBAGENT_TIMEOUT_SECONDS", cls.model_fields["subagent_timeout_seconds"].default)
+        kwargs["review_max_files"] = _int("REVIEW_MAX_FILES", cls.model_fields["review_max_files"].default)
+        kwargs["review_max_findings"] = _int("REVIEW_MAX_FINDINGS", cls.model_fields["review_max_findings"].default)
+        kwargs["review_gh_cli_enabled"] = _bool("REVIEW_GH_CLI_ENABLED", cls.model_fields["review_gh_cli_enabled"].default)
 
         return cls(**kwargs)
 

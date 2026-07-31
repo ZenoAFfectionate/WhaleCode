@@ -15,10 +15,14 @@ Scenarios:
 - Subagent delegation
 - Stagnation detection (no-diff edits / same test results)
 - Truncation retry (finish_reason="length")
+- Role subagents (Explorer read-only enforcement / Tester writes+runs tests)
+- ReviewerRole full review chain (structured output → ReviewReport)
+- AgentOrchestra full chain (decompose → execute → aggregate)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -26,10 +30,11 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from code.agents.code_agent import CodeAgent
-from code.core.config import Config
-from code.tools.base import Tool, ToolParameter
-from code.tools.response import ToolResponse
+# 注: 使用 hello_agents 包名 (tests/conftest.py 引导), 而非 code.* 直导入
+from hello_agents.agents.code_agent import CodeAgent
+from hello_agents.core.config import Config
+from hello_agents.tools.base import Tool, ToolParameter
+from hello_agents.tools.response import ToolResponse
 
 
 # ============================================================================
@@ -139,6 +144,28 @@ class ScriptedLLM:
         **kwargs,
     ) -> _FakeResponse:
         return self.invoke_with_tools(messages, tools, tool_choice, **kwargs)
+
+    # ── plain text invocation (AgentOrchestra decompose/aggregate) ──────
+
+    def invoke(self, messages: List[Dict[str, Any]], **kwargs):
+        """Plain-text LLM call; script entry ``{"_text": "..."}`` supplies content."""
+        from types import SimpleNamespace
+
+        self.invoke_history.append({
+            "messages": messages,
+            "kwargs": kwargs,
+            "kind": "invoke",
+        })
+        step = self._next_step()
+        if isinstance(step, dict) and "_text" in step:
+            content = step["_text"]
+        else:
+            content = json.dumps(step, ensure_ascii=False)
+        return SimpleNamespace(
+            content=content,
+            model=self.model,
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
 
     # ── internal ─────────────────────────────────────────────────────────
 
@@ -630,7 +657,7 @@ class TestStagnationDetectionE2E:
         Uses direct stagnation state manipulation to verify detection logic,
         since real no-diff edits require very specific file states.
         """
-        from code.agents.react_agent import _ExecutionState
+        from hello_agents.agents.react_agent import _ExecutionState
 
         agent = CodeAgent(
             "stuck-agent",
@@ -939,3 +966,329 @@ class TestMultiToolRoundE2E:
         history = agent.get_history()
         tool_messages = [m for m in history if m.role == "tool"]
         assert len(tool_messages) >= 2
+
+
+# ============================================================================
+# E2E Scenario 14: Role Subagents (Explorer / Tester)
+# ============================================================================
+
+
+class TestRoleSubagentE2E:
+    """角色化子 Agent 走完整 ReAct loop: 工具策略在真实执行中被强制."""
+
+    @pytest.fixture
+    def workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app.py").write_text("def work():\n    return 42\n")
+            yield root
+
+    def _main_agent(self, workspace, llm):
+        return CodeAgent(
+            "parent",
+            llm,
+            project_root=str(workspace),
+            config=_e2e_config(),
+            register_default_tools=True,
+            enable_task_tool=False,
+            interactive=False,
+            max_steps=20,
+        )
+
+    def test_explorer_read_only_full_loop(self, workspace):
+        """Explorer 子 Agent: Read → Finish, 结果通过 run() 返回."""
+        from hello_agents.agents.roles import ExplorerRole
+
+        script = [
+            {"Read": {"path": "app.py"}},
+            {"Finish": {"answer": "app.py defines work() which returns 42."}},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        sub = ExplorerRole.create_subagent(
+            main.llm, main.config, str(workspace), str(workspace)
+        )
+
+        result = sub.run("Explore app.py")
+
+        assert "returns 42" in result
+        assert llm.call_count == 2
+        # 工具策略在真实执行链路上生效
+        assert sub.tool_registry.get_tool("Write") is None
+        assert sub.tool_registry.get_tool("Bash") is None
+
+    def test_explorer_write_attempt_blocked_at_runtime(self, workspace):
+        """Explorer 尝试 Write → NOT_FOUND 错误回执 → Agent 恢复并 Finish; 文件未创建."""
+        from hello_agents.agents.roles import ExplorerRole
+
+        script = [
+            {"Write": {"path": "evil.py", "content": "x = 1\n"}},
+            {"Finish": {"answer": "I cannot write files; read-only role."}},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        sub = ExplorerRole.create_subagent(
+            main.llm, main.config, str(workspace), str(workspace)
+        )
+
+        result = sub.run("Try to write evil.py")
+
+        assert "read-only" in result.lower() or "cannot" in result.lower()
+        assert not (workspace / "evil.py").exists()
+        # NOT_FOUND 错误进入了子 Agent 历史 (tool message)
+        tool_msgs = [m for m in sub.get_history() if m.role == "tool"]
+        assert any("not found" in (m.content or "").lower() for m in tool_msgs)
+
+    def test_tester_writes_and_runs_tests(self, workspace):
+        """Tester 子 Agent: Write 测试文件 → Bash 运行 → Finish; 产物真实落盘."""
+        from hello_agents.agents.roles import TesterRole
+
+        script = [
+            {"Write": {
+                "path": "tests/test_app.py",
+                "content": "def test_work():\n    assert 42 == 42\n",
+            }},
+            {"Bash": {"command": f"cd {workspace} && python -m pytest tests/ -q"}},
+            {"Finish": {"answer": "Test file created and all tests passed."}},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        sub = TesterRole.create_subagent(
+            main.llm, main.config, str(workspace), str(workspace)
+        )
+
+        result = sub.run("Write and run a test for app.py")
+
+        assert "passed" in result.lower()
+        test_file = workspace / "tests" / "test_app.py"
+        assert test_file.exists()
+        assert "test_work" in test_file.read_text()
+        # Tester 可用写工具但 Delete 被禁止
+        assert sub.tool_registry.get_tool("Write") is not None
+        assert sub.tool_registry.get_tool("Delete") is None
+
+
+# ============================================================================
+# E2E Scenario 15: ReviewerRole Full Review Chain
+# ============================================================================
+
+
+class TestReviewerRoleE2E:
+    """review_files 完整链路: 读文件 → 子 Agent ReAct loop → 结构化报告."""
+
+    @pytest.fixture
+    def workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "auth.py").write_text(
+                "API_KEY = 'sk-hardcoded-secret-123'\n\n"
+                "def login(user):\n"
+                "    return user == 'admin'\n"
+            )
+            yield root
+
+    def test_review_files_end_to_end(self, workspace):
+        from hello_agents.agents.roles.reviewer import ReviewerRole
+
+        payload = {
+            "summary": "发现硬编码密钥",
+            "findings": [
+                {
+                    "severity": "critical",
+                    "category": "security",
+                    "file": "auth.py",
+                    "line": 1,
+                    "title": "Hardcoded API key",
+                    "description": "Secret in source control",
+                    "suggestion": "Move to environment variable",
+                }
+            ],
+            "score": {"correctness": 8, "security": 2},
+            "recommendations": ["立即移除硬编码密钥"],
+        }
+        script = [
+            {"Read": {"path": "auth.py"}},
+            {"ReviewOutput": payload},
+        ]
+        llm = ScriptedLLM(script)
+        main_config = _e2e_config()
+
+        report = asyncio.run(
+            ReviewerRole.review_files(
+                llm, main_config, str(workspace), ["auth.py"], review_focus="security"
+            )
+        )
+
+        assert report.error is None
+        assert report.summary == "发现硬编码密钥"
+        assert len(report.findings) == 1
+        finding = report.findings[0]
+        assert finding.severity == "critical"
+        assert finding.category == "security"
+        assert finding.file == "auth.py"
+        assert finding.line == 1
+        assert report.score["security"] == 2
+        assert report.recommendations == ["立即移除硬编码密钥"]
+        # Markdown 渲染可用
+        md = report.to_markdown()
+        assert "[CRITICAL]" in md and "auth.py:1" in md
+
+    def test_review_files_degraded_output(self, workspace):
+        """子 Agent 未按 schema 输出 → 降级报告, 不抛异常."""
+        from hello_agents.agents.roles.reviewer import ReviewerRole
+
+        script = [
+            {"Finish": {"answer": "代码看起来没问题, 但我说不清具体 JSON."}},
+        ]
+        llm = ScriptedLLM(script)
+
+        report = asyncio.run(
+            ReviewerRole.review_files(llm, _e2e_config(), str(workspace), ["auth.py"])
+        )
+
+        assert report.error == "parse_fallback"
+        assert report.findings == []
+
+
+# ============================================================================
+# E2E Scenario 16: AgentOrchestra Full Chain
+# ============================================================================
+
+
+class TestAgentOrchestraE2E:
+    """Orchestra 完整链路: decompose → 真实子 Agent 执行 → aggregate."""
+
+    @pytest.fixture
+    def workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app.py").write_text("def work():\n    return 42\n")
+            yield root
+
+    def _main_agent(self, workspace, llm):
+        return CodeAgent(
+            "orchestrator",
+            llm,
+            project_root=str(workspace),
+            config=_e2e_config(),
+            register_default_tools=True,
+            enable_task_tool=False,
+            interactive=False,
+            max_steps=20,
+        )
+
+    def test_full_pipeline_chain(self, workspace):
+        """decompose(hybrid) → Explorer(Read→Finish) → Reviewer(Finish) → aggregate."""
+        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
+
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "exp-1", "description": "探索 app.py 的功能", "role": "explorer",
+                 "dependencies": []},
+                {"id": "rev-1", "description": "审查发现的问题", "role": "reviewer",
+                 "dependencies": ["exp-1"]},
+            ],
+            "mode": "hybrid",
+            "stages": [["exp-1"], ["rev-1"]],
+        }, ensure_ascii=False)
+
+        script = [
+            {"_text": plan_json},                                        # 1. decompose
+            {"Read": {"path": "app.py"}},                                # 2. explorer round 1
+            {"Finish": {"answer": "app.py: work() returns 42"}},         # 3. explorer round 2
+            {"Finish": {"answer": "审查通过, 无严重问题"}},               # 4. reviewer round 1
+            {"_text": "最终答案: 项目健康"},                              # 5. aggregate
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        orchestra = AgentOrchestra(main)
+
+        answer = asyncio.run(orchestra.run("分析这个项目", ExecutionMode.HYBRID))
+
+        assert answer == "最终答案: 项目健康"
+        assert llm.call_count == 5
+        # 阶段间上下文注入: reviewer 的 prompt 包含 explorer 的结果摘要
+        reviewer_call = llm.invoke_history[3]
+        reviewer_prompt = json.dumps(reviewer_call["messages"], ensure_ascii=False, default=str)
+        assert "work() returns 42" in reviewer_prompt
+
+    def test_parallel_chain(self, workspace):
+        """decompose(parallel) → 两个 Explorer 并行 → aggregate."""
+        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
+
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "e1", "description": "探索结构", "role": "explorer", "dependencies": []},
+                {"id": "e2", "description": "探索依赖", "role": "explorer", "dependencies": []},
+            ],
+            "mode": "parallel",
+            "stages": [],
+        }, ensure_ascii=False)
+
+        script = [
+            {"_text": plan_json},
+            {"Finish": {"answer": "结构分析"}},
+            {"Finish": {"answer": "依赖分析"}},
+            {"_text": "并行汇总答案"},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        orchestra = AgentOrchestra(main)
+
+        answer = asyncio.run(orchestra.run("并行分析", ExecutionMode.PARALLEL))
+
+        assert answer == "并行汇总答案"
+        assert llm.call_count == 4
+
+    def test_decompose_failure_falls_back_and_completes(self, workspace):
+        """decompose 两次输出非法 JSON → fallback 计划仍完整跑完流程."""
+        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
+
+        script = [
+            {"_text": "这不是 JSON"},
+            {"_text": "依然不是 JSON"},
+            {"Finish": {"answer": "fallback 探索完成"}},
+            {"_text": "fallback 汇总"},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        orchestra = AgentOrchestra(main)
+
+        answer = asyncio.run(orchestra.run("任意任务", ExecutionMode.HYBRID))
+
+        assert answer == "fallback 汇总"
+        # 2 次 decompose 尝试 + 1 次子 Agent 执行 + 1 次 aggregate
+        assert llm.call_count == 4
+
+    def test_context_isolation_main_history_unpolluted(self, workspace):
+        """隔离性契约: 子 Agent 的中间过程 (工具调用/试错) 不进入主 Agent 历史."""
+        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
+
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "exp-1", "description": "探索 app.py", "role": "explorer",
+                 "dependencies": []},
+            ],
+            "mode": "hybrid",
+            "stages": [["exp-1"]],
+        }, ensure_ascii=False)
+        script = [
+            {"_text": plan_json},
+            {"Read": {"path": "app.py"}},
+            {"Grep": {"pattern": "work"}},
+            {"Finish": {"answer": "app.py: work() returns 42"}},
+            {"_text": "最终答案"},
+        ]
+        llm = ScriptedLLM(script)
+        main = self._main_agent(workspace, llm)
+        history_before = len(main.get_history())
+
+        answer = asyncio.run(
+            AgentOrchestra(main).run("探索项目", ExecutionMode.HYBRID)
+        )
+
+        assert answer == "最终答案"
+        # 子 Agent 的 Read/Grep 等中间步骤未污染主 Agent 历史
+        assert len(main.get_history()) == history_before
+        for msg in main.get_history():
+            assert msg.role != "tool"

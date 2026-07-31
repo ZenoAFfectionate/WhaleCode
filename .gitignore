@@ -163,8 +163,10 @@ cython_debug/
 .venv
 
 /memory/
+scripts/memory/
 /docs/
 /data/
 /result/
 IMPROVEMENT.md
+*.patch
 PLAN.md

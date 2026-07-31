@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from code.context.history import HistoryManager
-from code.context.token_counter import TokenCounter
-from code.core.config import Config
-from code.core.message import Message
+from hello_agents.context.history import HistoryManager
+from hello_agents.context.token_counter import TokenCounter
+from hello_agents.core.config import Config
+from hello_agents.core.message import Message
 
 
 # ============================================================================

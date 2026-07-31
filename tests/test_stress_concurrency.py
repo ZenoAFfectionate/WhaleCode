@@ -21,15 +21,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from code.agents.react_agent import ReActAgent
-from code.context.history import HistoryManager
-from code.context.token_counter import TokenCounter
-from code.core.config import Config
-from code.core.message import Message
-from code.tools.base import Tool, ToolParameter
-from code.tools.registry import ToolRegistry
-from code.tools.response import ToolResponse, ToolStatus
-from code.tools.lsp.manager import LSPManager
+from hello_agents.agents.react_agent import ReActAgent
+from hello_agents.context.history import HistoryManager
+from hello_agents.context.token_counter import TokenCounter
+from hello_agents.core.config import Config
+from hello_agents.core.message import Message
+from hello_agents.tools.base import Tool, ToolParameter
+from hello_agents.tools.registry import ToolRegistry
+from hello_agents.tools.response import ToolResponse, ToolStatus
+from hello_agents.tools.lsp.manager import LSPManager
 
 
 # ============================================================================
@@ -596,7 +596,7 @@ class TestConcurrentAgentSessions:
         def run_agent(file_to_read: str):
             try:
                 registry = ToolRegistry()
-                from code.tools.builtin.file_tools import ReadTool
+                from hello_agents.tools.builtin.file_tools import ReadTool
                 registry.register_tool(ReadTool(
                     project_root=str(workspace),
                     working_dir=str(workspace),

@@ -223,6 +223,10 @@ function setVitalsStatus(status) {
   bar.classList.toggle("is-failed", status === "failed");
   bar.classList.toggle("is-cancelled", status === "cancelled");
   $("#vitalStatus").textContent = statusLabel(status);
+  const label = statusLabel(status);
+  document.title = (status === "running" || status === "queued")
+    ? `● ${label} · ${BASE_TITLE}`
+    : (status === "failed" ? `✕ ${label} · ${BASE_TITLE}` : BASE_TITLE);
 }
 function startRunTimer() {
   stopRunTimer();
@@ -238,7 +242,13 @@ function ensureStreamReady() {
   const empty = $("#chatStream .empty-state");
   if (empty) empty.remove();
 }
-function scrollStream() { const s = $("#traceStream"); s.scrollTop = s.scrollHeight; }
+function scrollStream() {
+  const s = $("#traceStream");
+  // Only auto-scroll while the user is already near the bottom; yanking the
+  // viewport on every event would make it impossible to read earlier steps.
+  const nearBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 120;
+  if (nearBottom) s.scrollTop = s.scrollHeight;
+}
 function nextIdx() { state.run.nodeIdx += 1; return String(state.run.nodeIdx).padStart(2, "0"); }
 
 function stepShell({ phase, idx, kicker, primary, meta, body }) {
@@ -397,6 +407,38 @@ function resolveActStep(event) {
   scrollStream();
 }
 
+function addBuiltinToolStep(event) {
+  // thought 工具承载模型的显式推理；finish 等其余内建工具由 completed 收尾，不重复展示。
+  const p = event.payload || {};
+  const name = String(toolName(p)).toLowerCase();
+  if (name !== "thought" && name !== "thinking") return;
+  const text = clean(p.result_content || payloadText(p)).replace(/^Reasoning:\s*/i, "");
+  if (!text) return;
+  ensureStreamReady();
+  state.run.logStep = null;
+  const art = stepShell({
+    phase: "think", idx: nextIdx(), kicker: "思考",
+    primary: firstLine(text) || "模型思考",
+    body: "<div class=\"body-text\">" + renderMarkdown(text) + "</div>",
+  });
+  $("#chatStream").appendChild(art);
+  scrollStream();
+}
+
+function addErrorLine(text) {
+  ensureStreamReady();
+  state.run.logStep = null;
+  const art = stepShell({
+    phase: "fail", idx: nextIdx(), kicker: "错误",
+    primary: firstLine(text) || "运行错误",
+    meta: "<span class=\"step-stat\">✗</span>",
+    body: "<div class=\"body-text\">" + escapeHtml(text) + "</div>",
+  });
+  art.querySelector(".step-main").classList.add("open");
+  $("#chatStream").appendChild(art);
+  scrollStream();
+}
+
 function addLogLine(event) {
   ensureStreamReady();
   const line = payloadText(event.payload);
@@ -462,6 +504,13 @@ function handleEvent(event) {
     case "model_output": return addThinkStep(event);
     case "tool_call": return addActStep(event);
     case "tool_result": return resolveActStep(event);
+    case "builtin_tool": return addBuiltinToolStep(event);
+    case "control_tool": {
+      const p = event.payload || {};
+      return addSystemLine(`${toolName(p)}：${firstLine(p.result_content || "") || "已完成"}`);
+    }
+    case "agent_error": return addErrorLine(String(event.payload?.message || "Agent 运行错误"));
+    case "llm_error": return addErrorLine(`模型调用失败：${event.payload?.error || "未知错误"}`);
     case "console": return addLogLine(event);
     case "session_loaded": return addSystemLine("会话上下文已接入本次运行");
     default: return; // job_created / status / benchmark_* / completed / failed handled elsewhere
@@ -502,6 +551,10 @@ function resetAgentConversation() {
     active: false, jobId: null, steps: 0, nodeIdx: 0, startedAt: 0, timer: null,
     pendingTools: new Map(), pendingOrder: [], logStep: null,
   };
+  // The whole stream is being discarded, so the stored full-text blobs
+  // backing its 复制/展开 buttons can be released too.
+  state.blobs.clear();
+  state.blobSeq = 0;
   setVitalsStatus("idle");
   updateResumeBanner();
   const cancel = $("#cancelAgentButton");
@@ -513,10 +566,12 @@ function resetAgentConversation() {
 }
 
 /* ------------------------------ status -------------------------------- */
+const BASE_TITLE = document.title;
 async function refreshStatus() {
   const data = await api("/api/status");
   state.projectRoot = data.project_root || "";
   renderModelStatus(data.model || {});
+  renderGpu(data.gpu);
 }
 function renderModelStatus(snapshot) {
   state.modelSnapshot = snapshot;
@@ -525,6 +580,34 @@ function renderModelStatus(snapshot) {
   $("#serviceDot").className = `dot ${running ? "running" : status === "loading" ? "loading" : "stopped"}`;
   $("#serviceStatus").textContent = statusLabel(status);
   $("#activeModel").textContent = snapshot.active_model || "未加载";
+}
+function renderGpu(gpu) {
+  const box = $("#reactorGpu");
+  if (!box) return;
+  const rows = gpu && gpu.available && Array.isArray(gpu.gpus) ? gpu.gpus : [];
+  if (!rows.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = rows.slice(0, 4).map((row) => {
+    const usedGb = (row.memory_used_mb / 1024).toFixed(1);
+    const totalGb = Math.round(row.memory_total_mb / 1024);
+    const memPct = row.memory_total_mb > 0
+      ? Math.min(100, Math.round((row.memory_used_mb / row.memory_total_mb) * 100))
+      : 0;
+    const utilPct = Math.min(100, Math.max(0, Number(row.utilization) || 0));
+    const name = escapeHtml(row.name || `GPU ${row.index}`);
+    return `<div class="reactor-line reactor-gpu-line" title="${name}">
+  <span class="label">GPU${escapeHtml(String(row.index))}</span>
+  <strong>${name}</strong>
+</div>
+<div class="reactor-line"><span class="label">显存</span>
+  <span class="meter" role="img" aria-label="显存占用 ${memPct}%"><span style="width:${memPct}%"></span></span>
+  <strong>${usedGb}/${totalGb} GB</strong>
+</div>
+<div class="reactor-line"><span class="label">算力</span>
+  <span class="meter" role="img" aria-label="算力占用 ${utilPct}%"><span style="width:${utilPct}%"></span></span>
+  <strong>${utilPct}%</strong>
+</div>`;
+  }).join("");
 }
 
 /* ----------------------------- sessions ------------------------------- */
@@ -679,7 +762,7 @@ function renderBenchmarkDetail(detail) {
   const stats = computeStats(records);
   const summary = detail.summary || {};
   const extra = Object.entries(summary)
-    .filter(([, v]) => v == null || typeof v !== "object")
+    .filter(([, v]) => v != null && typeof v !== "object")
     .filter(([k]) => !["passed", "total", "pass_rate", "failed"].includes(k))
     .slice(0, 12);
 
@@ -689,7 +772,7 @@ function renderBenchmarkDetail(detail) {
     const benchmark = r.benchmark || summary.benchmark || detail.benchmark || datasetLabel(detail);
     const trajectoryButton = r.trajectory_available ? "<button type=\"button\" class=\"trajectory-button\" data-trajectory-task=\""
       + escapeHtml(taskId) + "\" data-trajectory-benchmark=\"" + escapeHtml(benchmark || "") + "\">查看 trajectory</button>" : "";
-    return `<details class="case-row ${s}">
+    return `<details class="case-row ${s}"${s === "failed" ? " open" : ""}>
         <summary>
           <span class="case-status">${s === "passed" ? "正确" : s === "failed" ? "错误" : "未知"}</span>
           <span class="case-title">${escapeHtml(taskId)}</span>
@@ -857,6 +940,7 @@ function subscribeJob(job, handlers = {}) {
     if (["completed", "failed", "cancelled"].includes(data.type)) source.close();
   };
   ["job_created", "status", "console", "model_output", "tool_call", "tool_result",
+   "builtin_tool", "control_tool", "agent_error", "llm_error",
    "session_loaded", "benchmark_started", "benchmark_output", "completed", "failed", "cancelled"]
     .forEach((name) => source.addEventListener(name, onAny));
   source.onerror = () => { if (["completed", "failed", "cancelled"].includes(job.status)) source.close(); };
@@ -881,6 +965,7 @@ async function runAgent(event) {
   state.run.active = true;
   state.run.jobId = null;
   state.run.steps = 0;
+  state.run.nodeIdx = 0;
   state.run.pendingTools = new Map();
   state.run.pendingOrder = [];
   state.run.logStep = null;
@@ -890,7 +975,8 @@ async function runAgent(event) {
   startRunTimer();
   setBusy($("#runAgentButton"), true, "运行中");
   const cancelButton = $("#cancelAgentButton");
-  if (cancelButton) { cancelButton.hidden = false; cancelButton.disabled = false; }
+  // Disabled until the job id is known — a cancel click before that would no-op.
+  if (cancelButton) { cancelButton.hidden = false; cancelButton.disabled = true; }
 
   const finish = (status) => {
     stopRunTimer();
@@ -914,6 +1000,7 @@ async function runAgent(event) {
       }),
     });
     state.run.jobId = job.id;
+    if (cancelButton) cancelButton.disabled = false;
     state.activeEventSource = subscribeJob(job, {
       any: handleEvent,
       completed(data) {
@@ -955,13 +1042,16 @@ async function cancelAgentRun() {
 
 /* --------------------------- run benchmark ---------------------------- */
 function appendBenchLog(line) {
-  const empty = $("#benchLog .log-empty");
+  const log = $("#benchLog");
+  const empty = log.querySelector(".log-empty");
   if (empty) empty.remove();
   const el = document.createElement("div");
   el.className = "log-line";
   el.textContent = line;
-  $("#benchLog").appendChild(el);
-  $("#benchLog").scrollTop = $("#benchLog").scrollHeight;
+  log.appendChild(el);
+  // Cap DOM growth for long benchmark runs (thousands of output lines).
+  while (log.children.length > 2000) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
 }
 async function runBenchmark(event) {
   event.preventDefault();
@@ -1064,6 +1154,7 @@ function bindEvents() {
     const row = e.target.closest(".session-item");
     if (!row?.dataset.filepath) return;
     if (e.target.closest(".delete-session")) {
+      if (!window.confirm(`删除会话「${row.dataset.title || row.dataset.filename}」？此操作不可恢复。`)) return;
       await api(`/api/sessions/${encodeURIComponent(row.dataset.filename)}`, { method: "DELETE" });
       if (state.selectedSession === row.dataset.filepath) { state.selectedSession = null; state.selectedSessionTitle = "新会话"; }
       await refreshSessions();
@@ -1102,6 +1193,8 @@ async function init() {
   bindEvents();
   renderEmptyState();
   await Promise.allSettled([refreshStatus(), refreshSessions(), refreshDatasets(), refreshBenchmarkHistory()]);
+  // GPU 读数与服务状态随时间变化，低频轮询保持侧栏鲜活（15s，远轻于 SSE）。
+  setInterval(() => { refreshStatus().catch(() => {}); }, 15000);
 }
 
 init().catch((error) => addSystemLine(`初始化失败：${error.message}`));

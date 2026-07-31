@@ -360,6 +360,10 @@ svg {
 .vitals.is-failed .vital-status strong { color: var(--fail); }
 .vitals-spacer { flex: 1; }
 
+/* The `hidden` attribute must always win over component display rules
+   (author styles override the UA [hidden] rule otherwise). */
+[hidden] { display: none !important; }
+
 .ghost-button {
   min-height: 34px;
   display: inline-flex;

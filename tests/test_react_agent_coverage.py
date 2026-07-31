@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from code.agents.react_agent import (
+from hello_agents.agents.react_agent import (
     FINISH_TOOL_NAME,
     STRUCTURED_OUTPUT_TOOL_NAME,
     THOUGHT_TOOL_NAME,
@@ -37,10 +37,10 @@ from code.agents.react_agent import (
     _ThoughtTool,
     ReActAgent,
 )
-from code.core.config import Config
-from code.tools.base import Tool, ToolParameter
-from code.tools.registry import ToolRegistry
-from code.tools.response import ToolResponse, ToolStatus
+from hello_agents.core.config import Config
+from hello_agents.tools.base import Tool, ToolParameter
+from hello_agents.tools.registry import ToolRegistry
+from hello_agents.tools.response import ToolResponse, ToolStatus
 
 
 def _mock_llm():

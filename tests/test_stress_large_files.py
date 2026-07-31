@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from code.context.token_counter import TokenCounter, _LRUCache
-from code.context.truncator import ObservationTruncator
-from code.core.message import Message
+from hello_agents.context.token_counter import TokenCounter, _LRUCache
+from hello_agents.context.truncator import ObservationTruncator
+from hello_agents.core.message import Message
 
 
 # ============================================================================
@@ -192,7 +192,7 @@ class TestMessageContentExplosion:
 
     def test_large_message_in_history_manager(self):
         """HistoryManager handles a single huge message gracefully."""
-        from code.context.history import HistoryManager
+        from hello_agents.context.history import HistoryManager
 
         hm = HistoryManager(token_counter=TokenCounter())
         huge_msg = Message("x" * 500_000, "user")  # 500K chars
@@ -204,7 +204,7 @@ class TestMessageContentExplosion:
 
     def test_many_large_messages(self):
         """50 messages of 10K chars each — token estimation stays consistent."""
-        from code.context.history import HistoryManager
+        from hello_agents.context.history import HistoryManager
 
         hm = HistoryManager(token_counter=TokenCounter())
         for i in range(50):

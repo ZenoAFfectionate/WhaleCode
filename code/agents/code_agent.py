@@ -92,6 +92,13 @@ class CodeAgent(ReActAgent):
         from ..tools.builtin.ask_user import AskUserTool
         from ..tools.builtin.bash import BashTool
         from ..tools.builtin.file_tools import DeleteTool, EditTool, ListFilesTool, ReadTool, WriteTool
+        from ..tools.builtin.git_tools import (
+            GitBlameTool,
+            GitCommitTool,
+            GitDiffTool,
+            GitLogTool,
+            GitStatusTool,
+        )
         from ..tools.builtin.glob_tool import GlobTool
         from ..tools.builtin.grep_tool import GrepTool
         from ..tools.builtin.web_tool import WebSearchTool, WebFetchTool
@@ -147,6 +154,18 @@ class CodeAgent(ReActAgent):
                 output_truncator=self.truncator,
             )
         )
+        # Git tools — structured porcelain output; gated by config + env switch.
+        if GitStatusTool.is_enabled_by_default() and getattr(self.config, "git_tools_enabled", True):
+            for git_tool_cls in (GitStatusTool, GitDiffTool, GitLogTool, GitBlameTool, GitCommitTool):
+                self.tool_registry.register_tool(
+                    git_tool_cls(
+                        project_root=str(self.project_root),
+                        working_dir=str(self.working_dir),
+                        config=self.config,
+                        output_truncator=self.truncator,
+                    )
+                )
+
         self.tool_registry.register_tool(AskUserTool(interactive=self.interactive))
 
         if WebSearchTool.is_enabled_by_default():

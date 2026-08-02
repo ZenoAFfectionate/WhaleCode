@@ -170,3 +170,6 @@ scripts/memory/
 IMPROVEMENT.md
 *.patch
 PLAN.md
+
+# 运行时产物（traces / sessions / todos / 日志），不应纳入版本控制
+web/runtime/

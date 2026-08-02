@@ -11,7 +11,7 @@
     href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./styles.css?v=9" />
 </head>
 <body>
   <div class="shell">
@@ -54,7 +54,6 @@
           <span class="label">模型</span>
           <strong id="activeModel">未加载</strong>
         </div>
-        <div class="reactor-gpu" id="reactorGpu" hidden></div>
       </div>
     </aside>
 
@@ -94,7 +93,6 @@
         </div>
 
         <form class="composer" id="agentForm">
-          <div class="resume-banner" id="resumeBanner" hidden></div>
           <div class="prompt-box">
             <textarea id="promptInput" rows="1" placeholder="输入代码问题、开发任务或调试需求…"></textarea>
             <button class="primary-button" id="runAgentButton" type="submit">
@@ -123,7 +121,7 @@
               </div>
               <div class="dataset-grid" id="datasetGrid"></div>
               <form class="bench-form" id="benchForm">
-                <label>
+                <label class="bench-model-label">
                   <span class="label">模型</span>
                   <input id="benchModel" type="text" placeholder="留空使用当前模型" />
                 </label>
@@ -179,6 +177,6 @@
     </main>
   </div>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=9"></script>
 </body>
 </html>

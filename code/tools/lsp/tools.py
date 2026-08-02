@@ -14,6 +14,7 @@ how to install the server.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
@@ -52,7 +53,7 @@ def _format_location(
         parsed = urlparse(uri)
         file_path = Path(parsed.path)
         try:
-            rel = file_path.relative_to(workspace_root)
+            rel = file_path.relative_to(Path(workspace_root).resolve())
         except ValueError:
             rel = file_path
     except Exception:
@@ -175,6 +176,30 @@ def _ensure_lsp(
     return client, None, str(resolved)
 
 
+def _retry_call(client: "LSPClient", method_name: str, *args: Any, retries: int = 2, delay: float = 1.5) -> Any:
+    """调用 LSP 方法并在返回空时重试。
+
+    pylsp 首次启动时 jedi 仍在后台索引项目，didOpen 后立刻查询可能返回
+    空结果；短暂等待重试可显著提升首次调用的命中率。
+    """
+    last: Any = None
+    for attempt in range(retries + 1):
+        try:
+            result = getattr(client, method_name)(*args)
+        except Exception as exc:
+            last = None
+            if attempt >= retries:
+                raise
+            time.sleep(delay)
+            continue
+        if result not in (None, [], {}, ""):
+            return result
+        last = result
+        if attempt < retries:
+            time.sleep(delay)
+    return last
+
+
 # ---------------------------------------------------------------------------
 # Tool classes
 # ---------------------------------------------------------------------------
@@ -239,7 +264,7 @@ class LSPDefinitionTool(Tool):
 
         try:
             uri = Path(resolved).as_uri()
-            result = client.definition(uri, line, character)  # type: ignore[union-attr]
+            result = _retry_call(client, "definition", uri, line, character)  # type: ignore[union-attr]
         except Exception as exc:
             return ToolResponse.partial(
                 text=f"LSP definition request failed: {exc}",
@@ -325,7 +350,7 @@ class LSPReferencesTool(Tool):
 
         try:
             uri = Path(resolved).as_uri()
-            result = client.references(uri, line, character)  # type: ignore[union-attr]
+            result = _retry_call(client, "references", uri, line, character)  # type: ignore[union-attr]
         except Exception as exc:
             return ToolResponse.partial(
                 text=f"LSP references request failed: {exc}",
@@ -415,7 +440,7 @@ class LSPHoverTool(Tool):
 
         try:
             uri = Path(resolved).as_uri()
-            result = client.hover(uri, line, character)  # type: ignore[union-attr]
+            result = _retry_call(client, "hover", uri, line, character)  # type: ignore[union-attr]
         except Exception as exc:
             return ToolResponse.partial(
                 text=f"LSP hover request failed: {exc}",

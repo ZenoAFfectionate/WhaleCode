@@ -6,6 +6,7 @@ python-dotenv>=0.19.0
 tiktoken>=0.5.0
 pyyaml>=6.0.0
 requests>=2.25.0
+numpy>=2.0.0          # benchmark (hevp_bench) 计算 pass@k 等指标必需
 
 # CLI interface
 rich>=13.0.0
@@ -13,6 +14,20 @@ prompt-toolkit>=3.0.0
 
 # Web search (used by WebSearchTool, optional but recommended)
 ddgs>=7.0.0
+
+# Testing (pyproject.toml 的 pytest addopts 引用 --cov，缺 pytest-cov 会导致 pytest 无法启动)
+pytest>=8.0.0
+pytest-cov>=5.0.0
+
+# Optional: local tokenizer counting (token_counter 使用本地模型目录时启用)
+transformers>=4.40.0
+
+# LSP (Language Server Protocol) — 提供 LSPDefinition/LSPHover/LSPReferences/LSPDiagnostics 工具
+# Python 语言服务器；其他语言需另行安装对应服务器 (typescript-language-server / rust-analyzer / gopls)
+python-lsp-server>=1.11.0
+
+# Optional: web UI 测试辅助 (web/_test_ui.py 使用)
+# playwright>=1.40.0
 
 # Optional: provider-specific SDKs (install only if you use the provider)
 # anthropic>=0.40.0        # For Anthropic Claude models

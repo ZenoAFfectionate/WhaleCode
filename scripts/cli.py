@@ -18,7 +18,7 @@ from typing import Iterable, Optional
 from dotenv import load_dotenv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CODE_DIR = PROJECT_ROOT / "code"
 
 try:
@@ -648,8 +648,8 @@ class CLIUI:
             ctx_used = getattr(agent, "_last_prompt_tokens", 0)
 
             token_parts = [
-                f"[green]⬆Σ{prompt_t:,}[/green]",
-                f"[yellow]⬇Σ{comp_t:,}[/yellow]",
+                f"[green]⬆ Σ {prompt_t:,}[/green]",
+                f"[yellow]⬇ Σ {comp_t:,}[/yellow]",
             ]
             if ctx_window > 0 and ctx_used > 0:
                 pct = ctx_used * 100 / ctx_window

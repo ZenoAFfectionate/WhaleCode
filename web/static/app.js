@@ -156,6 +156,16 @@ function rawBlock(payload) {
   if (!raw || raw === "{}") return "";
   return "<details class=\"step-raw\"><summary>raw</summary>" + longTextBlock(raw, { label: "raw JSON", language: "json" }) + "</details>";
 }
+function renderInline(text) {
+  // 行内 markdown：行内代码 → 加粗 → 斜体 → 链接（按此顺序避免正则互相干扰）
+  let out = escapeHtml(text);
+  out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return out;
+}
 function renderMarkdown(value) {
   const src = clean(value);
   if (!src) return "";
@@ -164,26 +174,47 @@ function renderMarkdown(value) {
   return chunks.map((chunk, idx) => {
     if (idx % 2 === 1) {
       const firstBreak = chunk.indexOf("\n");
+      const lang = firstBreak >= 0 ? chunk.slice(0, firstBreak).trim() : "";
       const code = firstBreak >= 0 ? chunk.slice(firstBreak + 1) : chunk;
-      return "<pre class=\"md-code\"><code>" + escapeHtml(code) + "</code></pre>";
+      const langAttr = lang ? " data-language=\"" + escapeHtml(lang) + "\"" : "";
+      return "<pre class=\"md-code\"" + langAttr + "><code>" + escapeHtml(code) + "</code></pre>";
     }
     const lines = chunk.split("\n");
     const out = [];
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
       if (!line.trim()) continue;
-      if (/^#{1,3}\s+/.test(line)) {
-        const level = line.match(/^#+/)[0].length + 2;
-        out.push("<h" + level + ">" + escapeHtml(line.replace(/^#+\s+/, "")) + "</h" + level + ">");
-      } else if (/^\s*[-*]\s+/.test(line)) {
+      // 标题 1-6 级
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        const level = Math.min(6, heading[1].length + 2);
+        out.push("<h" + level + ">" + renderInline(heading[2]) + "</h" + level + ">");
+        continue;
+      }
+      // 无序列表
+      if (/^\s*[-*+]\s+/.test(line)) {
         const items = [];
-        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-          items.push("<li>" + escapeHtml(lines[i].replace(/^\s*[-*]\s+/, "")) + "</li>");
+        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+          items.push("<li>" + renderInline(lines[i].replace(/^\s*[-*+]\s+/, "")) + "</li>");
           i += 1;
         }
         i -= 1;
         out.push("<ul>" + items.join("") + "</ul>");
-      } else if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) {
+        continue;
+      }
+      // 有序列表
+      if (/^\s*\d+[.)]\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+          items.push("<li>" + renderInline(lines[i].replace(/^\s*\d+[.)]\s+/, "")) + "</li>");
+          i += 1;
+        }
+        i -= 1;
+        out.push("<ol>" + items.join("") + "</ol>");
+        continue;
+      }
+      // 表格
+      if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) {
         const headers = line.split("|").map((x) => clean(x)).filter(Boolean);
         i += 2;
         const rows = [];
@@ -192,12 +223,12 @@ function renderMarkdown(value) {
           i += 1;
         }
         i -= 1;
-        out.push("<table><thead><tr>" + headers.map((h) => "<th>" + escapeHtml(h) + "</th>").join("") + "</tr></thead><tbody>"
-          + rows.map((row) => "<tr>" + row.map((c) => "<td>" + escapeHtml(c) + "</td>").join("") + "</tr>").join("")
+        out.push("<table><thead><tr>" + headers.map((h) => "<th>" + renderInline(h) + "</th>").join("") + "</tr></thead><tbody>"
+          + rows.map((row) => "<tr>" + row.map((c) => "<td>" + renderInline(c) + "</td>").join("") + "</tr>").join("")
           + "</tbody></table>");
-      } else {
-        out.push("<p>" + escapeHtml(line) + "</p>");
+        continue;
       }
+      out.push("<p>" + renderInline(line) + "</p>");
     }
     return out.join("");
   }).join("");
@@ -384,6 +415,46 @@ function addStandaloneObserve(event) {
   scrollStream();
 }
 
+function parseAskUserAnswers(text) {
+  /* 解析工具 text 中的问答对：`User answered N question(s):` 后每行 `- qid: answer` */
+  const lines = String(text || "").split("\n");
+  const pairs = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*-\s*([^:]+):\s*(.+)$/);
+    if (m) pairs.push({ id: m[1].trim(), answer: m[2].trim() });
+  }
+  return pairs;
+}
+
+function renderAskUserResult(payload, ok, el) {
+  /* AskUser 完成后的美观展示：绿色成功主题 + 问题/回答对照（见 IMPROVEMENT.md 改进 1） */
+  if (!ok) return renderToolResultBody(payload, false);
+  const text = payloadText(payload) || "";
+  const pairs = parseAskUserAnswers(text);
+  const questions = (el && el._askQuestions) || [];
+  const qText = (qid) => {
+    const q = questions.find((item) => String(item.id || "") === qid);
+    return q ? String(q.text || "") : "";
+  };
+
+  const items = pairs.map((pair) => {
+    const question = qText(pair.id);
+    const qHtml = question
+      ? `<span class="ask-result-q">${renderInline(question)}</span>`
+      : `<span class="ask-result-q ask-result-q-muted">问题 ${escapeHtml(pair.id)}</span>`;
+    return `<div class="ask-result-item">
+      ${qHtml}
+      <div class="ask-result-a">${escapeHtml(pair.answer).replace(/\n/g, "<br>")}</div>
+    </div>`;
+  }).join("");
+
+  if (!items) return renderToolResultBody(payload, true);
+  return `<div class="ask-result">
+    <div class="ask-result-head"><span class="ask-result-badge">✓ 已收到你的回答</span></div>
+    ${items}
+  </div>`;
+}
+
 function resolveActStep(event) {
   const p = event.payload || {};
   const ok = toolResultStatus(p) === "success";
@@ -403,7 +474,10 @@ function resolveActStep(event) {
     "<span class=\"step-stat\">" + (ok ? "✓" : "✗") + "</span><span>" + dur + "</span>"
     + "<svg class=\"step-caret\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m9 6 6 6-6 6\"/></svg>";
   const body = el.querySelector(".step-body");
-  body.innerHTML = renderToolResultBody(p, ok);
+  const name = String(toolName(p)).toLowerCase();
+  body.innerHTML = name === "askuser"
+    ? renderAskUserResult(p, ok, el)
+    : renderToolResultBody(p, ok);
   scrollStream();
 }
 
@@ -421,6 +495,136 @@ function addBuiltinToolStep(event) {
     primary: firstLine(text) || "模型思考",
     body: "<div class=\"body-text\">" + renderMarkdown(text) + "</div>",
   });
+  $("#chatStream").appendChild(art);
+  scrollStream();
+}
+
+function buildAskForm(questions, jobId, onSubmitted) {
+  /* 构造提问表单 HTML，绑定选项选中/提交逻辑，返回 {html, wire}。
+     wire() 在卡片挂载后调用以绑定事件。 */
+  const qBlocks = questions.map((q, qi) => {
+    const qid = String(q.id || `q${qi + 1}`);
+    const text = String(q.text || "");
+    const options = Array.isArray(q.options) && q.options.length ? q.options : [];
+    let controlHtml;
+    if (options.length) {
+      controlHtml = `<div class="ask-options" data-qid="${qid}">` + options.map((opt, oi) => {
+        const label = String((opt && (opt.label || opt.text || opt.value)) || "");
+        const value = String((opt && opt.value) || label);
+        return `<button type="button" class="ask-option" data-qid="${qid}" data-value="${escapeHtml(value)}">
+          <span class="ask-option-num">${oi + 1}</span>
+          <span class="ask-option-label">${escapeHtml(label)}</span>
+        </button>`;
+      }).join("") + "</div>";
+    } else {
+      controlHtml = `<textarea class="ask-input" data-qid="${qid}" rows="2" placeholder="输入你的回答…"></textarea>`;
+    }
+    return `<div class="ask-question" data-qid="${qid}">
+      <div class="ask-qtext">${renderInline(text)}</div>
+      ${controlHtml}
+    </div>`;
+  }).join("");
+  const html = `<div class="ask-box">${qBlocks}
+      <div class="ask-actions">
+        <button type="button" class="ask-submit" data-job="${escapeHtml(jobId)}">提交回答</button>
+        <span class="ask-hint">回答提交后模型将继续执行</span>
+      </div>
+    </div>`;
+
+  function wire(root) {
+    root.querySelectorAll(".ask-option").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const qid = btn.dataset.qid;
+        root.querySelectorAll(`.ask-option[data-qid="${qid}"]`).forEach((b) => b.classList.remove("selected"));
+        btn.classList.add("selected");
+      });
+    });
+    const submit = root.querySelector(".ask-submit");
+    submit.addEventListener("click", async () => {
+      const answers = questions.map((q, qi) => {
+        const qid = String(q.id || `q${qi + 1}`);
+        let answer = "";
+        const selected = root.querySelector(`.ask-option.selected[data-qid="${qid}"]`);
+        if (selected) answer = selected.dataset.value;
+        else {
+          const ta = root.querySelector(`textarea[data-qid="${qid}"]`);
+          if (ta) answer = ta.value.trim();
+        }
+        return { id: qid, answer };
+      });
+      submit.disabled = true;
+      submit.textContent = "提交中…";
+      try {
+        await api("/api/agent/answers", {
+          method: "POST",
+          body: JSON.stringify({ job_id: jobId, answers }),
+        });
+        if (onSubmitted) onSubmitted(root, submit);
+      } catch (err) {
+        submit.disabled = false;
+        submit.textContent = "提交回答";
+        const hint = root.querySelector(".ask-hint");
+        if (hint) hint.textContent = "提交失败：" + (err.message || err) + "（可能已超时）";
+      }
+    });
+  }
+  return { html, wire };
+}
+
+function addAskUserCard(event) {
+  ensureStreamReady();
+  state.run.logStep = null;
+  const p = event.payload || {};
+  const questions = Array.isArray(p.questions) ? p.questions : [];
+  if (!questions.length) return;
+  const jobId = p.job_id || state.run.jobId;
+  const form = buildAskForm(questions, jobId, (root) => {
+    const hint = root.querySelector(".ask-hint");
+    if (hint) hint.textContent = "已提交回答，等待模型继续执行…";
+    root.querySelectorAll(".ask-input, .ask-option").forEach((el) => { el.disabled = true; });
+  });
+  // 记住问题列表：tool_result 到达时用它渲染美观的问答结果（result_content 只有 qid+回答）
+  form._questions = questions;
+
+  // 优先注入到正在运行的 AskUser 工具调用卡片（复用其展示框，见 IMPROVEMENT.md 改进 1）
+  const steps = document.querySelectorAll("#chatStream .step.running");
+  let target = null;
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const kicker = steps[i].querySelector(".step-kicker");
+    if (kicker && kicker.textContent.trim().toLowerCase() === "askuser") {
+      target = steps[i];
+      break;
+    }
+  }
+
+  const storeQuestions = (el) => { el._askQuestions = questions; };
+
+  if (target) {
+    const body = target.querySelector(".step-body");
+    const main = target.querySelector(".step-main");
+    if (body) body.innerHTML = form.html;
+    if (main) main.classList.add("open");
+    if (form.wire) form.wire(target);
+    storeQuestions(target);
+    const meta = target.querySelector(".step-meta");
+    if (meta) meta.innerHTML = "<span class=\"step-stat\">等待回答</span>";
+    const head = target.querySelector(".step-head");
+    if (head) head.setAttribute("aria-expanded", "true");
+    scrollStream();
+    return;
+  }
+
+  // 回退：独立提问卡片
+  const art = stepShell({
+    phase: "act running tool-ask", idx: nextIdx(), kicker: "AskUser",
+    primary: "需要你的确认",
+    meta: "<span class=\"step-stat\">等待回答</span>",
+    body: form.html,
+  });
+  art.querySelector(".step-main").classList.add("open");
+  art.querySelector(".step-head").setAttribute("aria-expanded", "true");
+  if (form.wire) form.wire(art);
+  storeQuestions(art);
   $("#chatStream").appendChild(art);
   scrollStream();
 }
@@ -480,19 +684,10 @@ function addSystemLine(text) {
 function addAnswer(text, meta = {}, failed = false) {
   ensureStreamReady();
   state.run.logStep = null;
-  const duration = typeof meta === "number" ? meta : meta.duration_seconds;
   const art = document.createElement("article");
   art.className = "answer" + (failed ? " failed" : "");
-  const chips = [
-    meta.model ? ["模型", meta.model] : null,
-    meta.steps != null ? ["Steps", meta.steps] : null,
-    meta.tokens != null ? ["Tokens", formatTokens(meta.tokens)] : null,
-    duration != null ? ["Duration", formatDuration(duration)] : null,
-  ].filter(Boolean).map(([k, v]) => "<span><b>" + escapeHtml(k) + "</b>" + escapeHtml(v) + "</span>").join("");
   art.innerHTML =
-    "<div class=\"answer-head\"><span class=\"label\">" + (failed ? "执行失败" : "最终答案") + "</span>"
-    + "<div class=\"answer-meta\">" + chips + "</div></div>"
-    + "<div class=\"answer-body markdown-body\">" + renderMarkdown(text) + "</div>";
+    "<div class=\"answer-body markdown-body\">" + renderMarkdown(text) + "</div>";
   $("#chatStream").appendChild(art);
   scrollStream();
 }
@@ -505,6 +700,7 @@ function handleEvent(event) {
     case "tool_call": return addActStep(event);
     case "tool_result": return resolveActStep(event);
     case "builtin_tool": return addBuiltinToolStep(event);
+    case "ask_user": return addAskUserCard(event);
     case "control_tool": {
       const p = event.payload || {};
       return addSystemLine(`${toolName(p)}：${firstLine(p.result_content || "") || "已完成"}`);
@@ -528,20 +724,6 @@ function renderEmptyState() {
     </div>`;
 }
 
-function updateResumeBanner() {
-  const el = $("#resumeBanner");
-  if (!el) return;
-  if (!state.selectedSession) {
-    el.hidden = true;
-    el.innerHTML = "";
-    return;
-  }
-  el.hidden = false;
-  el.innerHTML = "<span class=\"label\">继续会话</span>"
-    + "<strong>" + escapeHtml(state.selectedSessionTitle || "历史会话") + "</strong>"
-    + "<small>下一次运行会基于该历史上下文继续；点击“新会话”可清空。</small>";
-}
-
 function resetAgentConversation() {
   if (state.activeEventSource) { state.activeEventSource.close(); state.activeEventSource = null; }
   stopRunTimer();
@@ -556,7 +738,6 @@ function resetAgentConversation() {
   state.blobs.clear();
   state.blobSeq = 0;
   setVitalsStatus("idle");
-  updateResumeBanner();
   const cancel = $("#cancelAgentButton");
   if (cancel) { cancel.hidden = true; cancel.disabled = false; }
   $("#vitalStep").textContent = "0";
@@ -571,7 +752,6 @@ async function refreshStatus() {
   const data = await api("/api/status");
   state.projectRoot = data.project_root || "";
   renderModelStatus(data.model || {});
-  renderGpu(data.gpu);
 }
 function renderModelStatus(snapshot) {
   state.modelSnapshot = snapshot;
@@ -581,36 +761,32 @@ function renderModelStatus(snapshot) {
   $("#serviceStatus").textContent = statusLabel(status);
   $("#activeModel").textContent = snapshot.active_model || "未加载";
 }
-function renderGpu(gpu) {
-  const box = $("#reactorGpu");
-  if (!box) return;
-  const rows = gpu && gpu.available && Array.isArray(gpu.gpus) ? gpu.gpus : [];
-  if (!rows.length) { box.hidden = true; box.innerHTML = ""; return; }
-  box.hidden = false;
-  box.innerHTML = rows.slice(0, 4).map((row) => {
-    const usedGb = (row.memory_used_mb / 1024).toFixed(1);
-    const totalGb = Math.round(row.memory_total_mb / 1024);
-    const memPct = row.memory_total_mb > 0
-      ? Math.min(100, Math.round((row.memory_used_mb / row.memory_total_mb) * 100))
-      : 0;
-    const utilPct = Math.min(100, Math.max(0, Number(row.utilization) || 0));
-    const name = escapeHtml(row.name || `GPU ${row.index}`);
-    return `<div class="reactor-line reactor-gpu-line" title="${name}">
-  <span class="label">GPU${escapeHtml(String(row.index))}</span>
-  <strong>${name}</strong>
-</div>
-<div class="reactor-line"><span class="label">显存</span>
-  <span class="meter" role="img" aria-label="显存占用 ${memPct}%"><span style="width:${memPct}%"></span></span>
-  <strong>${usedGb}/${totalGb} GB</strong>
-</div>
-<div class="reactor-line"><span class="label">算力</span>
-  <span class="meter" role="img" aria-label="算力占用 ${utilPct}%"><span style="width:${utilPct}%"></span></span>
-  <strong>${utilPct}%</strong>
-</div>`;
-  }).join("");
-}
-
 /* ----------------------------- sessions ------------------------------- */
+async function renderSessionHistory(history) {
+  const stream = $("#chatStream");
+  if (!stream) return;
+  stream.innerHTML = "";
+  for (const msg of history || []) {
+    const role = msg && msg.role;
+    const content = String(msg && msg.content != null ? msg.content : "");
+    if (!content) continue;
+    if (role === "user") {
+      const turn = document.createElement("article");
+      turn.className = "turn-user";
+      turn.innerHTML = escapeHtml(content).replace(/\n/g, "<br>");
+      stream.appendChild(turn);
+    } else if (role === "assistant") {
+      const art = document.createElement("article");
+      art.className = "answer";
+      art.innerHTML = `<div class="answer-body markdown-body">${renderMarkdown(content)}</div>`;
+      stream.appendChild(art);
+    }
+    // tool 消息是过程噪音，历史回顾时跳过
+  }
+  state.run.logStep = null;
+  const s = $("#traceStream");
+  if (s) s.scrollTop = s.scrollHeight;
+}
 async function refreshSessions() {
   const data = await api("/api/sessions");
   const sessions = data.sessions || [];
@@ -627,7 +803,6 @@ async function refreshSessions() {
       </button>
     </article>`).join("")
     : `<div class="session-empty"><strong>暂无会话</strong>运行智能体后自动生成。</div>`;
-  updateResumeBanner();
 }
 
 /* ----------------------------- datasets ------------------------------- */
@@ -940,7 +1115,7 @@ function subscribeJob(job, handlers = {}) {
     if (["completed", "failed", "cancelled"].includes(data.type)) source.close();
   };
   ["job_created", "status", "console", "model_output", "tool_call", "tool_result",
-   "builtin_tool", "control_tool", "agent_error", "llm_error",
+   "builtin_tool", "control_tool", "ask_user", "agent_error", "llm_error",
    "session_loaded", "benchmark_started", "benchmark_output", "completed", "failed", "cancelled"]
     .forEach((name) => source.addEventListener(name, onAny));
   source.onerror = () => { if (["completed", "failed", "cancelled"].includes(job.status)) source.close(); };
@@ -957,7 +1132,7 @@ async function runAgent(event) {
   ensureStreamReady();
   const turn = document.createElement("article");
   turn.className = "turn-user";
-  turn.innerHTML = `<div class="label">User</div>${escapeHtml(prompt).replace(/\n/g, "<br>")}`;
+  turn.innerHTML = escapeHtml(prompt).replace(/\n/g, "<br>");
   $("#chatStream").appendChild(turn);
 
   $("#promptInput").value = "";
@@ -1162,8 +1337,17 @@ function bindEvents() {
     }
     state.selectedSession = row.dataset.filepath;
     state.selectedSessionTitle = row.dataset.title || row.querySelector("strong")?.textContent || row.dataset.filename;
-    updateResumeBanner();
-    addSystemLine(`已选择历史会话：${state.selectedSessionTitle}，下一次运行将基于该上下文继续`);
+    addSystemLine(`已加载历史会话：${state.selectedSessionTitle}，可继续对话`);
+    try {
+      const detail = await api(`/api/sessions/${encodeURIComponent(row.dataset.filename)}`);
+      if (detail && detail.session) {
+        await renderSessionHistory(detail.session.history || []);
+      } else {
+        addSystemLine("该会话没有可展示的历史记录（可能只有工具调用过程）。");
+      }
+    } catch (err) {
+      addSystemLine(`历史会话加载失败：${err.message || err}`);
+    }
     await refreshSessions();
   });
 

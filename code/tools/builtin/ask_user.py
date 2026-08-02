@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable, Optional
 
 from ..base import Tool, ToolParameter
 from ..errors import ToolErrorCode
@@ -11,16 +11,25 @@ from ..response import ToolResponse
 
 _QUESTIONS_PARAM_ERROR = "'questions' must be a non-empty list, question object, or JSON string."
 
+# answer_provider(questions) -> list[{"id": str, "answer": str}]
+AnswerProvider = Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
+
 
 class AskUserTool(Tool):
     """Ask the user a question and wait for an answer.
 
-    Only the main agent is allowed to interact with the user.
-    Sub-agents should be created with ``interactive=False`` so that
-    calling this tool returns an error instead of blocking on stdin.
+    三种交互模式（按优先级）:
+    1. ``answer_provider`` 提供时：调用它获取回答（Web 场景的事件通道，
+       由宿主实现"提问 → 阻塞等待回答"）。
+    2. ``interactive=True``：调用 ``input()`` 等待终端输入（CLI 场景）。
+    3. 否则返回 ``ASK_USER_UNAVAILABLE`` 错误（子 agent / 无交互宿主）。
     """
 
-    def __init__(self, interactive: bool = True):
+    def __init__(
+        self,
+        interactive: bool = True,
+        answer_provider: Optional[AnswerProvider] = None,
+    ):
         super().__init__(
             name="AskUser",
             description=(
@@ -32,6 +41,7 @@ class AskUserTool(Tool):
             category="interactive",
         )
         self._interactive = bool(interactive)
+        self._answer_provider = answer_provider
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -50,13 +60,6 @@ class AskUserTool(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
-        if not self._interactive:
-            return ToolResponse.error(
-                code=ToolErrorCode.ASK_USER_UNAVAILABLE,
-                message="AskUser is unavailable in sub-agent context. "
-                        "Handle user interaction in the main agent.",
-            )
-
         try:
             questions = self._parse_questions(parameters.get("questions"))
         except ValueError as exc:
@@ -65,21 +68,60 @@ class AskUserTool(Tool):
                 message=str(exc),
             )
 
-        answers: list[dict[str, Any]] = []
-        for question in questions:
+        # 模式 1：事件通道（Web）—— 由宿主实现提问与等待
+        if self._answer_provider is not None:
             try:
-                user_input = input(self._format_prompt(question))
-            except EOFError:
-                user_input = ""
-            answers.append(
-                {
-                    "id": question["id"],
-                    "answer": self._normalize_answer(user_input, question["options"]),
-                }
-            )
+                answers = self._answer_provider(questions)
+            except Exception as exc:
+                return ToolResponse.error(
+                    code=ToolErrorCode.ASK_USER_UNAVAILABLE,
+                    message=f"AskUser interaction failed: {exc}",
+                )
+            if not isinstance(answers, list):
+                return ToolResponse.error(
+                    code=ToolErrorCode.ASK_USER_UNAVAILABLE,
+                    message="AskUser answer_provider returned invalid result.",
+                )
+            return self._success_with_answers(answers)
 
+        # 模式 2：CLI 终端输入
+        if self._interactive:
+            answers: list[dict[str, Any]] = []
+            for question in questions:
+                try:
+                    user_input = input(self._format_prompt(question))
+                except EOFError:
+                    user_input = ""
+                answers.append(
+                    {
+                        "id": question["id"],
+                        "answer": self._normalize_answer(user_input, question["options"]),
+                    }
+                )
+            return self._success_with_answers(answers)
+
+        # 模式 3：无交互宿主（子 agent 等）
+        return ToolResponse.error(
+            code=ToolErrorCode.ASK_USER_UNAVAILABLE,
+            message="AskUser is unavailable in sub-agent context. "
+                    "Handle user interaction in the main agent.",
+        )
+
+    @staticmethod
+    def _success_with_answers(answers: list[dict[str, Any]]) -> ToolResponse:
+        """构造成功响应 —— text 必须包含完整问答内容。
+
+        模型消费工具结果时主要看 ``response.text``（data 不展示给模型，
+        见 core/agent.py 的 _tool_observation_source_text），因此 text 里
+        必须带上每个问题的 id 与用户的回答，否则模型"看不到回答"。
+        """
+        lines = [f"User answered {len(answers)} question(s):"]
+        for item in answers:
+            qid = str(item.get("id") or "?")
+            answer = str(item.get("answer") or "")
+            lines.append(f"- {qid}: {answer}")
         return ToolResponse.success(
-            text=f"User answered {len(answers)} question(s).",
+            text="\n".join(lines),
             data={"answers": answers},
         )
 

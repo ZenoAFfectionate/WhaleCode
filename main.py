@@ -728,6 +728,11 @@ def main() -> int:
     # 都被收集到 unknown 中，由各模式函数作为 "passthrough args" 接收。
     args, unknown = parser.parse_known_args()
 
+    # argparse 会把用户写的 `--` 分隔符原样留在 unknown 中，但子进程/子模块
+    # 自己的 argparse 无法处理它（会把后面的选项误当位置参数），这里剥掉。
+    if "--" in unknown:
+        unknown.remove("--")
+
     # vllm 命令不接收透传参数
     if unknown and args.command == "vllm":
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")

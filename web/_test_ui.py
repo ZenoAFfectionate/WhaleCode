@@ -58,7 +58,7 @@ try:
         check("has an ACT step", page.locator(".step.act").count() >= 1)
         check("has a FAILED observe step", page.locator(".step.fail").count() >= 1)
         check("answer card surfaced", page.locator(".answer").count() == 1)
-        check("answer meta chips surfaced", page.locator(".answer-meta span").count() >= 3)
+        check("answer body surfaced", page.locator(".answer .answer-body").count() == 1)
         check("no raw <pre> visible by default (collapsed)", page.locator(".step-body pre:visible").count() == 0)
         check("no step body visible by default", page.locator(".step-body:visible").count() == 0)
         tok = page.locator("#vitalTokens").inner_text()

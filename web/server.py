@@ -17,7 +17,6 @@ import argparse
 import json
 import os
 import queue
-import shutil
 import signal
 import subprocess
 import sys
@@ -153,6 +152,9 @@ def json_safe(value: Any) -> Any:
 
 
 TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+
+# AskUser 提问等待用户回答的最长秒数；超时后工具返回错误，模型自行继续
+ASK_USER_TIMEOUT_SECONDS = float(os.getenv("ASK_USER_TIMEOUT_SECONDS", "300"))
 
 
 class JobCancelled(Exception):
@@ -438,6 +440,8 @@ class Job:
     cancel_requested: bool = False
     cancel_reason: str | None = None
     process: subprocess.Popen | None = None
+    # AskUser 交互：question_id -> 等待该问题答案的队列（见 IMPROVEMENT.md 改进 1）
+    answer_queues: dict[str, queue.Queue] = field(default_factory=dict)
 
 
 class JobManager:
@@ -533,6 +537,7 @@ class JobManager:
                 should_emit = True
             snapshot = self.snapshot(job)
         self._terminate_process(process)
+        self.wake_all_waiters(job_id)
         if should_emit:
             self.emit(job_id, "cancelled", {"reason": reason})
         return snapshot
@@ -604,6 +609,64 @@ class JobManager:
             for subscriber in list(job.subscribers):
                 subscriber.put(event)
 
+    # ── AskUser 交互通道（IMPROVEMENT.md 改进 1）──────────────────────
+
+    def open_answer_queues(self, job_id: str, question_ids: list[str]) -> None:
+        """为问题建立等待队列（job 线程调用，agent 线程等待消费）。"""
+        with self._lock:
+            job = self._jobs[job_id]
+            for qid in question_ids:
+                job.answer_queues[qid] = queue.Queue()
+
+    def submit_answer(self, job_id: str, question_id: str, answer: Any) -> bool:
+        """前端提交答案 → 放入对应队列。返回 False 表示队列不存在/已取消。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status == "cancelled":
+                return False
+            q = job.answer_queues.get(question_id)
+        if q is None:
+            return False
+        q.put({"id": question_id, "answer": answer})
+        return True
+
+    def wait_for_answer(self, job_id: str, question_id: str, timeout: float) -> dict[str, Any]:
+        """阻塞等待一个问题的答案（agent 线程调用）。
+
+        取消/超时抛 AskUserTimeout 或 JobCancelled，由上层转为工具错误。
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            q = job.answer_queues.get(question_id) if job else None
+        if q is None:
+            raise KeyError(f"no answer queue for question {question_id!r} in job {job_id}")
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.is_cancel_requested(job_id):
+                raise JobCancelled(job.cancel_reason or "用户取消运行")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"waiting for answer to {question_id!r} timed out")
+            try:
+                item = q.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if item is None:  # wake_all_waiters 投递的取消哨兵
+                raise JobCancelled(job.cancel_reason or "用户取消运行")
+            return item
+
+    def wake_all_waiters(self, job_id: str) -> None:
+        """取消时唤醒所有等待答案的队列（投递哨兵，避免 agent 线程卡死）。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            for q in job.answer_queues.values():
+                try:
+                    q.put(None)
+                except Exception:
+                    pass
+
 
 class ModelManager:
     def __init__(self) -> None:
@@ -637,38 +700,7 @@ class ModelManager:
                 "base_url": base_url,
                 "models": items,
                 "scan_roots": [str(root) for root in MODEL_SCAN_ROOTS],
-                "gpu": self._gpu_snapshot(),
             }
-
-    def _gpu_snapshot(self) -> dict[str, Any]:
-        if not shutil.which("nvidia-smi"):
-            return {"available": False, "summary": "nvidia-smi unavailable"}
-        try:
-            output = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-                timeout=3,
-            )
-            rows = []
-            for line in output.strip().splitlines():
-                parts = [part.strip() for part in line.split(",")]
-                if len(parts) >= 5:
-                    rows.append(
-                        {
-                            "index": parts[0],
-                            "name": parts[1],
-                            "memory_used_mb": int(parts[2]),
-                            "memory_total_mb": int(parts[3]),
-                            "utilization": int(parts[4]),
-                        }
-                    )
-            return {"available": True, "gpus": rows}
-        except Exception as exc:
-            return {"available": False, "summary": str(exc)}
 
     def start(self, model_id: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -775,6 +807,7 @@ def create_web_agent(
     temperature: float | None,
     max_steps: int | None,
     event_sink: Callable[[str, dict[str, Any]], None] | None,
+    answer_provider: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
 ) -> WebCodeAgent:
     workspace.mkdir(parents=True, exist_ok=True)
     config = Config.from_env()
@@ -798,7 +831,7 @@ def create_web_agent(
 
     llm = HelloAgentsLLM(**llm_kwargs)
     registry = ToolRegistry(config=config, verbose=False)
-    return WebCodeAgent(
+    agent = WebCodeAgent(
         name="web-code-agent",
         llm=llm,
         tool_registry=registry,
@@ -811,6 +844,16 @@ def create_web_agent(
         interactive=False,
         event_sink=event_sink,
     )
+    # AskUser：默认 interactive=False 会直接报错；web 场景用 answer_provider
+    # 走事件通道（见 IMPROVEMENT.md 改进 1），覆盖默认注册的同名工具。
+    if answer_provider is not None:
+        from hello_agents.tools.builtin.ask_user import AskUserTool  # noqa: E402
+
+        agent.tool_registry.register_tool(
+            AskUserTool(interactive=False, answer_provider=answer_provider),
+            auto_expand=False,
+        )
+    return agent
 
 
 def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
@@ -831,6 +874,28 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
                 raise JobCancelled(job.cancel_reason or "用户取消运行")
             jobs.emit(job.id, event_type, event_payload)
 
+        def ask_user_provider(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            """AskUser 事件通道：发 ask_user 事件 → 阻塞等待前端提交答案。"""
+            q_ids = [str(q.get("id") or f"q{i + 1}") for i, q in enumerate(questions)]
+            for i, q in enumerate(questions):
+                q["id"] = q_ids[i]
+            jobs.open_answer_queues(job.id, q_ids)
+            jobs.emit(job.id, "ask_user", {"job_id": job.id, "questions": questions})
+            answers: list[dict[str, Any]] = []
+            for qid in q_ids:
+                try:
+                    item = jobs.wait_for_answer(
+                        job.id, qid, timeout=ASK_USER_TIMEOUT_SECONDS
+                    )
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"AskUser 等待回答超时或中断: {exc}") from exc
+                if item is None:  # 取消哨兵
+                    raise JobCancelled(job.cancel_reason or "用户取消运行")
+                answers.append({"id": qid, "answer": item.get("answer", "")})
+            return answers
+
         agent = create_web_agent(
             workspace=workspace,
             model=payload.get("model") or configured_model_name(),
@@ -839,6 +904,7 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
             temperature=payload.get("temperature"),
             max_steps=payload.get("max_steps"),
             event_sink=sink,
+            answer_provider=ask_user_provider,
         )
 
         resume_path = payload.get("resume_path")
@@ -1281,6 +1347,13 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
 
+    def end_headers(self) -> None:
+        # 静态文件无显式缓存策略时浏览器会做启发式缓存，导致改了代码看不到效果；
+        # no-cache 让浏览器每次重新验证。API 响应已在 send_json/SSE 中设置 no-store。
+        if not self.path.split("?", 1)[0].startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[web] {self.address_string()} - {format % args}")
 
@@ -1304,7 +1377,6 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                 "ok": True,
                 "project_root": str(PROJECT_ROOT),
                 "model": models.snapshot(),
-                "gpu": models._gpu_snapshot(),
             })
         if path == "/api/models":
             return self.send_json(models.snapshot())
@@ -1322,6 +1394,15 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
             return self.send_json(jobs.snapshot(job))
         if path == "/api/sessions":
             return self.send_json({"sessions": self.list_sessions()})
+        if path.startswith("/api/sessions/"):
+            name = urllib.parse.unquote(path.split("/")[-1])
+            try:
+                detail = self.get_session_detail(name)
+            except FileNotFoundError:
+                return self.send_json({"error": "session not found"}, HTTPStatus.NOT_FOUND)
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return self.send_json({"session": detail})
         if path == "/api/benchmarks/history":
             return self.send_json({"history": load_benchmark_history()})
         if path == "/api/benchmarks/trajectory":
@@ -1357,6 +1438,22 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                 job = jobs.create("agent", title)
                 threading.Thread(target=run_agent_job, args=(job, payload), daemon=True).start()
                 return self.send_json(jobs.snapshot(job), HTTPStatus.ACCEPTED)
+            if path == "/api/agent/answers":
+                # AskUser 回答提交（IMPROVEMENT.md 改进 1）
+                job_id = str(payload.get("job_id") or "")
+                answers = payload.get("answers") or []
+                if not job_id or not isinstance(answers, list):
+                    return self.send_json({"error": "job_id and answers list are required"}, HTTPStatus.BAD_REQUEST)
+                accepted = 0
+                for item in answers:
+                    if not isinstance(item, dict):
+                        continue
+                    qid = str(item.get("id") or "")
+                    if qid and jobs.submit_answer(job_id, qid, item.get("answer", "")):
+                        accepted += 1
+                if accepted == 0:
+                    return self.send_json({"error": "no matching question found for this job"}, HTTPStatus.NOT_FOUND)
+                return self.send_json({"ok": True, "accepted": accepted})
             if path == "/api/models/start":
                 return self.send_json(models.start(payload.get("model_id")))
             if path == "/api/models/stop":
@@ -1448,6 +1545,27 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
                     "display_time": format_session_time(datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")),
                 })
         return sessions
+
+    def get_session_detail(self, name: str) -> dict[str, Any]:
+        """返回单个会话的详情（history 等），供前端渲染历史对话。
+
+        路径穿越防护与 do_DELETE 一致：只允许 runtime/sessions 内的文件。
+        """
+        target = WEB_ROOT / "runtime" / "sessions" / name
+        if target.suffix != ".json":
+            target = target.with_suffix(".json")
+        target.resolve().relative_to((WEB_ROOT / "runtime" / "sessions").resolve())
+        if not target.exists():
+            raise FileNotFoundError(name)
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return {
+            "filename": target.name,
+            "session_id": data.get("session_id"),
+            "created_at": data.get("created_at"),
+            "saved_at": data.get("saved_at"),
+            "title": first_user_prompt_from_session(data) or compact_session_title(data.get("metadata", {}).get("title") or target.stem),
+            "history": data.get("history", []),
+        }
 
 
 def main() -> int:

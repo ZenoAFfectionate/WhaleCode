@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -89,8 +90,17 @@ def _server_label(file_path: str) -> Optional[str]:
 
 
 def _check_executable(command: List[str]) -> Optional[str]:
-    """Return the resolved path to *command[0]*, or None if not found."""
-    return shutil.which(command[0])
+    """Return the resolved path to *command[0]*, or None if not found.
+
+    PATH 查找失败时回退到当前 Python 环境的 bin 目录——服务进程可能从
+    任意 PATH 启动（如 nohup / 绝对路径），而 pylsp 等服务器常装在解释器
+    同目录的 bin 下，仅查 PATH 会导致"已安装却找不到"。
+    """
+    resolved = shutil.which(command[0])
+    if resolved:
+        return resolved
+    env_bin = Path(sys.executable).parent / command[0]
+    return str(env_bin) if env_bin.is_file() else None
 
 
 class LSPManager:
@@ -146,7 +156,10 @@ class LSPManager:
                     )
                     return None
                 try:
-                    self._servers[language_id] = LSPClient(command, self._workspace_root)
+                    # 用解析后的绝对路径启动：subprocess.Popen 不会继承
+                    # shutil.which 的结果，若 PATH 缺该 bin 目录会启动失败。
+                    resolved_command = [resolved, *command[1:]]
+                    self._servers[language_id] = LSPClient(resolved_command, self._workspace_root)
                 except LSPServerStartError as exc:
                     _logger.warning(
                         "LSP server %r failed to start: %s. "

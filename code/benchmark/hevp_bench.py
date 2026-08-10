@@ -389,6 +389,7 @@ def main():
         default_temperature=1.0,
         default_max_steps=64,
         default_timeout=120,
+        default_max_tokens=32768,
         include_task_timeout=True,
         default_task_timeout=600,
     )

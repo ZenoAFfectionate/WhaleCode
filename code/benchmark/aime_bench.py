@@ -69,7 +69,10 @@ class AIMEBenchmark(BenchmarkRunner):
 
     benchmark_name = "aime"
     _VALIDATION_SOURCE = "finish_answer"
-    _RETRY_MAX_TOKENS = 2048  # enough for a direct Finish call or a brief strategy pivot
+    _RETRY_MAX_TOKENS = 32768  # AIME math reasoning is long; a small retry budget
+    # (previously 2048) truncated generation mid-reasoning (finish_reason="length"),
+    # so the model never reached Finish. Match the first-round budget so every
+    # round has enough output tokens to complete a full solve.
     _BOXED_ANSWER_RE = re.compile(r"\\boxed\{\s*(-?\d+)\s*\}", flags=re.IGNORECASE)
     _FINAL_ANSWER_RE = re.compile(r"Final answer is\s+(-?\d+)\.", flags=re.IGNORECASE)
 
@@ -355,6 +358,7 @@ def main():
         default_max_steps=128,
         default_timeout=120,
         timeout_help="Longer timeout for math computations",
+        default_max_tokens=32768,
         include_task_timeout=True,
         default_task_timeout=1200,
     )

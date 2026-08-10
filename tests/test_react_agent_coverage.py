@@ -1008,3 +1008,94 @@ class TestStagnationStateBash:
         assert state.consecutive_no_diff_edits == 0  # Reset by Bash (non-Edit tool)
         # Bash counter is tracked independently (first call sets baseline to c=0)
         assert state.consecutive_same_tests == 1  # call2 matched call1
+
+
+# ============================================================================
+# _process_tool_results — Finish must append the tool result message
+# ============================================================================
+#
+# Regression: Finish previously returned immediately without appending a ``tool``
+# result message, leaving history as ``assistant(tool_calls) → assistant``. Strict
+# OpenAI-compatible providers (e.g. DeepSeek) reject that with 400 on the next
+# turn ("An assistant message with 'tool_calls' must be followed by tool
+# messages"), so multi-round benchmark tasks could never revise.
+#
+# Correct protocol order after Finish: assistant(tool_calls) → tool → assistant.
+
+class TestProcessToolResultsFinish:
+    """_process_tool_results appends the Finish tool result message."""
+
+    def _agent(self):
+        agent = ReActAgent("test", _mock_llm(), config=Config())
+        agent.trace_logger = None
+        return agent
+
+    class _FakeToolCall:
+        def __init__(self, id: str, name: str, arguments: str = "{}"):
+            self.id = id
+            self.function = MagicMock()
+            self.function.name = name
+            self.function.arguments = arguments
+
+    def _finish_result(self):
+        return {
+            "content": "Final answer: done",
+            "metadata": {"tool_name": FINISH_TOOL_NAME, "builtin_tool": True, "finished": True},
+            "status": "success",
+            "finished": True,
+            "final_answer": "done",
+        }
+
+    def test_finish_appends_tool_message(self):
+        """After Finish, _process_tool_results must append the tool result message.
+
+        Regression: the Finish branch previously returned immediately without
+        appending a ``tool`` result message, leaving a dangling assistant
+        tool_calls message that strict providers reject with 400.
+        """
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        tool_calls = [self._FakeToolCall("c1", FINISH_TOOL_NAME)]
+        tool_results = [("Finish", "c1", self._finish_result())]
+
+        final = agent._process_tool_results(tool_calls, tool_results, 1, state)
+
+        assert final == "done"
+        history = agent.get_history()
+        # _process_tool_results alone appends exactly one tool message.
+        tool_msgs = [m for m in history if m.role == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].content == "Final answer: done"
+        assert tool_msgs[0].metadata.get("tool_call_id") == "c1"
+        assert tool_msgs[0].metadata.get("tool_name") == FINISH_TOOL_NAME
+        # The tool message must be the last history entry so that a subsequent
+        # turn can continue with a well-formed assistant(tool_calls)→tool pair.
+        assert history[-1].role == "tool"
+
+    def test_finish_content_fallback_to_final_answer(self):
+        """When the Finish result has no content, fall back to 'Final answer: ...'."""
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        tool_calls = [self._FakeToolCall("c1", FINISH_TOOL_NAME)]
+        result = self._finish_result()
+        result["content"] = ""
+        tool_results = [("Finish", "c1", result)]
+
+        agent._process_tool_results(tool_calls, tool_results, 1, state)
+
+        tool_msgs = [m for m in agent.get_history() if m.role == "tool"]
+        assert tool_msgs[0].content == "Final answer: done"
+
+    def test_regular_tool_still_appends_tool_message(self):
+        """Non-Finish tools keep appending their tool result message."""
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        tool_calls = [self._FakeToolCall("c1", "Read")]
+        tool_results = [("Read", "c1", {"content": "file contents", "status": "success"})]
+
+        result = agent._process_tool_results(tool_calls, tool_results, 1, state)
+
+        assert result is None  # not finished → continues the loop
+        tool_msgs = [m for m in agent.get_history() if m.role == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].content == "file contents"

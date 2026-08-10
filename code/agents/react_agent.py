@@ -1106,6 +1106,20 @@ class ReActAgent(Agent):
         for tool_name, tool_call_id, result in tool_results:
             if result.get("finished"):
                 final_answer = result["final_answer"]
+                # An assistant message carrying tool_calls must be followed by the
+                # matching tool result message (OpenAI-compatible protocol).
+                # Finish previously skipped this, leaving a dangling assistant
+                # tool_calls message that strict providers (e.g. DeepSeek) reject
+                # with 400 on the next turn.
+                result_content = result.get("content", str(result))
+                if not result_content:
+                    result_content = f"Final answer: {final_answer}"
+                self._append_tool_message(
+                    tool_name,
+                    tool_call_id,
+                    result_content,
+                    metadata=result.get("metadata"),
+                )
                 self._render_final_answer(
                     final_answer,
                     step=current_step,
@@ -1923,6 +1937,20 @@ class ReActAgent(Agent):
                             or (structured_output and tool_name == structured_output.name)
                         ):
                             final_answer = result_dict.get("final_answer", result_dict["content"])
+                            # Mirror _process_tool_results: an assistant message
+                            # carrying tool_calls must be followed by the matching
+                            # tool result message. Without this the history has a
+                            # dangling assistant tool_calls message that strict
+                            # providers reject with 400 on the next turn.
+                            result_content = result_dict.get("content", str(result_dict))
+                            if not result_content:
+                                result_content = f"Final answer: {final_answer}"
+                            self._append_tool_message(
+                                tool_name,
+                                tool_call_id,
+                                result_content,
+                                metadata=result_dict.get("metadata"),
+                            )
                             yield StreamEvent.create(
                                 StreamEventType.AGENT_FINISH,
                                 self.name,

@@ -690,7 +690,19 @@ bash scripts/run_swev_eval.sh data/_results/swev_predictions_YYYYMMDD_HHMMSS.jso
 | **AIME 26** | 30 | 28 | **93.3%** | 142s | 2026-07-27 |
 | **HumanEval+** | 164 | 162 | **98.8%** | 25s | 2026-07-27 |
 | **ClassEval** | 100 | 91 | **91.0%** | 233s | 2026-07-27 |
-| **LiveCodeBench** | 175 | 122 | **69.7** | 742s | 2026-07-31 |
+| **LiveCodeBench** | 175 | 122 | **69.7** | 742s | 2026-07-27 |
+| **SWE-verified** | 500 | — | — | — | — |
+
+> 🤖 **Model**: Deepseek-v4-flash-0731 &nbsp;|&nbsp; **Speed**: xx tokens/s from API
+
+| Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
+|:----------|------:|-------:|----------:|---------:|:-----|
+| **AIME 24** | 30 | 30 | **100.0%** | 53s | 2026-08-09 |
+| **AIME 25** | 30 | 30 | **100.0%** | 61s | 2026-08-09 |
+| **AIME 26** | 30 | 30 | **100.0%** | 71s | 2026-08-09 |
+| **HumanEval+** | 164 | 163 | **99.4%** | 21s | 2026-08-09 |
+| **ClassEval** | 100 | 97 | **97.0%** | 226s | 2026-08-09 |
+| **LiveCodeBench** | 175 | 157 | **89.7%** | 304s | 2026-08-09 |
 | **SWE-verified** | 500 | — | — | — | — |
 
 ---

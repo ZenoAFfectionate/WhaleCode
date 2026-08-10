@@ -1,3 +1,5 @@
+
+
 <div align="center">
 
 # 🐋 Whale Code
@@ -79,8 +81,8 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ZenoAFfectionate/Coding_Agent.git
-cd Whale_Code
+git clone https://github.com/ZenoAFfectionate/WhaleCode.git
+cd WhaleCode
 
 # 2. Create and activate a conda virtual environment
 conda create -n WhaleCode python=3.12 -y
@@ -594,7 +596,7 @@ Accepted code runs in a controlled subprocess environment:
 **`BenchmarkRuntimeConfig`** exposes these limits through environment variables:
 
 | Environment Variable | Controls |
-|:---------------------|:---------|
+:---------------------|:---------|
 | `WHALE_BENCH_EVAL_CPU_SECONDS` | CPU time limit |
 | `WHALE_BENCH_EVAL_MEMORY_BYTES` | Memory limit |
 | `WHALE_BENCH_EVAL_MAX_PROCESSES` | Max process count |
@@ -606,7 +608,7 @@ Accepted code runs in a controlled subprocess environment:
 Sandbox execution records useful artifacts instead of dumping unbounded logs into the prompt:
 
 | Artifact | Description |
-|:---------|:------------|
+:---------|:------------|
 | `source` | Source submitted for evaluation |
 | `stdout` / `stderr` | Excerpted standard output and error |
 | `status` | Execution status and return code |

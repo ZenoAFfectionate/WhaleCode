@@ -300,7 +300,7 @@ class _RestrictedUnpickler(pickle.Unpickler):
             return super().find_class(module, name)
         raise pickle.UnpicklingError(
             f"Refusing to unpickle {module}.{name}: only plain data types are "
-            "allowed (严重-4 guard against untrusted-dataset code execution)."
+            "allowed (guard against untrusted-dataset code execution)."
         )
 
 
@@ -334,9 +334,8 @@ def _infer_mode(task: Dict[str, Any], cases: List[Dict[str, Any]]) -> str:
     testtypes = {str(case.get("testtype", "")).lower() for case in cases if case.get("testtype")}
     if "stdin" in testtypes:
         return "stdin"
-    starter = str(task.get("starter_code") or "")
-    if starter.strip():
-        return "functional"
+    # Both the starter-code-present and starter-code-absent branches resolve
+    # to "functional" — kept as an unconditional return (Q1 dead-branch fix).
     return "functional"
 
 
@@ -439,18 +438,6 @@ def _format_public_context(mode: str, case: Dict[str, Any]) -> str:
     return f"  {field}: {value[:200]!r}" if mode == "stdin" else f"  {field}: {value}"
 
 
-def _truncate_feedback(text: str, max_lines: int = 80, max_chars: int = 12000) -> str:
-    if not text:
-        return text
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + ["[feedback truncated]"]
-    truncated = "\n".join(lines)
-    if len(truncated) > max_chars:
-        truncated = truncated[:max_chars].rstrip() + "\n[feedback truncated]"
-    return truncated
-
-
 def _normalize_output_lines(text: str) -> List[str]:
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
@@ -512,12 +499,13 @@ def _evaluate_stdin_solution(
     solution_file: Path,
     cases: List[Dict[str, Any]],
     public_count: int,
+    timeout: int = 10,
 ) -> Dict[str, Any]:
     return PythonStdinAdapter(
         source_wrapper=_merge_official_imports,
         output_matcher=_stdio_outputs_match,
         public_context_formatter=_format_public_context,
-        timeout=10,
+        timeout=timeout,
     ).evaluate(
         solution_file=solution_file,
         cases=cases,
@@ -531,6 +519,7 @@ def _evaluate_functional_solution(
     public_count: int,
     starter_code: str,
     metadata: Optional[Dict[str, Any]] = None,
+    timeout: int = 10,
 ) -> Dict[str, Any]:
     call_spec = json.dumps(_resolve_call_spec(starter_code, metadata or {}), ensure_ascii=False)
     return PythonFunctionalAdapter(
@@ -538,7 +527,7 @@ def _evaluate_functional_solution(
         call_spec=call_spec,
         expected_parser=_parse_scalar_repr,
         public_context_formatter=_format_public_context,
-        timeout=10,
+        timeout=timeout,
     ).evaluate(
         solution_file=solution_file,
         cases=cases,
@@ -674,8 +663,11 @@ class LCB6Benchmark(BenchmarkRunner):
                     )
                     return result
 
+                # 改进项 8/F2: honor CLI --timeout (self.timeout) for controlled
+                # evaluation instead of a hardcoded 10s that silently ignored it.
+                eval_timeout = int(self.timeout) if int(self.timeout) > 0 else 10
                 evaluation = (
-                    _evaluate_stdin_solution(solution_file, all_cases, len(public_cases))
+                    _evaluate_stdin_solution(solution_file, all_cases, len(public_cases), timeout=eval_timeout)
                     if mode == "stdin"
                     else _evaluate_functional_solution(
                         solution_file,
@@ -683,6 +675,7 @@ class LCB6Benchmark(BenchmarkRunner):
                         len(public_cases),
                         str(task.get("starter_code") or ""),
                         metadata,
+                        timeout=eval_timeout,
                     )
                 )
                 if evaluation["passed"]:

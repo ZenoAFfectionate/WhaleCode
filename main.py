@@ -77,7 +77,7 @@ BENCHMARK_DISPLAY: dict[str, str] = {
     "swev": "SWE-bench Verified",
 }
 
-# Benchmark → 数据集子目录名（与 /home/kemove/CodeingAgent/data/ 下一致）
+# Benchmark → 数据集子目录名（与 WHALE_BENCH_DATA_ROOT 默认的 PROJECT_ROOT/data/ 下一致）
 BENCH_DATA_SUBDIR: dict[str, str] = {
     "hevp": "HEVP",
     "clev": "CLEV",
@@ -517,9 +517,9 @@ def _resolve_data_root() -> str:
     """返回 benchmark 数据集根目录。
 
     优先级：环境变量 ``WHALE_BENCH_DATA_ROOT`` → 默认路径
-    ``/home/kemove/CodeingAgent/data``（与所有 shell 脚本的默认值一致）。
+    ``PROJECT_ROOT / "data"``（与所有 shell 脚本的默认值一致）。
     """
-    return os.getenv("WHALE_BENCH_DATA_ROOT", "/home/kemove/CodeingAgent/data")
+    return os.getenv("WHALE_BENCH_DATA_ROOT", str(PROJECT_ROOT / "data"))
 
 
 def _ensure_data_path(bench_name: str, bench_args: list[str]) -> list[str]:

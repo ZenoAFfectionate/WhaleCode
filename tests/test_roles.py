@@ -159,8 +159,8 @@ class TestRoleSubagentCreation:
     def test_config_isolation_deep_copy(self, mock_llm, tmp_workspace):
         main = _make_main_agent(mock_llm, tmp_workspace)
         sub = ExplorerRole.create_subagent(main.llm, main.config, tmp_workspace, tmp_workspace)
-        sub.config.orchestra_max_parallel = 99
-        assert main.config.orchestra_max_parallel != 99
+        sub.config.subagent_timeout_seconds = 99
+        assert main.config.subagent_timeout_seconds != 99
 
     def test_parent_registry_untouched_by_subagent_policy(self, mock_llm, tmp_workspace):
         """子 Agent 的工具过滤不得影响父 Agent 的注册表."""
@@ -190,6 +190,14 @@ class TestRoleSubagentCreation:
         sub = ExplorerRole.create_subagent(main.llm, main.config, tmp_workspace, tmp_workspace)
         assert sub.config.skills_enabled is False
         assert sub.config.todowrite_enabled is False
+
+    @pytest.mark.parametrize("role_cls", [ExplorerRole, ReviewerRole, TesterRole])
+    def test_subagent_task_tool_disabled(self, role_cls, mock_llm, tmp_workspace):
+        """防递归契约: 子代理不得持有 Task 工具 (不得再派生子代理)."""
+        main = _make_main_agent(mock_llm, tmp_workspace)
+        sub = role_cls.create_subagent(main.llm, main.config, tmp_workspace, tmp_workspace)
+        assert sub.config.subagent_task_enabled is False
+        assert sub.tool_registry.get_tool("Task") is None
 
     @pytest.mark.parametrize("role_cls", [ExplorerRole, ReviewerRole, TesterRole])
     def test_control_tools_always_preserved(self, role_cls, mock_llm, tmp_workspace):
@@ -316,10 +324,6 @@ class TestPromptFiles:
         for name in ("explorer", "reviewer", "tester"):
             assert (self._PROMPTS / "roles" / f"{name}.md").is_file(), name
 
-    def test_orchestra_prompt_files_exist(self):
-        assert (self._PROMPTS / "orchestra" / "decompose.md").is_file()
-        assert (self._PROMPTS / "orchestra" / "aggregate.md").is_file()
-
     def test_constants_loaded_from_files(self):
         from hello_agents.agents.roles.explorer import EXPLORER_SYSTEM_PROMPT
         from hello_agents.agents.roles.reviewer import REVIEWER_SYSTEM_PROMPT
@@ -328,14 +332,6 @@ class TestPromptFiles:
         assert EXPLORER_SYSTEM_PROMPT == (self._PROMPTS / "roles" / "explorer.md").read_text(encoding="utf-8")
         assert REVIEWER_SYSTEM_PROMPT == (self._PROMPTS / "roles" / "reviewer.md").read_text(encoding="utf-8")
         assert TESTER_SYSTEM_PROMPT == (self._PROMPTS / "roles" / "tester.md").read_text(encoding="utf-8")
-
-    def test_decompose_template_tokens_and_roles(self):
-        from hello_agents.agents.orchestra import _DECOMPOSE_PROMPT_TEMPLATE
-
-        assert "{task}" in _DECOMPOSE_PROMPT_TEMPLATE
-        assert "{mode}" in _DECOMPOSE_PROMPT_TEMPLATE
-        for role in ("explorer", "reviewer", "tester"):
-            assert role in _DECOMPOSE_PROMPT_TEMPLATE
 
     @pytest.mark.parametrize("name", ["explorer", "reviewer", "tester"])
     def test_role_prompts_carry_output_contract(self, name):
@@ -347,19 +343,17 @@ class TestPromptFiles:
         assert "self-contained" in text
 
 
-class TestOrchestraConfigEnv:
-    def test_from_env_reads_orchestra_vars(self, monkeypatch):
+class TestSubagentTaskConfigEnv:
+    def test_from_env_reads_subagent_task_vars(self, monkeypatch):
         from hello_agents.core.config import Config
 
-        monkeypatch.setenv("ORCHESTRA_ENABLED", "false")
-        monkeypatch.setenv("ORCHESTRA_MAX_PARALLEL", "4")
+        monkeypatch.setenv("SUBAGENT_TASK_ENABLED", "false")
         monkeypatch.setenv("SUBAGENT_TIMEOUT_SECONDS", "120.5")
         monkeypatch.setenv("REVIEW_MAX_FILES", "20")
         monkeypatch.setenv("REVIEW_MAX_FINDINGS", "10")
         monkeypatch.setenv("REVIEW_GH_CLI_ENABLED", "false")
         cfg = Config.from_env()
-        assert cfg.orchestra_enabled is False
-        assert cfg.orchestra_max_parallel == 4
+        assert cfg.subagent_task_enabled is False
         assert cfg.subagent_timeout_seconds == 120.5
         assert cfg.review_max_files == 20
         assert cfg.review_max_findings == 10
@@ -369,11 +363,10 @@ class TestOrchestraConfigEnv:
         from hello_agents.core.config import Config
 
         for var in (
-            "ORCHESTRA_ENABLED", "ORCHESTRA_MAX_PARALLEL", "SUBAGENT_TIMEOUT_SECONDS",
+            "SUBAGENT_TASK_ENABLED", "SUBAGENT_TIMEOUT_SECONDS",
             "REVIEW_MAX_FILES", "REVIEW_MAX_FINDINGS", "REVIEW_GH_CLI_ENABLED",
         ):
             monkeypatch.delenv(var, raising=False)
         cfg = Config.from_env()
-        assert cfg.orchestra_enabled is True
-        assert cfg.orchestra_max_parallel == 2
+        assert cfg.subagent_task_enabled is True
         assert cfg.subagent_timeout_seconds == 300.0

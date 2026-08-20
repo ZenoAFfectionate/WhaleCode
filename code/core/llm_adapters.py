@@ -11,6 +11,7 @@ from typing import Optional, Iterator, List, Dict, Any, Union, AsyncIterator
 from .llm_response import LLMResponse, StreamStats
 from .exceptions import HelloAgentsException
 from .reasoning import extract_reasoning_payload
+from .env_utils import env_int, env_float
 
 
 # --- Cross-provider tool-call normalization (重要-3) --------------------------
@@ -121,26 +122,6 @@ _RETRYABLE_NAME_HINTS = (
 )
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return max(0, int(str(raw).strip()))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return max(0.0, float(str(raw).strip()))
-    except (TypeError, ValueError):
-        return default
-
-
 class BaseLLMAdapter(ABC):
     """LLM适配器基类"""
 
@@ -152,9 +133,9 @@ class BaseLLMAdapter(ABC):
         self._client = None
         self._async_client = None
         # 重要-12: bounded exponential-backoff retry for transient API failures.
-        self.max_retries = _env_int("LLM_MAX_RETRIES", 2)
-        self.retry_base_delay = _env_float("LLM_RETRY_BASE_DELAY", 0.5)
-        self.retry_max_delay = _env_float("LLM_RETRY_MAX_DELAY", 8.0)
+        self.max_retries = env_int("LLM_MAX_RETRIES", 2)
+        self.retry_base_delay = env_float("LLM_RETRY_BASE_DELAY", 0.5)
+        self.retry_max_delay = env_float("LLM_RETRY_MAX_DELAY", 8.0)
 
     @abstractmethod
     def create_client(self) -> Any:
@@ -212,12 +193,6 @@ class BaseLLMAdapter(ABC):
         """工具调用（Function Calling）"""
         pass
 
-    def _is_thinking_model(self, model_name: str) -> bool:
-        """判断是否为thinking model"""
-        thinking_keywords = ["reasoner", "o1", "o3", "thinking"]
-        model_lower = model_name.lower()
-        return any(keyword in model_lower for keyword in thinking_keywords)
-
     def _is_retryable_error(self, exc: Exception) -> bool:
         """Classify an exception as a transient (retryable) API failure (重要-12)."""
         name = type(exc).__name__.lower()
@@ -242,6 +217,23 @@ class BaseLLMAdapter(ABC):
                 delay = min(self.retry_max_delay, self.retry_base_delay * (2 ** attempt))
                 delay *= 0.5 + random.random() * 0.5  # jitter to avoid thundering herds
                 time.sleep(delay)
+                attempt += 1
+
+    async def _aretry_call(self, fn, *, op: str = "llm"):
+        """Async counterpart of ``_retry_call`` (A2): same policy, ``asyncio.sleep`` backoff.
+
+        ``fn`` must be an awaitable-returning callable (e.g. an async function).
+        """
+        attempt = 0
+        while True:
+            try:
+                return await fn()
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                if attempt >= self.max_retries or not self._is_retryable_error(exc):
+                    raise
+                delay = min(self.retry_max_delay, self.retry_base_delay * (2 ** attempt))
+                delay *= 0.5 + random.random() * 0.5
+                await asyncio.sleep(delay)
                 attempt += 1
 
 
@@ -324,22 +316,39 @@ class OpenAIAdapter(BaseLLMAdapter):
         """流式调用"""
         if not self._client:
             self._client = self.create_client()
-        
+
         start_time = time.time()
-        
+
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                **kwargs
-            )
-            
+            # A2: 首 chunk 前的瞬时失败可安全重放——此时尚未向调用方产出任何
+            # 内容；一旦开始 yield 则不再重试（重放会导致内容重复）。
+            holder: Dict[str, Any] = {}
+
+            def _open_and_take_first():
+                stream_obj = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    **kwargs
+                )
+                holder["stream"] = stream_obj
+                for first in stream_obj:
+                    holder["first"] = first
+                    return
+
+            self._retry_call(_open_and_take_first, op="openai.stream")
+            stream = holder["stream"]
+
             collected_content = []
             reasoning_content = None
             usage = {}
-            
-            for chunk in response:
+
+            def _chunks():
+                if "first" in holder:
+                    yield holder["first"]
+                yield from stream
+
+            for chunk in _chunks():
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
                     
@@ -402,18 +411,34 @@ class OpenAIAdapter(BaseLLMAdapter):
         start_time = time.time()
 
         try:
-            response = await self._async_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                **kwargs
-            )
+            # A2: 与同步版同构——首 chunk 前的瞬时失败经 _aretry_call 重放。
+            holder: Dict[str, Any] = {}
+
+            async def _open_and_take_first():
+                stream_obj = await self._async_client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    **kwargs
+                )
+                holder["stream"] = stream_obj
+                async for first in stream_obj:
+                    holder["first"] = first
+                    return
+
+            await self._aretry_call(_open_and_take_first, op="openai.astream")
 
             collected_content = []
             reasoning_content = None
             usage = {}
 
-            async for chunk in response:
+            async def _achunks():
+                if "first" in holder:
+                    yield holder["first"]
+                async for c in holder["stream"]:
+                    yield c
+
+            async for chunk in _achunks():
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
 
@@ -597,18 +622,48 @@ class AnthropicAdapter(BaseLLMAdapter):
 
             usage = {}
 
-            with self._client.messages.stream(**request_params) as stream:
-                for text in stream.text_stream:
+            # A2: 首 chunk 前的瞬时失败可安全重放。Anthropic 的 MessageStream
+            # 在 __enter__ 时由后台线程发起请求，失败会在迭代 text_stream 时
+            # 冒出——因此重试粒度必须覆盖"进入 + 取首个 text"。上下文管理器
+            # 手动管理：失败时立即 __exit__ 释放，成功后由外层 finally 收尾。
+            # text_stream 为生成器语义：取首个后再迭代会从暂停处继续（不重复）。
+            holder: Dict[str, Any] = {}
+
+            def _open_and_take_first():
+                cm = self._client.messages.stream(**request_params)
+                stream_obj = cm.__enter__()
+                try:
+                    for text in stream_obj.text_stream:
+                        holder["first"] = text
+                        break
+                except BaseException:
+                    cm.__exit__(None, None, None)
+                    raise
+                holder["cm"] = cm
+                holder["stream"] = stream_obj
+
+            self._retry_call(_open_and_take_first, op="anthropic.stream")
+
+            try:
+                if "first" in holder:
+                    yield holder["first"]
+                for text in holder["stream"].text_stream:
                     yield text
 
-                # 获取最终消息以提取usage
-                final_message = stream.get_final_message()
+                # 获取最终消息以提取usage（get_final_message 属于 stream 对象，
+                # 与真实 SDK 的 `with ... as stream: stream.get_final_message()` 一致）
+                final_message = holder["stream"].get_final_message()
                 if hasattr(final_message, 'usage') and final_message.usage:
                     usage = {
                         "prompt_tokens": final_message.usage.input_tokens,
                         "completion_tokens": final_message.usage.output_tokens,
                         "total_tokens": final_message.usage.input_tokens + final_message.usage.output_tokens,
                     }
+            except BaseException:
+                holder["cm"].__exit__(None, None, None)
+                raise
+            else:
+                holder["cm"].__exit__(None, None, None)
 
             latency_ms = int((time.time() - start_time) * 1000)
 
@@ -760,18 +815,34 @@ class GeminiAdapter(BaseLLMAdapter):
 
             usage = {}
 
-            response = model.generate_content(
-                converted_messages,
-                generation_config=generation_config if generation_config else None,
-                stream=True
-            )
+            # A2: 首 chunk 前的瞬时失败可安全重放（与 OpenAI 同构）。
+            holder: Dict[str, Any] = {}
 
-            for chunk in response:
+            def _open_and_take_first():
+                stream_obj = model.generate_content(
+                    converted_messages,
+                    generation_config=generation_config if generation_config else None,
+                    stream=True
+                )
+                holder["stream"] = stream_obj
+                for first in stream_obj:
+                    holder["first"] = first
+                    return
+
+            self._retry_call(_open_and_take_first, op="gemini.stream")
+
+            def _chunks():
+                if "first" in holder:
+                    yield holder["first"]
+                yield from holder["stream"]
+
+            for chunk in _chunks():
                 if hasattr(chunk, 'text'):
                     yield chunk.text
 
-                # 尝试提取usage（可能在最后一个chunk）
-                if hasattr(chunk, 'usage_metadata'):
+                # 尝试提取usage（可能在最后一个chunk；非末尾 chunk 的
+                # usage_metadata 为 None——A2 测试暴露的既有缺陷，加 None 防护）
+                if getattr(chunk, "usage_metadata", None) is not None:
                     usage = {
                         "prompt_tokens": chunk.usage_metadata.prompt_token_count,
                         "completion_tokens": chunk.usage_metadata.candidates_token_count,

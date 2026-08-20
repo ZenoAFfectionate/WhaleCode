@@ -11,7 +11,7 @@ All tools degrade gracefully when no LSP server is installed.
 """
 
 from .client import LSPClient, LSPError, LSPServerStartError
-from .manager import LSPManager
+from .manager import LSPManager, get_shared_manager
 from .tools import (
     LSPDefinitionTool,
     LSPDiagnosticsTool,
@@ -24,6 +24,7 @@ __all__ = [
     "LSPError",
     "LSPServerStartError",
     "LSPManager",
+    "get_shared_manager",
     "LSPDefinitionTool",
     "LSPReferencesTool",
     "LSPHoverTool",

@@ -233,6 +233,58 @@ class TestResourceLimitDefaults:
         assert tool.max_memory_bytes == 0
 
 
+class TestConfigDefaultLimitsEffective:
+    """改进项 7/F1: Config 默认值必须与 BashTool 类安全默认对齐并真正生效。
+
+    此前 Config 默认 0 恒覆盖 BashTool 类默认（memory/execution_ms），且
+    file_size 完全不读 Config 字段，导致主路径下沙箱资源限制全部失效。
+    """
+
+    def test_config_defaults_match_tool_safe_defaults(self):
+        from hello_agents.core.config import Config
+        cfg = Config()
+        assert cfg.bash_max_memory_bytes == BashTool.DEFAULT_MAX_MEMORY_BYTES
+        assert cfg.bash_max_processes == BashTool.DEFAULT_MAX_PROCESSES
+        assert cfg.bash_max_file_size_bytes == BashTool.DEFAULT_MAX_FILE_SIZE_BYTES
+        assert cfg.bash_max_execution_ms == BashTool.DEFAULT_MAX_EXECUTION_MS
+        assert cfg.bash_max_cpu_seconds == BashTool.DEFAULT_MAX_CPU_SECONDS
+
+    def test_main_path_defaults_effective(self, tmp_path):
+        """主路径（CodeAgent 必传 config）下安全默认必须生效，而非 0=不限制。"""
+        from hello_agents.core.config import Config
+        tool = BashTool(project_root=str(tmp_path), config=Config())
+        assert tool.max_memory_bytes == BashTool.DEFAULT_MAX_MEMORY_BYTES
+        assert tool.max_processes == BashTool.DEFAULT_MAX_PROCESSES
+        assert tool.max_file_size_bytes == BashTool.DEFAULT_MAX_FILE_SIZE_BYTES
+        assert tool.max_execution_ms == BashTool.DEFAULT_MAX_EXECUTION_MS
+
+    def test_config_file_size_field_is_honored(self, tmp_path):
+        """Config.bash_max_file_size_bytes 此前被 BashTool 忽略（只读 env）。"""
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            config=Config(bash_max_file_size_bytes=1024),
+        )
+        assert tool.max_file_size_bytes == 1024
+
+    def test_config_zero_still_disables_each_dimension(self, tmp_path):
+        """显式设 0 仍可禁用各维度（逃生通道保留）。"""
+        from hello_agents.core.config import Config
+        tool = BashTool(
+            project_root=str(tmp_path),
+            config=Config(
+                bash_max_memory_bytes=0,
+                bash_max_processes=0,
+                bash_max_file_size_bytes=0,
+                bash_max_execution_ms=0,
+            ),
+        )
+        assert tool.max_memory_bytes == 0
+        assert tool.max_processes == 0
+        assert tool.max_file_size_bytes == 0
+        assert tool.max_execution_ms == 0
+
+
 class TestWatchdogTimer:
     """Verify the wall-clock watchdog (fix for 严重-2)."""
 

@@ -20,59 +20,107 @@ dependencies = [
     "python-dotenv>=0.19.0,<2.0.0",
     "pydantic>=2.0.0,<3.0.0",
     "numpy>=2.0.0,<3.0.0",
-    "networkx>=2.6.0,<4.0.0",
     "tiktoken>=0.5.0",
     "pyyaml>=6.0.0",
+    # D5: CLI / Web / 工具链运行时依赖（原先只在 requirements.txt，导致 pip 装出的包跑不了 CLI/Web）
+    "rich>=13.0.0",
+    "prompt-toolkit>=3.0.0",
+    "ddgs>=7.0.0",
+    "python-lsp-server>=1.11.0",
+]
+
+# D5: 可选能力与开发依赖（与 requirements.txt 的注释项一一对应）
+[project.optional-dependencies]
+# 测试与开发（pyproject [tool.pytest] 的 addopts 引用 --cov，缺 pytest-cov 会导致 pytest 无法启动）
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    # B4/B5 可选测试增强（tests/test_properties.py / test_benchmarks.py，
+    # 未安装时这两个文件 importorskip 优雅跳过）
+    "hypothesis>=6.100.0",
+    "pytest-benchmark>=5.0.0",
+]
+# Web UI 测试辅助（web/_test_ui.py 使用）
+ui-tests = [
+    "playwright>=1.40.0",
+]
+# 本地 tokenizer 计数（code/context/token_counter.py 使用本地模型目录时启用，有降级）
+tokenizer = [
+    "transformers>=4.40.0",
+]
+# 其他 provider SDK（按需安装）
+anthropic = [
+    "anthropic>=0.40.0",
+]
+gemini = [
+    "google-generativeai>=0.3",
 ]
 
 [project.urls]
-Homepage = "https://github.com/jjyaoao/HelloAgents"
-Documentation = "https://github.com/jjyaoao/HelloAgents/blob/main/README.md"
-Repository = "https://github.com/jjyaoao/HelloAgents"
-"Bug Tracker" = "https://github.com/jjyaoao/HelloAgents/issues"
+Homepage = "https://github.com/ZenoAFfectionate/WhaleCode"
+Documentation = "https://github.com/ZenoAFfectionate/WhaleCode/blob/main/README.md"
+Repository = "https://github.com/ZenoAFfectionate/WhaleCode"
+"Bug Tracker" = "https://github.com/ZenoAFfectionate/WhaleCode/issues"
 
 # 重要-11: the source tree lives in code/ but is imported as `hello_agents`
-# (run_cli.py aliases it at runtime). Map the package to code/ so `pip install`
-# ships the real modules instead of an empty distribution.
+# (scripts/cli.py and main.py alias it at runtime). Map the package to code/
+# so `pip install` ships the real modules instead of an empty distribution.
 [tool.setuptools]
 package-dir = {"hello_agents" = "code"}
 packages = [
     "hello_agents",
     "hello_agents.agents",
+    "hello_agents.agents.roles",
     "hello_agents.benchmark",
+    "hello_agents.benchmark.runtime",
     "hello_agents.context",
     "hello_agents.core",
     "hello_agents.observability",
     "hello_agents.skills",
     "hello_agents.tools",
     "hello_agents.tools.builtin",
+    "hello_agents.tools.lsp",
 ]
 
 [tool.setuptools.package-data]
-hello_agents = ["py.typed"]
+# D5: py.typed (PEP 561 marker) must actually exist in code/ for this entry
+# to hold. prompts/*.md are shipped for forward-compatibility, but note the
+# known limitation: code_agent.py derives _PROJECT_ROOT via parents[2] and
+# reads prompts at module import time, which only resolves inside the source
+# tree. Run the CLI/Web from the repo (python main.py cli) — `pip install`
+# alone does not yet give a runnable layout.
+hello_agents = ["py.typed", "prompts/**/*.md"]
 
-[tool.black]
+# D3: ruff replaces the previous black + isort pair (same line-length 88,
+# same import style). `ruff check` covers linting (incl. isort rules via "I"),
+# `ruff format` replaces black.
+[tool.ruff]
 line-length = 88
-target-version = ['py310']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
+target-version = "py310"
+extend-exclude = [
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "dist",
+]
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 88
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E501 is delegated to the formatter (line-length above), mirroring black's
+# behavior of not flagging long lines it cannot split (e.g. long strings).
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# Match the previous [tool.isort] profile = "black" configuration.
+known-first-party = ["hello_agents"]
+
+[tool.ruff.format]
+# Keep double quotes to stay diff-compatible with historical black output.
+quote-style = "double"
 
 [tool.coverage.run]
 source = ["code"]
@@ -87,8 +135,23 @@ markers = [
     "integration: tests that require the real SWEV dataset on disk",
 ]
 
+# D3: progressive tightening — strict checks (disallow_untyped_defs etc.) are
+# currently scoped to code/core/ + code/context/ only via `files`. The
+# remaining source trees are listed as ignore_errors overrides so that
+# per-directory adoption can shrink the whitelist quarter by quarter.
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+files = ["code/core", "code/context"]
+
+[[tool.mypy.overrides]]
+module = [
+    "code.agents.*",
+    "code.benchmark.*",
+    "code.observability.*",
+    "code.skills.*",
+    "code.tools.*",
+]
+ignore_errors = true

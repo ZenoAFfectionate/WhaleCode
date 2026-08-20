@@ -187,21 +187,6 @@ class SessionStore:
 
         return sessions
 
-    def delete(self, session_name: str) -> bool:
-        """删除会话
-
-        Args:
-            session_name: 会话名称（不含 .json 后缀）
-
-        Returns:
-            是否删除成功
-        """
-        filepath = self.session_dir / f"{session_name}.json"
-        if filepath.exists():
-            os.remove(filepath)
-            return True
-        return False
-
     def check_config_consistency(
         self,
         saved_config: Dict[str, Any],

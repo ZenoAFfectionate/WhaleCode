@@ -127,10 +127,12 @@ def _ensure_lsp(
     is ``None``, *error_response* is populated and the caller should
     return it immediately.
     """
-    # Path safety
+    # Path safety (Q4-4: is_relative_to replaces the string-prefix check —
+    # the latter let "/root_evil" pass a "/root" prefix test).
     try:
-        resolved = (Path(workspace_root) / file_path).resolve()
-        if not str(resolved).startswith(str(Path(workspace_root).resolve())):
+        root = Path(workspace_root).resolve()
+        resolved = (root / file_path).resolve()
+        if not resolved.is_relative_to(root):
             return None, ToolResponse.error(
                 code=ToolErrorCode.ACCESS_DENIED,
                 message=f"Path '{file_path}' is outside the project root",

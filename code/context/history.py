@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..core.message import Message
+from .io_utils import atomic_write
 
 _logger = logging.getLogger(__name__)
 
@@ -185,12 +186,9 @@ class HistoryManager:
         与 ``get_estimated_token_count()`` 的区别：
         - 本方法返回 API response 中记录的真实值（来自 record_usage）
         - get_estimated_token_count() 返回本地 TokenCounter 的估算值
-        当 SimpleAgent 未调用 record_usage 时，本方法始终返回 0。
+        当调用方未调用 record_usage 时，本方法始终返回 0。
         """
         return int(self._recorded_usage.get("prompt_tokens", 0) or 0)
-
-    # 向后兼容别名
-    get_token_count = get_last_api_prompt_tokens
 
     def get_estimated_token_count(self) -> int:
         """返回基于本地 TokenCounter 的历史估算值。
@@ -211,16 +209,24 @@ class HistoryManager:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: Optional[int] = None,
+        cached_tokens: int = 0,
     ) -> None:
-        """记录最近一次模型调用返回的真实 usage。"""
+        """记录最近一次模型调用返回的真实 usage.
+
+        A9: ``cached_tokens`` 为命中 provider 前缀缓存的 prompt tokens
+        (OpenAI ``prompt_tokens_details.cached_tokens`` / Anthropic
+        ``cache_read_input_tokens`` / Gemini ``cached_content_token_count``)。
+        """
         prompt_tokens = int(prompt_tokens or 0)
         completion_tokens = int(completion_tokens or 0)
+        cached_tokens = int(cached_tokens or 0)
         if total_tokens is None:
             total_tokens = prompt_tokens + completion_tokens
         self._recorded_usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": int(total_tokens or 0),
+            "cached_tokens": cached_tokens,
             "stale": False,
             "recorded_at": datetime.now().isoformat(),
         }
@@ -639,6 +645,7 @@ class HistoryManager:
         if isinstance(usage, dict):
             prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
             completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            cached_tokens = int(usage.get("cached_tokens", 0) or 0)
             total_tokens = usage.get("total_tokens")
             if total_tokens is not None:
                 total_tokens = int(total_tokens or 0)
@@ -646,6 +653,7 @@ class HistoryManager:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
             )
             if bool(usage.get("stale")):
                 self._mark_usage_stale()
@@ -747,6 +755,7 @@ class HistoryManager:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
             "stale": False,
             "recorded_at": None,
         }
@@ -1202,7 +1211,7 @@ class HistoryManager:
 
         try:
             transcript_dir.mkdir(parents=True, exist_ok=True)
-            self._atomic_write(filepath, "\n".join(lines) + "\n")
+            atomic_write(filepath, "\n".join(lines) + "\n")
             return str(filepath.resolve())
         except Exception:
             return None
@@ -1256,12 +1265,6 @@ class HistoryManager:
             if match:
                 return match.group(1).strip()
         return None
-
-    @staticmethod
-    def _atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
-        temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-        temp_path.write_text(content, encoding=encoding)
-        os.replace(temp_path, path)
 
     def _round_boundaries(self, history: Sequence[Message]) -> List[int]:
         boundaries: List[int] = []

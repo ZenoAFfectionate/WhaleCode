@@ -1,6 +1,6 @@
 """Reviewer 角色 — 代码审查专家 (双用途).
 
-用途 1: Orchestra pipeline 中的审查阶段 (作为子 Agent 被调度)
+用途 1: Task 工具派生的审查子代理 (主 Agent 的 LLM 按需调度)
 用途 2: 独立审查 API (review_diff / review_pr / review_files), 供 CLI /review 使用
 """
 

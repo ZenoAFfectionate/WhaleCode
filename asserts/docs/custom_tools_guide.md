@@ -580,8 +580,8 @@ class ComposeTool(Tool):
 
 ## 📞 获取帮助
 
-- GitHub Issues: https://github.com/your-repo/hello-agents/issues
-- 文档: https://hello-agents.readthedocs.io
-- 社区讨论: https://github.com/your-repo/hello-agents/discussions
+- GitHub Issues: https://github.com/ZenoAFfectionate/WhaleCode/issues
+- 项目文档: https://github.com/ZenoAFfectionate/WhaleCode/blob/main/README.md（本仓库 asserts/docs/ 目录含各专题指南）
+- 社区讨论: https://github.com/ZenoAFfectionate/WhaleCode/discussions
 
 

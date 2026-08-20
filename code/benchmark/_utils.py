@@ -943,6 +943,20 @@ def write_result_records(results_file: Path, records: List[Dict[str, Any]]) -> N
     tmp_path.replace(results_file)
 
 
+def append_result_record(results_file: Path, record: Dict[str, Any]) -> None:
+    """Append one result record as a single JSONL line (Q3-1).
+
+    The run loop previously rewrote the whole file after every task (O(n²)
+    IO). Duplicate task_ids in the file are expected and safe: resume
+    collapses them via ``latest_result_records`` (last write wins), and a
+    torn final line is skipped by ``load_result_records``.
+    """
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_file, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
 def upsert_result_record(records: List[Dict[str, Any]], record_index: Dict[str, int], result: Dict[str, Any]) -> None:
     task_id = result.get("task_id")
     if task_id is None:

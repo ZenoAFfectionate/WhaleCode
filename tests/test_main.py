@@ -531,7 +531,7 @@ class TestResolveDataRoot:
 
     def test_default(self, monkeypatch):
         monkeypatch.delenv("WHALE_BENCH_DATA_ROOT", raising=False)
-        assert _resolve_data_root() == "/home/kemove/CodeingAgent/data"
+        assert _resolve_data_root() == str(main_mod.PROJECT_ROOT / "data")
 
 
 class TestEnsureDataPath:

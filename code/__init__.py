@@ -19,13 +19,10 @@ from .core.message import Message
 from .core.exceptions import HelloAgentsException
 
 # Agent implementations
-from .agents.simple_agent import SimpleAgent
 from .agents.react_agent import ReActAgent
-from .agents.reflection_agent import ReflectionAgent
-from .agents.plan_solve_agent import PlanSolveAgent
 
 # Tool system
-from .tools.registry import ToolRegistry, global_registry
+from .tools.registry import ToolRegistry
 
 __all__ = [
     # Core components
@@ -35,12 +32,8 @@ __all__ = [
     "HelloAgentsException",
 
     # Agent paradigms
-    "SimpleAgent",
     "ReActAgent",
-    "ReflectionAgent",
-    "PlanSolveAgent",
 
     # Tool system
     "ToolRegistry",
-    "global_registry",
 ]

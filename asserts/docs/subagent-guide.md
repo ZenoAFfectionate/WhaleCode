@@ -6,308 +6,152 @@
 
 ### 核心特性
 
-- ✅ **上下文隔离**：子代理使用独立历史，不污染主 Agent
-- ✅ **工具过滤**：限制子代理可用工具（只读、完全访问、自定义）
-- ✅ **灵活组合**：所有 Agent 类型都可作为子代理
-- ✅ **成本优化**：子任务可用轻量模型（节省 70%）
-- ✅ **零配置**：TaskTool 自动注册
+- ✅ **上下文隔离**：子代理是全新实例（独立 Config / 独立历史 / 独立 ToolRegistry），不污染主 Agent
+- ✅ **角色化派生**：explorer / reviewer / tester 三种预置角色，按角色控制工具白名单与系统提示词
+- ✅ **LLM 自动编排**：主循环内置 `Task` 工具，LLM 在 ReAct 循环中按需派生子代理
+- ✅ **同轮并行**：独立的子任务可在同一轮响应中并行执行
+- ✅ **成本优化**：子任务可用轻量模型（节省 ~70%）
+
+> **✅ 状态说明 / Status**: 主 Agent 对话循环内置 **LLM 可自动调用的 `Task` 工具**——LLM 在 ReAct 循环中按需派生角色化子代理（explorer / reviewer / tester），独立任务可同轮多调用并行执行。
+> 历史演进：原 `AgentOrchestra` 一次分解式编排已移除（由 Task 工具的动态派生取代）；编程式 `run_as_subagent()` API 与 `ToolFilter` 过滤器已于一并下线（2026-08-20，见 `IMPROVEMENT.md`）——其"同实例状态切换"模型有线程安全隐患且生产零调用，隔离能力由 `Role.create_subagent()` 的全新实例模型取代。
+> The main-agent loop ships an **LLM-callable `Task` tool** — the LLM spawns role-specialized sub-agents on demand inside the ReAct loop; independent subtasks may be issued in the same response to run in parallel. The legacy `AgentOrchestra` pipeline and the programmatic `run_as_subagent()` / `ToolFilter` APIs have been removed (2026-08-20); isolation is now provided by `Role.create_subagent()` fresh-instance model.
 
 ---
 
 ## 🚀 快速开始
 
-### 1. 零配置使用（推荐）
+### 1. Task 工具（推荐 / Recommended）
+
+无需编写任何编排代码——给主 Agent 下达任务，LLM 会在需要时自动调用 `Task` 工具：
 
 ```python
 from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
-# 启用子代理机制
-config = Config(subagent_enabled=True)
+config = Config(subagent_timeout_seconds=300.0)  # 子代理超时预算
 agent = ReActAgent("main", HelloAgentsLLM(), config=config)
 
-# TaskTool 已自动注册，Agent 可以直接使用
-agent.run("使用 Task 工具探索项目结构")
-
-# Agent 会自动调用 TaskTool，创建子代理执行任务
+# LLM 在推理过程中自行决定派生子代理，例如：
+#   Task(role="explorer", task="探索项目结构，定位核心模块")
+#   Task(role="reviewer", task="审查最近的改动")
+result = agent.run("分析这个项目并给出架构改进建议")
 ```
 
-### 2. 手动调用子代理
+**Task 工具参数**：
+
+| 参数 | 说明 |
+|------|------|
+| `role` | 子代理角色：`explorer`（只读探索）/ `reviewer`（代码审查）/ `tester`（写测试与验证） |
+| `task` | 子任务描述（自然语言） |
+
+### 2. 编程式调用（Role 工厂）
+
+需要显式控制子代理构造时，使用 `Role.create_subagent()`——这也是 Task 工具内部走的路径：
 
 ```python
-from hello_agents import ReActAgent, HelloAgentsLLM
-from hello_agents.tools.tool_filter import ReadOnlyFilter
+from hello_agents.agents.roles import get_role
 
-# 创建主 Agent 和子 Agent
-main_agent = ReActAgent("main", llm, tool_registry=registry)
-explore_agent = ReActAgent("explorer", llm, tool_registry=registry)
-
-# 手动调用子代理（上下文隔离）
-result = explore_agent.run_as_subagent(
-    task="探索 hello_agents/core/ 目录",
-    tool_filter=ReadOnlyFilter(),  # 只读权限
-    return_summary=True
+# 按角色创建隔离子代理（Config 深拷贝 / 独立 ToolRegistry / 禁交互 / 防递归）
+# 注意：llm 与 working_dir 均为必传参数（与 Task 工具内部调用一致）
+role = get_role("explorer")
+subagent = role.create_subagent(
+    llm=llm,
+    parent_config=Config(),
+    project_root="/path/to/project",
+    working_dir="/path/to/project",
 )
 
-print(f"子代理结果: {result['summary']}")
-print(f"主 Agent 历史长度: {len(main_agent.get_history())}")  # 未被污染
+# 像普通 Agent 一样运行（独立历史，不影响主 Agent）
+result = subagent.run("探索 hello_agents/core/ 目录，总结各模块职责")
 ```
 
 ---
 
 ## 💡 核心概念
 
-### 1. 上下文隔离
+### 1. 上下文隔离（全新实例模型）
 
-**问题：** 主 Agent 和子任务共享历史，导致上下文混乱
+子代理**不是**主 Agent 的状态切换，而是 `Role.create_subagent()` 构造的**全新实例**：
 
-```python
-# ❌ 不好：共享历史
-agent.run("分析项目")
-agent.run("生成报告")
-agent.run("代码审查")
-# 历史混在一起，上下文混乱
-```
+| 维度 | 主 Agent | 子代理 |
+|------|----------|--------|
+| 历史 | 原有历史继续累积 | 全新空历史 |
+| Config | 原配置 | 深拷贝（修改不影响主 Agent） |
+| ToolRegistry | 共享的注册表 | 独立注册表（只含角色白名单内工具） |
+| 交互 | 可用 AskUser | 强制禁用（后台执行不能等待用户） |
+| 递归 | 可派生子代理 | 强制 `subagent_task_enabled=False`（防递归） |
 
-**解决：** 子代理使用独立历史
+这保证了并发派生多个子代理时互不干扰——不存在共享可变状态的竞态。
 
-```python
-# ✅ 好：上下文隔离
-main_agent.run("分析项目")  # 主任务
+### 2. 角色工具白名单
 
-# 子任务 1：探索（独立历史）
-explore_agent.run_as_subagent("探索项目结构")
+工具权限由各角色在 `code/agents/roles/` 中**硬编码白名单**控制：
 
-# 子任务 2：分析（独立历史）
-analyze_agent.run_as_subagent("分析架构设计")
+| 角色 | 类别 | 可用工具 | 用途 |
+|------|------|----------|------|
+| 🔍 **explorer** | `readonly` | Glob, Grep, Read, LS, GitStatus, GitDiff, GitLog, GitBlame, Bash（受限） | 理解代码结构、追踪依赖、定位代码 |
+| 📝 **reviewer** | `readonly` | Glob, Grep, Read, LS, GitDiff, GitLog, GitBlame, Bash（受限） | 多视角代码审查（正确性/安全/性能/风格） |
+| 🧪 **tester** | `write` | Read, Write, Edit, Bash, GitDiff | 编写并运行测试、验证修复 |
 
-# 主 Agent 历史保持清晰
-```
-
-### 2. 工具过滤
-
-**3 种内置过滤器：**
-
-```python
-from hello_agents.tools.tool_filter import (
-    ReadOnlyFilter,      # 只读工具（探索、分析）
-    FullAccessFilter,    # 完全访问（排除危险工具）
-    CustomFilter         # 自定义白名单/黑名单
-)
-```
-
-**ReadOnlyFilter（只读）：**
-```python
-readonly = ReadOnlyFilter()
-allowed = readonly.filter(["Read", "Write", "Bash", "Search"])
-# 返回：["Read", "Search"]
-# 只允许：Read, Search, Calculator, Memory, RAG, Note
-```
-
-**FullAccessFilter（完全访问）：**
-```python
-full = FullAccessFilter()
-allowed = full.filter(["Read", "Write", "Bash", "Terminal"])
-# 返回：["Read", "Write"]
-# 排除：Bash, Terminal, Execute（危险工具）
-```
-
-**CustomFilter（自定义）：**
-```python
-# 白名单模式
-custom = CustomFilter(allowed=["Read", "Search"], mode="whitelist")
-allowed = custom.filter(["Read", "Write", "Search"])
-# 返回：["Read", "Search"]
-
-# 黑名单模式
-custom = CustomFilter(denied=["Write", "Edit"], mode="blacklist")
-allowed = custom.filter(["Read", "Write", "Edit"])
-# 返回：["Read"]
-```
+> 为什么用角色白名单而不是通用过滤器？不同阶段有不同的安全画像：explorer 绝不应改文件，tester 需要写权限。角色化派生让边界显式且在代码层面可执行，而不依赖提示词约束。
 
 ### 3. Agent 工厂
 
-**create_agent() - 统一创建接口：**
+**create_agent() - 统一创建接口**（用于构造自定义 Agent，非角色化子代理）：
+
 ```python
 from hello_agents.agents.factory import create_agent
 
-# 创建不同类型的 Agent
 react_agent = create_agent("react", "explorer", llm, registry)
-reflection_agent = create_agent("reflection", "thinker", llm, registry)
-plan_agent = create_agent("plan", "planner", llm, registry)
-simple_agent = create_agent("simple", "assistant", llm, registry)
+code_agent = create_agent("code", "coder", llm, registry)
 ```
 
-**default_subagent_factory() - 默认工厂：**
-```python
-from hello_agents.agents.factory import default_subagent_factory
-
-subagent = default_subagent_factory(
-    agent_type="react",
-    llm=llm,
-    tool_registry=registry,
-    config=Config(subagent_max_steps=10)
-)
-```
+> 注：reflection / plan / simple 三个类型已随教学演示型 agent 一并移除（2026-08-19）；工厂仅支持 react 与 code。
 
 ---
 
 ## 📝 使用指南
 
-### 1. TaskTool 参数
+### 1. 并行与串行
 
-TaskTool 支持以下参数：
+**并行**：LLM 在同一轮响应中发起多个 Task 调用即可并行执行（主循环 `_execute_tools` 的 ThreadPoolExecutor）：
 
 ```python
-{
-    "task": "任务描述",
-    "agent_type": "react",           # react / reflection / plan / simple
-    "tool_filter": "readonly",       # readonly / full / none
-    "max_steps": 15                  # 最大步数（可选）
-}
+# LLM 的单轮响应中同时发起（示意）：
+# Task(role="explorer", task="分析模块 A 的依赖")
+# Task(role="explorer", task="分析模块 B 的依赖")
+# → 两个子代理并行执行
 ```
 
-**示例：**
-```python
-# Agent 调用 TaskTool
-agent.run("""
-使用 Task 工具执行以下任务：
-- task: 探索 hello_agents/core/ 目录
-- agent_type: react
-- tool_filter: readonly
-""")
-```
+**串行**：依赖型子任务应等上游 Task 结果返回后再发起——ReAct "观察→思考→行动" 的分轮循环天然保证了这一点。单次 Task 调用是阻塞的（子代理跑完才返回结果给主循环）。
 
-### 2. 自定义子代理工厂
+### 2. 行为配置（Config 字段）
 
 ```python
-from hello_agents.agents.factory import create_agent, default_subagent_factory
-from hello_agents.tools.builtin.task_tool import TaskTool
-
-# 主模型（强大但昂贵）
-main_llm = HelloAgentsLLM(provider="openai", model="gpt-4")
-
-# 轻量模型（快速且便宜）
-light_llm = HelloAgentsLLM(provider="deepseek", model="deepseek-chat")
-
-def my_agent_factory(agent_type: str):
-    """根据任务类型选择模型"""
-    if agent_type in ["react", "plan"]:
-        # 探索和规划用轻量模型
-        llm = light_llm
-    else:
-        # 反思和代码实现用主模型
-        llm = main_llm
-    
-    return default_subagent_factory(
-        agent_type=agent_type,
-        llm=llm,
-        tool_registry=registry,
-        config=Config(subagent_max_steps=10)
-    )
-
-# 手动注册 TaskTool
-task_tool = TaskTool(agent_factory=my_agent_factory, tool_registry=registry)
-registry.register_tool(task_tool)
-```
-
-### 3. 不同类型的子代理
-
-```python
-from hello_agents.agents.factory import create_agent
-
-# 创建不同类型的子代理
-agents = {
-    "react": create_agent("react", "explorer", llm, registry),
-    "reflection": create_agent("reflection", "thinker", llm, registry),
-    "plan": create_agent("plan", "planner", llm, registry),
-    "simple": create_agent("simple", "assistant", llm, registry)
-}
-
-# 根据任务选择合适的子代理类型
-explore_result = agents["react"].run_as_subagent(
-    task="探索项目",
-    tool_filter=ReadOnlyFilter()
-)
-
-analysis_result = agents["reflection"].run_as_subagent(
-    task="深度分析",
-    tool_filter=ReadOnlyFilter()
-)
-
-plan_result = agents["plan"].run_as_subagent(
-    task="制定计划",
-    tool_filter=FullAccessFilter()
+config = Config(
+    subagent_task_enabled=True,      # 主循环是否注册 Task 工具（默认 True）
+    subagent_timeout_seconds=300.0,  # 单个子代理超时（超时后放弃等待，结果丢弃）
 )
 ```
 
----
+> 注：**子代理步数上限不随 Config 配置**，由各角色内置的 `RoleConfig.max_steps` 控制：
+> explorer = 20，reviewer = 30，tester = 25（定义于 `code/agents/roles/` 各角色）。
 
-## 📊 实际案例
+### 3. 成本优化（轻量模型）
 
-### 案例 1：复杂项目分析
-
-**场景：** 分析大型代码库，生成架构报告
-
-```python
-# 主 Agent（ReActAgent）
-main_agent = ReActAgent("main", main_llm, tool_registry=registry)
-
-# 任务分解
-result = main_agent.run("""
-分析项目架构，生成报告：
-
-1. 使用 Task 工具探索项目结构（agent_type=react, tool_filter=readonly）
-2. 使用 Task 工具分析架构设计（agent_type=reflection, tool_filter=readonly）
-3. 使用 Task 工具制定优化计划（agent_type=plan, tool_filter=readonly）
-4. 整合结果，生成报告
-""")
-```
-
-**优势：**
-- ✅ 每个子任务上下文隔离，不互相干扰
-- ✅ 探索任务只能读取，不会误修改文件
-- ✅ 子任务可用轻量模型，节省成本
-
-### 案例 2：多阶段代码审查
-
-**场景：** 代码审查 + 自动修复
+角色工厂支持为子代理指定轻量模型：
 
 ```python
-main_agent.run("""
-代码审查流程：
+from hello_agents import HelloAgentsLLM
 
-1. 扫描代码问题（Task 工具，readonly）
-2. 分析问题严重性（Task 工具，reflection）
-3. 自动修复问题（Task 工具，full access）
-4. 生成审查报告
-""")
+main_llm = HelloAgentsLLM(provider="openai", model="gpt-4")        # 复杂决策
+light_llm = HelloAgentsLLM(provider="deepseek", model="deepseek-chat")  # 探索/简单处理
+
+# Task 工具派生时经 get_role 按角色创建子代理，llm 参数传入轻量模型：
+#   role.create_subagent(llm=light_llm, parent_config=..., ...)
+# 主 Agent 保留强模型（main_llm）。
 ```
 
-**优势：**
-- ✅ 扫描阶段只读，避免误修改
-- ✅ 修复阶段有写权限，但排除危险工具
-- ✅ 每个阶段独立历史，清晰可追溯
-
-### 案例 3：成本优化
-
-**场景：** 长时间运行的数据处理任务
-
-**配置：**
-- 主 Agent：GPT-4（$0.03/1K tokens）
-- 子 Agent：DeepSeek（$0.001/1K tokens）
-
-**任务分配：**
-```python
-def cost_optimized_factory(agent_type: str):
-    # 探索、规划、简单处理 → DeepSeek
-    if agent_type in ["react", "plan", "simple"]:
-        return create_agent(agent_type, "sub", light_llm, registry)
-    # 复杂决策、代码生成 → GPT-4
-    else:
-        return create_agent(agent_type, "sub", main_llm, registry)
-```
-
-**成本节省：**
+**成本节省示例**：
 ```
 之前：100% GPT-4 = $30
 之后：30% GPT-4 + 70% DeepSeek = $9 + $0.7 = $9.7
@@ -316,106 +160,102 @@ def cost_optimized_factory(agent_type: str):
 
 ---
 
+## 📊 实际案例
+
+### 案例 1：复杂项目分析
+
+**场景**：分析大型代码库，生成架构报告
+
+直接向主 Agent 下达任务，LLM 自动分解并派生：
+
+```
+用户：分析这个项目并给出架构改进建议
+
+LLM 的执行轨迹（自动）：
+  → Task(role="explorer", task="探索项目结构，列出核心模块")     # 只读
+  → Task(role="explorer", task="分析各模块的依赖关系")           # 只读
+  → 综合两个子代理的结果，生成架构报告
+```
+
+**优势**：
+- ✅ 每个子任务上下文隔离，不互相干扰
+- ✅ 探索任务只能读取，不会误修改文件
+- ✅ 独立子任务同轮并行，缩短总耗时
+
+### 案例 2：多阶段代码审查
+
+**场景**：代码审查 + 自动修复
+
+```
+用户：审查最近的改动，确认无误后写测试验证
+
+LLM 的执行轨迹（自动）：
+  → Task(role="reviewer", task="审查未提交的 diff，按严重度列出问题")  # 只读
+  → 根据审查结论修复问题（主 Agent 自己做，有完整工具）
+  → Task(role="tester", task="为修复的代码编写并运行测试")            # 写权限
+```
+
+---
+
 ## 🎯 最佳实践
 
-### 1. 合理选择工具过滤器
+### 1. 任务描述要具体
 
-```python
-# ❌ 不好：探索任务给完全访问权限
-explore_agent.run_as_subagent(
-    task="探索项目",
-    tool_filter=FullAccessFilter()  # 可能误修改文件
-)
-
-# ✅ 好：探索任务只给只读权限
-explore_agent.run_as_subagent(
-    task="探索项目",
-    tool_filter=ReadOnlyFilter()  # 安全
-)
+```text
+❌ 不好：Task(role="explorer", task="看看代码")
+✅ 好：Task(role="explorer", task="找到处理用户认证的模块，总结其调用链")
 ```
 
-### 2. 根据任务选择 Agent 类型
+### 2. 让角色与任务性质匹配
+
+探索/定位类任务用 `explorer`（只读最安全）；审查类用 `reviewer`（结构化输出）；需要写文件/跑测试用 `tester`。不要用 tester 跑纯探索任务——多余的写权限是风险。
+
+### 3. 设置合理的步数与超时预算
 
 ```python
-# 探索任务 → ReActAgent（快速迭代）
-create_agent("react", "explorer", llm, registry)
-
-# 深度分析 → ReflectionAgent（反思优化）
-create_agent("reflection", "analyzer", llm, registry)
-
-# 规划任务 → PlanAgent（先规划后执行）
-create_agent("plan", "planner", llm, registry)
-
-# 简单对话 → SimpleAgent（无需复杂推理）
-create_agent("simple", "assistant", llm, registry)
+config = Config(subagent_timeout_seconds=300.0)
 ```
 
-### 3. 限制子代理步数
-
-```python
-# ✅ 好：限制子代理步数，避免无限循环
-result = agent.run_as_subagent(
-    task="探索项目",
-    max_steps_override=10  # 最多 10 步
-)
-```
+步数过高会放大失控循环的成本；超时过低会产生假失败。
 
 ---
 
 ## 🔧 高级用法
 
-### 1. 获取子代理元数据
+### 1. 子代理执行元数据
+
+Task 工具返回给主循环的结果附带执行元数据（由 `Agent._get_subagent_metadata` 生成）：
 
 ```python
-result = agent.run_as_subagent(task="探索项目")
-
-# 查看元数据
-print(result["metadata"])
-# {
-#     "steps": 5,
-#     "duration_seconds": 12.3,
-#     "tool_calls": {"Read": 3, "Search": 2},
-#     "total_tokens": 1500
-# }
+metadata = {
+    "steps": 5,                  # 执行步数
+    "tokens": 1500,              # Token 数（本地估算）
+    "duration_seconds": 12.3,    # 执行时长
+    "tools_used": ["Read", "Grep"],  # 使用的工具列表
+    # "error": "..."             # 仅失败时出现
+}
 ```
 
-### 2. 自定义摘要生成
+### 2. 子代理事件流（可观测性）
 
-```python
-# 子代理返回完整结果（不生成摘要）
-result = agent.run_as_subagent(
-    task="探索项目",
-    return_summary=False
-)
+Task 工具在派生开始/结束时发出结构化事件，CLI 与 Web 前端均有渲染：
 
-# 手动生成摘要
-summary = my_custom_summarize(result["result"])
-```
+| 事件 | payload | 时机 |
+|------|---------|------|
+| `subagent_start` | `{role, task}` | 子代理开始执行 |
+| `subagent_finish` | `{role, task, success, duration_seconds, summary}` | 子代理结束（成功/失败/超时） |
 
-### 3. 嵌套子代理
+超时语义：daemon 线程 + `join(timeout)` 的"放弃等待"——超时后主循环继续，子代理结果被丢弃（其线程可能仍在后台运行至进程退出）。
 
-```python
-# 主 Agent
-main_agent = ReActAgent("main", llm, tool_registry=registry)
+### 3. 防递归保护（双层）
 
-# 子 Agent 1
-sub1_agent = ReActAgent("sub1", llm, tool_registry=registry)
-
-# 子 Agent 2（嵌套）
-sub2_agent = ReActAgent("sub2", llm, tool_registry=registry)
-
-# 主 Agent 调用子 Agent 1
-result1 = sub1_agent.run_as_subagent(task="任务 1")
-
-# 子 Agent 1 调用子 Agent 2（嵌套）
-result2 = sub2_agent.run_as_subagent(task="任务 2")
-```
+1. Task 工具注册检查 `enable_subagent_task` 配置；
+2. `Role.create_subagent()` 强制子代理 Config 的 `subagent_task_enabled=False`——子代理的注册表里不会有 Task 工具，物理上无法再派生孙代理。
 
 ---
 
 ## 🔗 相关文档
 
-- [工具过滤器](./tool-response-protocol.md) - ToolFilter 详细说明
 - [会话持久化](./session-persistence-guide.md) - 保存子代理会话
 - [可观测性](./observability-guide.md) - 追踪子代理执行
 
@@ -425,27 +265,24 @@ result2 = sub2_agent.run_as_subagent(task="任务 2")
 
 **Q: 子代理会污染主 Agent 的历史吗？**
 
-A: 不会。子代理使用独立历史，执行后自动恢复主 Agent 状态。
+A: 不会。子代理是全新实例，有独立的历史与注册表；主 Agent 只接收子代理的最终结果（截断后）作为工具返回值。
 
 **Q: 如何禁用子代理机制？**
 
-A: 设置 `subagent_enabled=False`：
+A: 设置 `subagent_task_enabled=False`，主循环不再注册 Task 工具：
 ```python
-config = Config(subagent_enabled=False)
+config = Config(subagent_task_enabled=False)
 ```
-
-**Q: TaskTool 和手动调用 run_as_subagent() 的区别？**
-
-A:
-- **TaskTool**: Agent 自动调用，零配置
-- **run_as_subagent()**: 手动调用，更灵活
 
 **Q: 子代理可以访问主 Agent 的工具吗？**
 
-A: 可以，但受工具过滤器限制：
-- `ReadOnlyFilter`: 只能访问只读工具
-- `FullAccessFilter`: 可以访问大部分工具（排除危险工具）
-- `CustomFilter`: 自定义白名单/黑名单
+A: 子代理有独立的 ToolRegistry，只包含其角色白名单内的工具：
+- `explorer` / `reviewer`：只读工具（Read, Glob, Grep, LS, Git 只读系列, 受限 Bash）
+- `tester`：Read, Write, Edit, Bash, GitDiff
+
+**Q: 子代理能再派生子代理吗？**
+
+A: 不能。防递归保护强制子代理的 `subagent_task_enabled=False`。
 
 **Q: 子代理的成本如何计算？**
 
@@ -479,6 +316,4 @@ A: 子代理独立计费：
 
 ---
 
-**最后更新**: 2026-02-21
-
-
+**最后更新**: 2026-08-20

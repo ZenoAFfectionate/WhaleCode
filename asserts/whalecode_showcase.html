@@ -2048,7 +2048,7 @@
             </div>
           </div>
           <div class="terminal" aria-label="Runtime terminal sample">
-            <div><span class="muted-line">$</span> python run_cli.py --workspace ./repo</div>
+            <div><span class="muted-line">$</span> python main.py cli -- --workspace ./repo</div>
             <div>✓ workspace root locked</div>
             <div>✓ 12+ coding tools registered</div>
             <div>✓ trace, sessions, todos, terminals ready</div>
@@ -2521,7 +2521,7 @@
               <span class="mock-title">CLI Runtime Mock</span>
             </div>
             <div class="cli-screen">
-              <div><span class="dim">$</span> python run_cli.py --workspace ./repo</div>
+              <div><span class="dim">$</span> python main.py cli -- --workspace ./repo</div>
               <div><span class="accent">/tools</span> Read · Write · Edit · Bash · TodoWrite</div>
               <div>🎬 Tool call: Read({"path": "code/agents/code_agent.py"})</div>
               <div>👀 Observation: optimistic metadata captured</div>
@@ -2673,7 +2673,7 @@ while rounds_left:
       "Benchmark feedback loop": "评测反馈闭环",
       "Submit code, sandbox evaluate, inject feedback, iterate under step budgets.": "提交代码、沙箱评测、注入反馈，并在步数预算内持续迭代。",
       "measured": "可度量",
-      "$ python run_cli.py --workspace ./repo": '<span class="muted-line">$</span> python run_cli.py --workspace ./repo',
+      "$ python main.py cli -- --workspace ./repo": '<span class="muted-line">$</span> python main.py cli -- --workspace ./repo',
       "✓ workspace root locked": "✓ 工作区根目录已锁定",
       "✓ 12+ coding tools registered": "✓ 已注册 12+ 个编程工具",
       "✓ trace, sessions, todos, terminals ready": "✓ 轨迹、会话、任务与终端记录已就绪",

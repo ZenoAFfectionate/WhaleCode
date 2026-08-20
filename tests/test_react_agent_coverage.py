@@ -588,7 +588,7 @@ class TestRecordToolExecutionResult:
 
 
 class TestExtractResponseUsage:
-    """_extract_response_usage static method."""
+    """_extract_response_usage static method (A9: returns 4-tuple incl. cached)."""
 
     def test_standard_usage(self):
         resp = MagicMock()
@@ -597,10 +597,11 @@ class TestExtractResponseUsage:
         resp.usage.total_tokens = 150
         resp.usage_metadata = None
 
-        p, c, t = ReActAgent._extract_response_usage(resp)
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
         assert p == 100
         assert c == 50
         assert t == 150
+        assert cached == 0  # MagicMock 自动属性不得被误读为数值
 
     def test_usage_metadata_fallback(self):
         resp = MagicMock()
@@ -609,20 +610,22 @@ class TestExtractResponseUsage:
         resp.usage_metadata.candidates_token_count = 80
         resp.usage_metadata.total_token_count = 280
 
-        p, c, t = ReActAgent._extract_response_usage(resp)
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
         assert p == 200
         assert c == 80
         assert t == 280
+        assert cached == 0
 
     def test_no_usage_returns_zeros(self):
         resp = MagicMock()
         resp.usage = None
         resp.usage_metadata = None
 
-        p, c, t = ReActAgent._extract_response_usage(resp)
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
         assert p == 0
         assert c == 0
         assert t == 0
+        assert cached == 0
 
     def test_usage_without_total(self):
         resp = MagicMock()
@@ -631,7 +634,7 @@ class TestExtractResponseUsage:
         resp.usage.total_tokens = None
         resp.usage_metadata = None
 
-        p, c, t = ReActAgent._extract_response_usage(resp)
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
         assert t == 400  # Infer from p + c
 
     def test_usage_metadata_without_total(self):
@@ -641,8 +644,131 @@ class TestExtractResponseUsage:
         resp.usage_metadata.candidates_token_count = 30
         resp.usage_metadata.total_token_count = None
 
-        p, c, t = ReActAgent._extract_response_usage(resp)
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
         assert t == 80  # Infer from p + c
+
+    # ------------------------------------------------------------------
+    # A9: cached_tokens 提取 (三 provider 字段映射)
+    # ------------------------------------------------------------------
+
+    def test_openai_cached_tokens_object_form(self):
+        """OpenAI: usage.prompt_tokens_details.cached_tokens (SDK 对象形态)."""
+        resp = MagicMock()
+        resp.usage.prompt_tokens = 1000
+        resp.usage.completion_tokens = 50
+        resp.usage.total_tokens = 1050
+        resp.usage.prompt_tokens_details.cached_tokens = 800
+        resp.usage_metadata = None
+
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
+        assert (p, c, t, cached) == (1000, 50, 1050, 800)
+
+    def test_openai_cached_tokens_details_dict_form(self):
+        """OpenAI 兼容层可能以 dict 形态返回 prompt_tokens_details."""
+        resp = MagicMock()
+        resp.usage.prompt_tokens = 500
+        resp.usage.completion_tokens = 20
+        resp.usage.total_tokens = 520
+        resp.usage.prompt_tokens_details = {"cached_tokens": 460}  # dict 形态
+        resp.usage_metadata = None
+
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
+        assert (p, c, t, cached) == (500, 20, 520, 460)
+
+    def test_anthropic_cached_tokens(self):
+        """Anthropic: usage.cache_read_input_tokens (input/output 命名)."""
+        resp = MagicMock()
+        resp.usage.prompt_tokens = None  # 触发 input_tokens 回退
+        resp.usage.input_tokens = 900
+        resp.usage.completion_tokens = None
+        resp.usage.output_tokens = 40
+        resp.usage.total_tokens = None
+        resp.usage.cache_read_input_tokens = 700
+        resp.usage_metadata = None
+
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
+        assert (p, c, t, cached) == (900, 40, 940, 700)
+
+    def test_gemini_cached_tokens(self):
+        """Gemini: usage_metadata.cached_content_token_count."""
+        resp = MagicMock()
+        resp.usage = None
+        resp.usage_metadata.prompt_token_count = 600
+        resp.usage_metadata.candidates_token_count = 30
+        resp.usage_metadata.total_token_count = None
+        resp.usage_metadata.cached_content_token_count = 512
+
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
+        assert (p, c, t, cached) == (600, 30, 630, 512)
+
+    def test_cached_tokens_non_numeric_guarded(self):
+        """非数值 (如测试替身的 auto-attribute) 必须归零而非抛错."""
+        resp = MagicMock()
+        resp.usage.prompt_tokens = 10
+        resp.usage.completion_tokens = 5
+        resp.usage.total_tokens = 15
+        resp.usage.prompt_tokens_details.cached_tokens = "not-a-number"
+        resp.usage_metadata = None
+
+        p, c, t, cached = ReActAgent._extract_response_usage(resp)
+        assert cached == 0
+
+
+class TestRecordModelResponseUsage:
+    """A9 集成: _record_model_response → record_usage/快照/累计 的 cached 链路."""
+
+    def _agent(self):
+        agent = ReActAgent("test", _mock_llm(), config=Config())
+        agent.trace_logger = None
+        return agent
+
+    def _resp(self, cached: int):
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "hi"
+        resp.choices[0].message.tool_calls = []
+        resp.choices[0].finish_reason = "stop"
+        resp.usage.prompt_tokens = 1000
+        resp.usage.completion_tokens = 50
+        resp.usage.total_tokens = 1050
+        if cached:
+            resp.usage.prompt_tokens_details.cached_tokens = cached
+        else:
+            # 显式禁用 auto-attribute: 无缓存信息时必须读出 0
+            resp.usage.prompt_tokens_details = None
+            resp.usage.cache_read_input_tokens = None
+        resp.usage_metadata = None
+        return resp
+
+    def test_cached_tokens_flows_to_history_snapshot(self):
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        agent._record_model_response(self._resp(cached=800), 1, state)
+
+        snap = agent.history_manager.get_usage_snapshot()
+        assert snap["prompt_tokens"] == 1000
+        assert snap["cached_tokens"] == 800
+        assert agent._turn_cached_tokens == 800
+        assert state.total_cached_tokens == 800
+
+    def test_without_cached_field_defaults_to_zero(self):
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        agent._record_model_response(self._resp(cached=0), 1, state)
+
+        assert agent.history_manager.get_usage_snapshot()["cached_tokens"] == 0
+        assert agent._turn_cached_tokens == 0
+
+    def test_cached_tokens_accumulate_across_calls(self):
+        agent = self._agent()
+        state = _ExecutionState(current_step=1)
+        agent._record_model_response(self._resp(cached=300), 1, state)
+        agent._record_model_response(self._resp(cached=500), 2, state)
+
+        assert state.total_cached_tokens == 800
+        assert agent._turn_cached_tokens == 800
+        # 快照记录最近一次 (record_usage 语义: 最近一次模型调用的真实 usage)
+        assert agent.history_manager.get_usage_snapshot()["cached_tokens"] == 500
 
 
 # ============================================================================

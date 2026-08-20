@@ -315,27 +315,27 @@ response = read_tool.run({"path": "not_exist.py"})
 # )
 ```
 
-### 案例 2：计算器工具
+### 案例 2：网络搜索工具
 
 ```python
-from hello_agents.tools.builtin import CalculatorTool
+from hello_agents.tools.builtin import WebSearchTool
 
-calc = CalculatorTool()
+search_tool = WebSearchTool()
 
-# 成功计算
-response = calc.run({"expression": "2 + 3"})
+# 成功搜索
+response = search_tool.run({"query": "hello-agents framework"})
 # ToolResponse(
 #     status=SUCCESS,
-#     text="计算结果: 5",
-#     data={"result": 5, "expression": "2+3"}
+#     text="搜索完成，返回 N 条结果",
+#     data={"results": [...], "query": "hello-agents framework"}
 # )
 
-# 语法错误
-response = calc.run({"expression": "2 +"})
+# 参数为空
+response = search_tool.run({"query": ""})
 # ToolResponse(
 #     status=ERROR,
-#     text="表达式语法错误",
-#     error_info={"code": "INVALID_FORMAT", "message": "..."}
+#     text="查询关键词不能为空",
+#     error_info={"code": "INVALID_PARAM", "message": "..."}
 # )
 ```
 

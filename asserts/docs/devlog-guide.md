@@ -1,5 +1,11 @@
 # 开发日志系统指南（DevLog System）
 
+> **⚠️ 历史设计稿 / Historical Design Draft**
+> 本文档描述的 DevLogTool、`Config(devlog_enabled=True)` 与 `memory/devlogs/` 持久化**在当前代码库中尚未实现**（`code/tools/builtin/` 无此工具，`Config` 无此字段）。本文作为设计稿保留，供未来实现参考。
+> The DevLogTool, `Config(devlog_enabled=True)` and `memory/devlogs/` persistence described in this document are **not implemented** in the current codebase (no such tool in `code/tools/builtin/`, no such Config field). Kept as a design draft for future reference.
+>
+> 当前的替代方案 / Current alternatives：用 `TodoWrite` 记录任务进度，用 [TraceLogger](./observability-guide.md) 记录执行轨迹。
+
 ## 📖 概述
 
 **DevLogTool** 是 HelloAgents 框架的结构化开发日志工具，用于记录 Agent 的开发决策、问题、解决方案等关键信息。

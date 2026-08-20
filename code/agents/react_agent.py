@@ -24,6 +24,29 @@ THOUGHT_TOOL_NAME = "Thought"
 FINISH_TOOL_NAME = "Finish"
 STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
 
+
+def _get_nested_int(obj: Any, path: tuple) -> int:
+    """Read a nested int value via object attribute or dict key (A9).
+
+    Tolerates both SDK object form (``usage.prompt_tokens_details.cached_tokens``)
+    and plain-dict form, returning 0 whenever any hop is missing/non-numeric
+    (also guards against MagicMock-style auto-attributes in tests).
+    """
+    current: Any = obj
+    for key in path:
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+        if current is None:
+            return 0
+    if isinstance(current, bool) or not isinstance(current, (int, float, str)):
+        return 0
+    try:
+        return int(current or 0)
+    except (TypeError, ValueError):
+        return 0
+
 DEFAULT_REACT_SYSTEM_PROMPT = """You are an AI assistant with reasoning and action capabilities.
 
 Use tools whenever they are helpful for gathering information or performing work.
@@ -108,6 +131,7 @@ class _ExecutionState:
     total_tokens: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
+    total_cached_tokens: int = 0
     consecutive_no_diff_edits: int = 0
     last_test_output_hash: Optional[int] = None
     consecutive_same_tests: int = 0
@@ -199,6 +223,15 @@ class ReActAgent(Agent):
             step = payload.get("step")
             notification_text = payload.get("notification_text", "")
             self._console(f"📬 Background updates before step {step}:\n{notification_text}")
+        elif event_type == "subagent_start":
+            # Task 工具派生: ⎇ 前缀与历史 orchestra 渲染保持一致
+            self._console(f"⎇ [{payload.get('role')}] {payload.get('task', '')}")
+        elif event_type == "subagent_finish":
+            role = payload.get("role", "")
+            duration = payload.get("duration_seconds", 0)
+            marker = "✓" if payload.get("success") else "✗"
+            summary = str(payload.get("summary", ""))
+            self._console(f"{marker} [{role}] ({duration:.1f}s) {summary}")
         elif event_type == "console":
             self._console(
                 payload.get("message", ""),
@@ -294,19 +327,27 @@ class ReActAgent(Agent):
         tool_call_id: Optional[str] = None,
         status: Optional[str] = None,
         step: Optional[int] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> None:
         if status is None:
             status = "error" if str(result_content).startswith("❌") else "success"
-        self._render_event(
-            "tool_result",
-            {
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "result_content": result_content,
-                "status": status,
-                "step": step,
-            },
-        )
+        payload: Dict[str, Any] = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "result_content": result_content,
+            "status": status,
+            "step": step,
+        }
+        if isinstance(data, dict):
+            # C2: 白名单透出结构化字段（体积可控，排除 content 等大字段）。
+            subset = {
+                key: data[key]
+                for key in ("diff_preview", "backup_path", "path", "changed_bytes")
+                if key in data
+            }
+            if subset:
+                payload["data"] = subset
+        self._render_event("tool_result", payload)
 
     def _render_final_answer(
         self,
@@ -704,7 +745,14 @@ class ReActAgent(Agent):
             self._render_compaction_notice()
 
     @staticmethod
-    def _extract_response_usage(response: Any) -> tuple[int, int, int]:
+    def _extract_response_usage(response: Any) -> tuple[int, int, int, int]:
+        """Extract (prompt, completion, total, cached) token usage.
+
+        A9: ``cached`` 是命中 provider 前缀缓存/上下文缓存的 prompt tokens:
+          - OpenAI:    ``usage.prompt_tokens_details.cached_tokens``
+          - Anthropic: ``usage.cache_read_input_tokens``
+          - Gemini:    ``usage_metadata.cached_content_token_count``
+        """
         usage = getattr(response, "usage", None)
         if usage is not None:
             prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -718,7 +766,10 @@ class ReActAgent(Agent):
             total_tokens = getattr(usage, "total_tokens", None)
             if total_tokens is None:
                 total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
-            return int(prompt_tokens or 0), int(completion_tokens or 0), int(total_tokens or 0)
+            cached_tokens = _get_nested_int(
+                usage, ("prompt_tokens_details", "cached_tokens")
+            ) or _get_nested_int(usage, ("cache_read_input_tokens",))
+            return int(prompt_tokens or 0), int(completion_tokens or 0), int(total_tokens or 0), cached_tokens
 
         usage_metadata = getattr(response, "usage_metadata", None)
         if usage_metadata is not None:
@@ -727,9 +778,10 @@ class ReActAgent(Agent):
             total_tokens = getattr(usage_metadata, "total_token_count", None)
             if total_tokens is None:
                 total_tokens = prompt_tokens + completion_tokens
-            return prompt_tokens, completion_tokens, int(total_tokens or 0)
+            cached_tokens = _get_nested_int(usage_metadata, ("cached_content_token_count",))
+            return prompt_tokens, completion_tokens, int(total_tokens or 0), cached_tokens
 
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     def _record_model_response(self, response: Any, current_step: int, state: _ExecutionState) -> Any:
         response_message = response.choices[0].message
@@ -750,19 +802,22 @@ class ReActAgent(Agent):
         reasoning_content = None
         reasoning_source = None
 
-        prompt_tokens, completion_tokens, total_tokens = self._extract_response_usage(response)
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens = self._extract_response_usage(response)
         if total_tokens or prompt_tokens or completion_tokens:
             state.total_tokens += total_tokens
             state.total_prompt_tokens += prompt_tokens
             state.total_completion_tokens += completion_tokens
+            state.total_cached_tokens += cached_tokens
             self._total_tokens = state.total_tokens
             self._turn_prompt_tokens = state.total_prompt_tokens
             self._turn_completion_tokens = state.total_completion_tokens
+            self._turn_cached_tokens = state.total_cached_tokens
             self._last_prompt_tokens = prompt_tokens
             self.history_manager.record_usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
             )
             self._sync_history_token_count()
 
@@ -803,6 +858,7 @@ class ReActAgent(Agent):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": total_tokens,
+                    "cached_tokens": cached_tokens,
                     "cost": 0.0,
                 },
             }
@@ -1196,6 +1252,7 @@ class ReActAgent(Agent):
                 tool_call_id=tool_call_id,
                 step=step,
                 status=result_status,
+                data=result.get("data"),
             )
         self._trace_tool_result(
             tool_name,

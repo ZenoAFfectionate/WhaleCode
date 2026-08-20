@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
-import time as _time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from hashlib import sha256
@@ -24,7 +23,6 @@ from .message import Message
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
-    from ..tools.tool_filter import ToolFilter
 
 
 class Agent(ABC):
@@ -75,6 +73,7 @@ class Agent(ABC):
         self._estimated_next_prompt_tokens = 0
         self._turn_prompt_tokens = 0
         self._turn_completion_tokens = 0
+        self._turn_cached_tokens = 0
         self._total_tokens = 0
 
         # 上下文工程组件
@@ -178,7 +177,7 @@ class Agent(ABC):
             执行结果
 
         Example:
-            >>> agent = SimpleAgent(...)
+            >>> agent = ReActAgent(...)
             >>> result = await agent.arun("Hello", on_start=my_hook)
         """
         # 触发开始事件
@@ -315,6 +314,7 @@ class Agent(ABC):
         self._estimated_next_prompt_tokens = 0
         self._turn_prompt_tokens = 0
         self._turn_completion_tokens = 0
+        self._turn_cached_tokens = 0
         self.token_counter.clear_cache()
 
     def get_history(self) -> List[Message]:
@@ -640,6 +640,8 @@ class Agent(ABC):
             "content": self._format_tool_response_text(tool_name, response),
             "metadata": self._tool_history_metadata(tool_name, response),
             "status": "error" if response.status == ToolStatus.ERROR else "success",
+            # C2: 结构化数据（如 Edit/Write 的 diff_preview）供渲染层消费。
+            "data": response.data if isinstance(getattr(response, "data", None), dict) else None,
         }
 
     def _tool_observation_source_text(self, tool_name: str, response) -> tuple[str, Dict[str, Any]]:
@@ -1000,152 +1002,11 @@ class Agent(ABC):
         return {}
 
     # ==================== 子代理机制 ====================
-
-    def run_as_subagent(
-        self,
-        task: str,
-        tool_filter: Optional['ToolFilter'] = None,
-        return_summary: bool = True,
-        max_steps_override: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """作为子代理运行（上下文隔离模式）
-
-        特性：
-        - 上下文隔离：创建独立的历史记录，不污染主 Agent 上下文
-        - 工具过滤：可选的工具访问控制
-        - 摘要返回：返回结构化摘要而非完整历史
-        - 状态恢复：执行后自动恢复原始状态
-
-        Args:
-            task: 子任务描述
-            tool_filter: 工具过滤器（可选），用于限制可用工具
-            return_summary: 是否返回摘要（True）或完整结果（False）
-            max_steps_override: 覆盖最大步数（可选）
-
-        Returns:
-            {
-                "success": bool,           # 是否成功完成
-                "summary": str,            # 任务摘要（如果 return_summary=True）
-                "result": str,             # 完整结果（如果 return_summary=False）
-                "metadata": {              # 执行元数据
-                    "steps": int,          # 执行步数
-                    "tokens": int,         # 消耗 Token 数（估算）
-                    "duration_seconds": float,  # 执行时长
-                    "tools_used": List[str],    # 使用的工具列表
-                    "error": Optional[str]      # 错误信息（如果失败）
-                }
-            }
-        """
-        # 1. 保存当前状态（使用 to_dict 完整保存 rounds/usage 等元数据）
-        original_hm_state = self.history_manager.to_dict()
-        original_tools = None
-        original_max_steps = None
-
-        # 2. 创建隔离的新历史
-        self.history_manager.clear()
-
-        # 3. 应用工具过滤（如果提供）
-        if tool_filter and self.tool_registry:
-            original_tools = self._apply_tool_filter(tool_filter)
-
-        # 4. 覆盖最大步数（如果提供）
-        if max_steps_override is not None and hasattr(self, 'max_steps'):
-            original_max_steps = self.max_steps
-            self.max_steps = max_steps_override
-
-        # 记录开始时间
-        start_time = _time.time()
-        success = False
-        result = ""
-        error_msg = None
-
-        try:
-            # 5. 执行任务
-            result = self.run(task)
-            success = True
-
-        except KeyboardInterrupt:
-            error_msg = "用户中断"
-            raise
-
-        except Exception as e:
-            error_msg = str(e)
-            result = f"执行失败: {error_msg}"
-
-        finally:
-            # 记录执行时长
-            duration = _time.time() - start_time
-
-            # 6. 收集元数据
-            metadata = self._get_subagent_metadata(duration, error_msg)
-
-            # 7. 生成摘要（如果需要）
-            if return_summary:
-                summary = self._generate_subagent_summary(task, result, metadata)
-
-            # 8. 恢复原始状态（使用 load_from_dict 完整恢复 rounds/usage 等元数据）
-            self.history_manager.load_from_dict(original_hm_state)
-            self._sync_history_token_count()
-
-            if original_tools is not None:
-                self._restore_tools(original_tools)
-
-            if original_max_steps is not None:
-                self.max_steps = original_max_steps
-
-        # 9. 返回结果
-        if return_summary:
-            return {
-                "success": success,
-                "summary": summary,
-                "metadata": metadata
-            }
-        else:
-            return {
-                "success": success,
-                "result": result,
-                "metadata": metadata
-            }
-
-    def _apply_tool_filter(self, tool_filter: 'ToolFilter') -> Optional[Dict[str, Any]]:
-        """应用工具过滤器（重要-6：非破坏式）
-
-        旧实现直接 ``del self.tool_registry._tools[name]``，会真正抹掉共享注册表
-        里的工具，导致并发/嵌套子代理互相踩踏、甚至清空父 Agent 的工具。这里改为
-        把注册表的 ``_tools`` 换成一个只含放行工具的副本，并原样保留原 dict 以便
-        退出时无损还原。（真正的并发子代理仍应使用独立实例 / _create_subagent。）
-
-        Args:
-            tool_filter: 工具过滤器实例
-
-        Returns:
-            用于恢复的原始 ``_tools`` dict（无注册表时为 None）
-        """
-        if not self.tool_registry:
-            return None
-
-        original_tools = getattr(self.tool_registry, "_tools", None)
-        if not isinstance(original_tools, dict):
-            return None
-
-        allowed = set(tool_filter.filter(list(original_tools.keys())))
-        filtered = {
-            name: tool for name, tool in original_tools.items() if name in allowed
-        }
-        # Swap in the filtered copy; keep the original dict object for restore.
-        self.tool_registry._tools = filtered
-        return original_tools
-
-    def _restore_tools(self, original_tools: Any):
-        """恢复原始工具注册表（重要-6）
-
-        Args:
-            original_tools: _apply_tool_filter 返回的原始 ``_tools`` dict
-        """
-        if not self.tool_registry:
-            return
-        if isinstance(original_tools, dict):
-            self.tool_registry._tools = original_tools
+    # 编程式 run_as_subagent() API 已于 2026-08-20 下线：其"同实例状态切换"
+    # 模型（清空/恢复自身历史与工具集）有线程安全隐患，且生产零调用。
+    # 现行子代理机制为 Task 工具 → Role.create_subagent()（全新隔离实例），
+    # 下方 _get_subagent_metadata / _generate_subagent_summary /
+    # _extract_tools_from_history 仍为其共享依赖，保留。
 
     def _get_subagent_metadata(self, duration: float, error: Optional[str]) -> Dict[str, Any]:
         """获取子代理执行元数据
@@ -1162,9 +1023,13 @@ class Agent(ABC):
         # 估算步数（用户+助手消息对）
         steps = sum(1 for msg in history if msg.role == "assistant")
 
-        # 估算 Token 数（简化：字符数 / 4）
-        total_chars = sum(len(msg.content) for msg in history)
-        tokens = total_chars // 4
+        # Token 数：优先本地 TokenCounter 估算（Q2-11），不可用时回退 chars//4 粗估
+        try:
+            tokens = int(self.history_manager.get_estimated_token_count())
+        except Exception:
+            tokens = 0
+        if tokens <= 0:
+            tokens = sum(len(msg.content) for msg in history) // 4
 
         # 提取使用的工具
         tools_used = self._extract_tools_from_history(history)
@@ -1193,19 +1058,22 @@ class Agent(ABC):
         tools = set()
 
         for msg in history:
-            # 检查 tool_calls（FunctionCallAgent）
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                for tool_call in msg.tool_calls:
-                    if isinstance(tool_call, dict) and 'function' in tool_call:
-                        tools.add(tool_call['function'].get('name', ''))
+            # tool_calls 由 react_agent 写入 Message.metadata["tool_calls"]，
+            # 形态为 OpenAI 两层结构或扁平结构（见 HistoryManager._normalize_tool_calls）。
+            # 旧 ReAct 文本协议（"Action: Tool[...]"）解析分支已移除（Q1）。
+            meta = getattr(msg, "metadata", None)
+            if not isinstance(meta, dict):
+                continue
+            for tool_call in meta.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                func = tool_call.get("function")
+                if isinstance(func, dict) and func.get("name"):
+                    tools.add(func["name"])
+                elif tool_call.get("name"):
+                    tools.add(tool_call["name"])
 
-            # 检查内容中的工具调用（ReActAgent）
-            if msg.role == "assistant" and "Action:" in msg.content:
-                import re
-                matches = re.findall(r'Action:\s*(\w+)\[', msg.content)
-                tools.update(matches)
-
-        return sorted(list(tools))
+        return sorted(tools)
 
     def _generate_subagent_summary(
         self,

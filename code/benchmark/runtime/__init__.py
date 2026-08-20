@@ -3,7 +3,6 @@
 from .artifacts import BenchmarkArtifactStore
 from .base import BenchmarkExecutionEnvironment, EvalRequest, EvalResult
 from .config import BenchmarkRuntimeConfig
-from .docker_env import DockerCommandRunner, DockerExecutionEnvironment
 from .feedback import append_artifact_hint, artifact_hint
 from .python_adapters import (
     PythonAssertionAdapter,
@@ -17,8 +16,6 @@ __all__ = [
     "BenchmarkExecutionEnvironment",
     "BenchmarkArtifactStore",
     "BenchmarkRuntimeConfig",
-    "DockerCommandRunner",
-    "DockerExecutionEnvironment",
     "EvalRequest",
     "EvalResult",
     "PythonAssertionAdapter",

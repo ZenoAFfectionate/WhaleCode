@@ -19,12 +19,12 @@
 
 ```python
 from hello_agents import ReActAgent, HelloAgentsLLM, ToolRegistry
-from hello_agents.tools.builtin import ReadTool, SearchTool
+from hello_agents.tools.builtin import ReadTool, WebSearchTool
 
 # 创建工具注册表
 registry = ToolRegistry()
 registry.register_tool(ReadTool(project_root="./"))
-registry.register_tool(SearchTool())
+registry.register_tool(WebSearchTool())
 
 # 创建 Agent（自动使用 Function Calling）
 agent = ReActAgent("assistant", HelloAgentsLLM(), tool_registry=registry)
@@ -36,7 +36,7 @@ result = agent.run("读取 README.md 并搜索相关文档")
 ### 2. 直接调用 LLM Function Calling
 
 ```python
-from hello_agents.llm import HelloAgentsLLM
+from hello_agents import HelloAgentsLLM
 from hello_agents.tools.builtin import ReadTool
 
 llm = HelloAgentsLLM()
@@ -194,50 +194,26 @@ agent = ReActAgent("assistant", HelloAgentsLLM(), tool_registry=registry)
 result = agent.run("读取 config.py，修改端口为 8080，保存")
 ```
 
-### 2. ReflectionAgent 使用 Function Calling
+### 2. CodeAgent 使用 Function Calling
 
 ```python
-from hello_agents import ReflectionAgent, HelloAgentsLLM
+from hello_agents.agents import CodeAgent
+from hello_agents import HelloAgentsLLM
 
-agent = ReflectionAgent("thinker", HelloAgentsLLM(), tool_registry=registry)
+agent = CodeAgent("coder", HelloAgentsLLM(), project_root="./my-project")
 
-# ReflectionAgent 流程：
-# 1. 执行阶段：使用 Function Calling 调用工具
-# 2. 反思阶段：评估执行结果
-# 3. 改进阶段：根据反思调整策略
+# CodeAgent 基于 ReAct 循环，内置 24 个编程工具：
+# 1. Think → Act（Function Calling 调用工具）→ Observe 循环
+# 2. 文件/Bash/Git/LSP/Web 工具全部走 Function Calling 协议
+# 3. 上下文三层压缩 + TodoWrite 任务管理
 
-result = agent.run("分析项目架构")
+result = agent.run("读取 README.md 并总结项目结构")
 ```
 
-### 3. PlanSolveAgent 使用 Function Calling
-
-```python
-from hello_agents import PlanSolveAgent, HelloAgentsLLM
-
-agent = PlanSolveAgent("planner", HelloAgentsLLM(), tool_registry=registry)
-
-# PlanSolveAgent 流程：
-# 1. 规划阶段：生成执行计划
-# 2. 执行阶段：使用 Function Calling 调用工具
-# 3. 验证阶段：检查结果
-
-result = agent.run("重构项目结构")
-```
-
-### 4. SimpleAgent 使用 Function Calling
-
-```python
-from hello_agents import SimpleAgent, HelloAgentsLLM
-
-agent = SimpleAgent("assistant", HelloAgentsLLM(), tool_registry=registry)
-
-# SimpleAgent 流程：
-# 1. 单次调用 llm.invoke_with_tools()
-# 2. 执行所有工具调用
-# 3. 返回结果
-
-result = agent.run("读取 README.md")
-```
+> 注：早期版本还有 ReflectionAgent / PlanSolveAgent / SimpleAgent 三个教学演示型
+> agent，已随 2026-08-19 的精简决策移除（见 `IMPROVEMENT.md` 第 10 轮）。
+> ReActAgent 与 CodeAgent 是当前仅有的两个 Agent 实现，前者是通用推理循环，
+> 后者是面向仓库的编程智能体（也是 Web 控制台与 CLI 的实际入口）。
 
 ---
 
@@ -452,14 +428,14 @@ A: 几乎没有开销：
 
 **Q: 如何调试 Function Calling？**
 
-A: 使用 TraceLogger：
+A: 使用 TraceLogger（通过 Config 启用，Agent 构造函数不接收 trace_logger 参数）：
 ```python
-from hello_agents.core.observability import TraceLogger
+from hello_agents import Config
 
-logger = TraceLogger(output_dir="logs")
-agent = ReActAgent("assistant", llm, trace_logger=logger)
+config = Config(trace_enabled=True, trace_dir="logs")
+agent = ReActAgent("assistant", llm, config=config)
 
-# 查看 logs/trace.jsonl 和 logs/trace.html
+# 运行后查看 logs/trace-<session_id>.jsonl 和 logs/trace-<session_id>.html
 ```
 
 ---

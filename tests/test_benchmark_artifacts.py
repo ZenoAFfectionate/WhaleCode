@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 from hello_agents.benchmark.runtime import (
     BenchmarkArtifactStore,
     BenchmarkRuntimeConfig,
-    DockerExecutionEnvironment,
     EvalRequest,
     PythonSubprocessEnvironment,
     artifact_hint,
@@ -109,79 +107,6 @@ def test_artifact_store_enforces_retention(tmp_path):
     store.record_eval(stem="three", code="print(3)", stdout="3", stderr="", metadata={})
 
     assert len([path for path in store.root.iterdir() if path.is_dir()]) == 2
-
-
-class _FakeDockerRunner:
-    def __init__(self, *, mode: str = "success"):
-        self.mode = mode
-        self.calls = []
-
-    def run(self, command, *, cwd, timeout):
-        self.calls.append((list(command), Path(cwd), timeout))
-        if self.mode == "timeout":
-            raise subprocess.TimeoutExpired(command, timeout, output="partial", stderr="late")
-        if self.mode == "error":
-            raise RuntimeError("docker unavailable")
-        return subprocess.CompletedProcess(command, 0, stdout="docker-ok\n", stderr="")
-
-
-def test_docker_runtime_uses_eval_result_artifacts_and_cleanup(tmp_path):
-    store = BenchmarkArtifactStore(tmp_path / "artifacts")
-    runner = _FakeDockerRunner()
-    cleanup_calls = []
-    env = DockerExecutionEnvironment(
-        runner=runner,
-        artifact_store=store,
-        cleanup=lambda: cleanup_calls.append("cleanup"),
-        config=BenchmarkRuntimeConfig.for_profile("terminal_docker"),
-    )
-
-    result = env.evaluate(
-        EvalRequest(
-            command=["docker", "exec", "container", "bash", "-lc", "pytest"],
-            cwd=tmp_path,
-            timeout_s=5,
-            artifact_stem="docker-success",
-            metadata={"benchmark": "term"},
-        )
-    )
-
-    assert result.passed is True
-    assert result.status == "passed"
-    assert result.stdout == "docker-ok\n"
-    assert cleanup_calls == ["cleanup"]
-    assert runner.calls[0][2] == 5
-    assert result.metrics["runtime_config"]["profile"] == "terminal_docker"
-
-    metadata = json.loads(_read_artifact(store.root, result.artifacts["metadata"]))
-    assert metadata["request"]["metadata"] == {"benchmark": "term"}
-    assert metadata["runtime_config"]["profile"] == "terminal_docker"
-
-
-def test_docker_runtime_reports_timeout_and_error_with_cleanup(tmp_path):
-    cleanup_calls = []
-    timeout_env = DockerExecutionEnvironment(
-        runner=_FakeDockerRunner(mode="timeout"),
-        cleanup=lambda: cleanup_calls.append("timeout-cleanup"),
-    )
-    error_env = DockerExecutionEnvironment(
-        runner=_FakeDockerRunner(mode="error"),
-        cleanup=lambda: cleanup_calls.append("error-cleanup"),
-    )
-
-    timed_out = timeout_env.evaluate(
-        EvalRequest(command=["docker", "ps"], cwd=tmp_path, timeout_s=1)
-    )
-    errored = error_env.evaluate(
-        EvalRequest(command=["docker", "ps"], cwd=tmp_path, timeout_s=1)
-    )
-
-    assert timed_out.status == "timeout"
-    assert timed_out.returncode == -9
-    assert "docker evaluator exceeded 1s" in timed_out.feedback
-    assert errored.status == "error"
-    assert "docker unavailable" in errored.feedback
-    assert cleanup_calls == ["timeout-cleanup", "error-cleanup"]
 
 
 def test_benchmark_runtime_config_profiles_and_env(monkeypatch):

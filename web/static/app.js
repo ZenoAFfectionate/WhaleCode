@@ -9,16 +9,136 @@ const state = {
   benchmarkHistory: [],
   benchmarkDetails: new Map(),
   benchmarkTrajectories: new Map(),
-  activeEventSource: null,
   activeBenchmarkSource: null,
   activeBenchmarkJobId: null,
   blobs: new Map(),
   blobSeq: 0,
-  run: {
+  /* C6: 多会话 Tab——state.run / state.activeEventSource 通过 getter 桥接到
+     当前激活 tab，既有的 43 处 state.run.* 引用无需改动。 */
+  get run() { return _tabs.active.run; },
+  set run(value) { _tabs.active.run = value; },
+  get activeEventSource() { return _tabs.active.eventSource; },
+  set activeEventSource(value) { _tabs.active.eventSource = value; },
+};
+
+/* --------------------- C6: 多会话 Tab 管理 ----------------------------- */
+const _tabs = { list: [], active: null, seq: 0 };
+
+let _streamOverride = null;  // 后台 tab 事件渲染重定向（见 subscribeJob）
+let _eventTab = null;        // 当前正在处理的事件所属 tab（后台 tab 事件期间非空）
+function chatStreamEl() { return _streamOverride || _tabs.active.streamEl; }
+function isActiveTab(tab) { return tab === _tabs.active; }
+/* C6: 事件归属感知——渲染函数经 evtRun() 读写"事件所属 tab"的运行状态，
+   经 evtIsForeground() 决定是否触碰全局 vitals DOM / 滚动激活视图。 */
+function evtRun() { return _eventTab ? _eventTab.run : state.run; }
+function evtIsForeground() { return !_eventTab || _eventTab === _tabs.active; }
+
+function makeRunState() {
+  return {
     active: false, jobId: null, steps: 0, nodeIdx: 0, startedAt: 0, timer: null,
     pendingTools: new Map(), pendingOrder: [], logStep: null,
-  },
-};
+  };
+}
+function createTab(title) {
+  _tabs.seq += 1;
+  // 首个 tab 复用 index.html 里的静态 #chatStream 节点，避免重复容器
+  const existing = _tabs.list.length === 0 ? $("#traceStream > .trace-inner") : null;
+  const streamEl = existing || document.createElement("div");
+  streamEl.classList.add("trace-inner");
+  const tab = {
+    id: "tab-" + _tabs.seq,
+    title: title || `会话 ${_tabs.seq}`,
+    streamEl,
+    vitals: { status: "idle", steps: "0", elapsedText: "—", tokensText: "—" },
+    run: makeRunState(),
+    eventSource: null,
+  };
+  _tabs.list.push(tab);
+  switchTab(tab.id);
+  renderEmptyState();
+  renderTabs();
+  return tab;
+}
+function switchTab(tabId) {
+  const target = _tabs.list.find((t) => t.id === tabId);
+  if (!target || target === _tabs.active) return;
+  // vitals 快照保存
+  snapshotVitals();
+  // DOM 换挂
+  if (_tabs.active) {
+    const host = $("#traceStream");
+    if (host && _tabs.active.streamEl.parentNode === host) host.removeChild(_tabs.active.streamEl);
+  }
+  _tabs.active = target;
+  $("#traceStream").appendChild(target.streamEl);
+  restoreVitals();
+  // 计时器随 tab 换挂：新激活 tab 若在运行则用其自身 startedAt 续走
+  if (_tabs.active.run.active && _tabs.active.run.startedAt) startRunTimer(target);
+  else stopRunTimer(target);
+  renderTabs();
+}
+function closeTab(tabId) {
+  const idx = _tabs.list.findIndex((t) => t.id === tabId);
+  if (idx === -1) return;
+  const tab = _tabs.list[idx];
+  if (tab.eventSource) tab.eventSource.close();
+  tab.run.pendingTools?.clear?.();
+  stopRunTimer(tab);
+  _tabs.list.splice(idx, 1);
+  if (_tabs.list.length === 0) {
+    createTab();
+    return;
+  }
+  if (_tabs.active === tab) {
+    // 先摘除被关闭 tab 的 streamEl，再切换（switchTab 只摘除 active 的）
+    const host = $("#traceStream");
+    if (host && tab.streamEl.parentNode === host) host.removeChild(tab.streamEl);
+    _tabs.active = null;
+    switchTab(_tabs.list[Math.max(0, idx - 1)].id);
+  } else {
+    renderTabs();
+  }
+}
+function snapshotVitals() {
+  const tab = _tabs.active;
+  if (!tab) return;
+  tab.vitals = {
+    status: $("#vitalStatus").textContent,
+    steps: $("#vitalStep").textContent,
+    elapsedText: $("#vitalElapsed").textContent,
+    tokensText: $("#vitalTokens").textContent,
+  };
+  tab.title = tab.title || "会话";
+}
+function restoreVitals() {
+  const tab = _tabs.active;
+  if (!tab) return;
+  $("#vitalStatus").textContent = tab.vitals.status;
+  $("#vitalStep").textContent = tab.vitals.steps;
+  $("#vitalElapsed").textContent = tab.vitals.elapsedText;
+  $("#vitalTokens").textContent = tab.vitals.tokensText;
+  const bar = $("#agentVitals");
+  const statusMap = { 运行中: "running", 排队中: "queued", 已完成: "completed", 失败: "failed", 已取消: "cancelled" };
+  const cls = statusMap[tab.vitals.status];
+  bar.classList.toggle("is-running", cls === "running" || cls === "queued");
+  bar.classList.toggle("is-done", cls === "completed");
+  bar.classList.toggle("is-failed", cls === "failed");
+  bar.classList.toggle("is-cancelled", cls === "cancelled");
+}
+function renderTabs() {
+  const bar = $("#agentTabs");
+  if (_tabs.list.length <= 1) { bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.innerHTML = _tabs.list.map((t) => `
+    <div class="tab-item ${t === _tabs.active ? "active" : ""}" data-tab-id="${t.id}">
+      <button type="button" class="tab-label" data-switch-tab="${t.id}" title="${escapeHtml(t.title)}">
+        ${t.run?.active ? '<span class="tab-dot"></span>' : ""}${escapeHtml(t.title)}
+      </button>
+      <button type="button" class="tab-close" data-close-tab="${t.id}" title="关闭标签页" aria-label="关闭标签页">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>`).join("");
+}
 
 const EXAMPLES = ["修复失败的测试", "解释这段代码的作用", "为接口新增一个端点"];
 
@@ -101,6 +221,23 @@ function fileNameFromPayload(payload) {
   if (args && typeof args === "object") return fileNameFromPayload(args);
   return "";
 }
+/* C1: 提取完整相对路径（供工作区面板联动打开），无则返回空串 */
+function filePathFromPayload(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  for (const k of ["path", "file_path", "filepath", "target_file", "target_path"]) {
+    if (typeof payload[k] === "string" && payload[k].trim()) return payload[k].trim();
+  }
+  const args = payload.arguments || payload.args || payload.params || payload.input || payload.parameters;
+  if (typeof args === "string") { try { return filePathFromPayload(JSON.parse(args)); } catch { return ""; } }
+  if (args && typeof args === "object") return filePathFromPayload(args);
+  return "";
+}
+/* C1: 文件路径 → 可点击 chip（点击在工作区面板中打开该文件） */
+function fileLinkChip(name, path) {
+  if (!name) return "";
+  if (!path) return `<strong>${escapeHtml(name)}</strong>`;
+  return `<strong><a class="file-link" data-open-file="${escapeHtml(path)}" title="在工作区面板中打开 ${escapeHtml(path)}">${escapeHtml(name)}</a></strong>`;
+}
 function isFileTool(name) { return ["read", "write", "edit", "delete"].includes(String(name || "").toLowerCase()); }
 function toolTarget(payload) {
   const name = toolName(payload).toLowerCase();
@@ -124,6 +261,83 @@ function renderMaybeDiff(text) {
     if (l.startsWith("-")) return `<span class="diff-del">${l}</span>`;
     return l;
   }).join("\n");
+}
+
+/* ------------------- C2: unified diff 增强查看器 ----------------------- */
+function parseUnifiedDiff(diffText) {
+  /* 解析 unified diff → { hunks: [{ header, oldStart, newStart, rows: [...] }], adds, dels }
+     rows: [{ type: 'ctx'|'add'|'del'|'hunk', oldNo, newNo, text }] */
+  const lines = String(diffText || "").split("\n");
+  const hunks = [];
+  let current = null;
+  let adds = 0, dels = 0;
+  let oldNo = 0, newNo = 0;
+  for (const line of lines) {
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      current = { header: line, oldStart: Number(hunkMatch[1]), newStart: Number(hunkMatch[2]), rows: [] };
+      hunks.push(current);
+      oldNo = current.oldStart;
+      newNo = current.newStart;
+      continue;
+    }
+    if (!current) continue;  // hunk 头之前的文件名/索引行忽略
+    if (line.startsWith("diff ") || line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+    if (line.startsWith("+")) {
+      current.rows.push({ type: "add", newNo: newNo++, text: line.slice(1) });
+      adds += 1;
+    } else if (line.startsWith("-")) {
+      current.rows.push({ type: "del", oldNo: oldNo++, text: line.slice(1) });
+      dels += 1;
+    } else if (line.startsWith(" ")) {
+      current.rows.push({ type: "ctx", oldNo: oldNo++, newNo: newNo++, text: line.slice(1) });
+    } else if (line === "") {
+      current.rows.push({ type: "ctx", oldNo: oldNo, newNo: newNo, text: "" });
+    }
+  }
+  return { hunks, adds, dels };
+}
+function renderDiffBlock(diffText, options = {}) {
+  const parsed = parseUnifiedDiff(diffText);
+  if (!parsed.hunks.length) return null;
+  const ctxLimit = options.context ?? 3;
+  const rowsHtml = [];
+  for (const hunk of parsed.hunks) {
+    // 上下文折叠：连续 ctx 行超过 2*ctxLimit+1 时只保留首尾
+    const kept = new Set();
+    let runStart = -1;
+    const rows = hunk.rows;
+    for (let i = 0; i <= rows.length; i += 1) {
+      const isCtx = i < rows.length && rows[i].type === "ctx";
+      if (isCtx && runStart === -1) runStart = i;
+      if (!isCtx && runStart !== -1) {
+        const runEnd = i - 1;
+        const len = runEnd - runStart + 1;
+        if (len > ctxLimit * 2 + 1) {
+          for (let k = runStart; k < runStart + ctxLimit; k += 1) kept.add(k);
+          for (let k = runEnd - ctxLimit + 1; k <= runEnd; k += 1) kept.add(k);
+          kept.add(-runStart);  // 折叠占位标记
+        } else {
+          for (let k = runStart; k <= runEnd; k += 1) kept.add(k);
+        }
+        runStart = -1;
+      }
+    }
+    rowsHtml.push(`<div class="diff-hunk-header">${escapeHtml(hunk.header)}</div>`);
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = rows[i];
+      if (kept.has(-i)) {
+        const prev = rows[i - 1];
+        rowsHtml.push(`<div class="diff-row fold"><span class="dl">${prev ? prev.oldNo ?? "" : ""}</span><span class="dl">${prev ? prev.newNo ?? "" : ""}</span><span class="dc">⋯ 上下文已折叠 ⋯</span></div>`);
+      }
+      if (!kept.has(i)) continue;
+      const cls = row.type === "add" ? "add" : row.type === "del" ? "del" : "ctx";
+      const mark = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+      rowsHtml.push(`<div class="diff-row ${cls}"><span class="dl">${row.oldNo ?? ""}</span><span class="dl">${row.newNo ?? ""}</span><span class="dm">${mark}</span><span class="dc">${escapeHtml(row.text)}</span></div>`);
+    }
+  }
+  const badge = `<span class="diff-badge"><i class="add">+${parsed.adds}</i><i class="del">−${parsed.dels}</i></span>`;
+  return `<div class="diff-view"><div class="diff-toolbar"><span class="label">${escapeHtml(options.label || "diff")}</span>${badge}</div><div class="diff-body">${rowsHtml.join("")}</div></div>`;
 }
 function storeBlob(value) {
   const id = "blob-" + (++state.blobSeq);
@@ -163,7 +377,11 @@ function renderInline(text) {
   out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
   out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // C3: 链接协议白名单——javascript:/data: 等危险 scheme 降级为纯文本
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
+    const safe = /^(https?:\/\/|\/|\.\/|#)/i.test(href) ? href : "#";
+    return `<a href="${safe}" target="_blank" rel="noopener">${label}</a>`;
+  });
   return out;
 }
 function renderMarkdown(value) {
@@ -187,8 +405,39 @@ function renderMarkdown(value) {
       // 标题 1-6 级
       const heading = line.match(/^(#{1,6})\s+(.*)$/);
       if (heading) {
-        const level = Math.min(6, heading[1].length + 2);
+        // Keep generated headings within valid HTML h2..h6 (h7/h8 are
+        // custom unknown elements and lose browser semantics/styles).
+        const level = Math.min(6, heading[1].length + 1);
         out.push("<h" + level + ">" + renderInline(heading[2]) + "</h" + level + ">");
+        continue;
+      }
+      // C3: 块引用（支持连续多行合并）
+      if (/^\s*>\s?/.test(line)) {
+        const quoteLines = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+          quoteLines.push(lines[i].replace(/^\s*>\s?/, ""));
+          i += 1;
+        }
+        i -= 1;
+        out.push("<blockquote>" + renderMarkdown(quoteLines.join("\n")) + "</blockquote>");
+        continue;
+      }
+      // C3: 任务列表（- [ ] / - [x]，渲染为只读 checkbox）
+      if (/^\s*[-*+]\s+\[[ xX]\]\s+/.test(line)) {
+        const items = [];
+        while (i < lines.length && /^\s*[-*+]\s+\[[ xX]\]\s+/.test(lines[i])) {
+          const checked = /\[[xX]\]/.test(lines[i]);
+          items.push(`<li class="task-item"><span class="task-check${checked ? " done" : ""}">${checked ? "✓" : ""}</span>`
+            + renderInline(lines[i].replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "")) + "</li>");
+          i += 1;
+        }
+        i -= 1;
+        out.push("<ul class=\"task-list\">" + items.join("") + "</ul>");
+        continue;
+      }
+      // C3: 水平线
+      if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(line)) {
+        out.push("<hr>");
         continue;
       }
       // 无序列表
@@ -259,28 +508,36 @@ function setVitalsStatus(status) {
     ? `● ${label} · ${BASE_TITLE}`
     : (status === "failed" ? `✕ ${label} · ${BASE_TITLE}` : BASE_TITLE);
 }
-function startRunTimer() {
-  stopRunTimer();
-  state.run.startedAt = performance.now();
-  state.run.timer = setInterval(() => {
-    $("#vitalElapsed").textContent = formatDuration((performance.now() - state.run.startedAt) / 1000);
+/* C6: 计时器归属各 tab——后台 tab 结束只停自己的，不误停激活 tab。 */
+function startRunTimer(tab = _tabs.active) {
+  if (!tab) return;
+  stopRunTimer(tab);
+  tab.run.startedAt = performance.now();
+  tab.run.timer = setInterval(() => {
+    if (tab === _tabs.active) {
+      $("#vitalElapsed").textContent = formatDuration((performance.now() - tab.run.startedAt) / 1000);
+    }
   }, 200);
 }
-function stopRunTimer() { if (state.run.timer) { clearInterval(state.run.timer); state.run.timer = null; } }
+function stopRunTimer(tab = _tabs.active) {
+  if (tab && tab.run.timer) { clearInterval(tab.run.timer); tab.run.timer = null; }
+}
 
 /* --------------------------- trace stream ----------------------------- */
 function ensureStreamReady() {
-  const empty = $("#chatStream .empty-state");
+  const empty = chatStreamEl().querySelector(".empty-state");
   if (empty) empty.remove();
 }
 function scrollStream() {
+  // C6: 后台 tab 的事件渲染进其自身 DOM（detached），不滚动激活视图。
+  if (!evtIsForeground()) return;
   const s = $("#traceStream");
   // Only auto-scroll while the user is already near the bottom; yanking the
   // viewport on every event would make it impossible to read earlier steps.
   const nearBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 120;
   if (nearBottom) s.scrollTop = s.scrollHeight;
 }
-function nextIdx() { state.run.nodeIdx += 1; return String(state.run.nodeIdx).padStart(2, "0"); }
+function nextIdx() { const run = evtRun(); run.nodeIdx += 1; return String(run.nodeIdx).padStart(2, "0"); }
 
 function stepShell({ phase, idx, kicker, primary, meta, body }) {
   const art = document.createElement("article");
@@ -310,14 +567,14 @@ function stepShell({ phase, idx, kicker, primary, meta, body }) {
 
 function addThinkStep(event) {
   ensureStreamReady();
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const text = payloadText(event.payload);
   const art = stepShell({
     phase: "think", idx: nextIdx(), kicker: "思考",
     primary: firstLine(text) || "模型思考",
     body: "<div class=\"body-text\">" + renderMarkdown(text) + "</div>",
   });
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
@@ -344,14 +601,28 @@ function renderToolCallBody(payload) {
   const args = toolArgs(payload);
   const kind = toolKind(name);
   const cards = [];
+  const link = fileLinkChip(toolPrimary(payload), filePathFromPayload(payload));
   if (kind === "bash") {
     const cmd = args.command || args.cmd || payload.command || payloadText(payload);
     cards.push("<div class=\"tool-card bash\"><span class=\"label\">Command</span>" + longTextBlock(cmd, { label: "bash", language: "bash", head: 20, tail: 12 }) + "</div>");
   } else if (kind === "read") {
-    cards.push("<div class=\"tool-card read\"><span class=\"label\">Read</span><strong>" + escapeHtml(toolPrimary(payload)) + "</strong></div>");
+    cards.push("<div class=\"tool-card read\"><span class=\"label\">Read</span>" + link + "</div>");
   } else if (kind === "edit" || kind === "write") {
+    // C2: Edit 调用参数自带 old/new，本地构造预览 diff（结果返回后由 diff_preview 接管）
+    let previewDiff = "";
+    if (kind === "edit" && typeof args.old_string === "string" && typeof args.new_string === "string") {
+      const p = args.path || args.file_path || "";
+      const oldLines = String(args.old_string).split("\n");
+      const newLines = String(args.new_string).split("\n");
+      const prefixDiffLines = (lines, marker) => lines.map((line) => marker + line).join("\n");
+      previewDiff = renderDiffBlock(
+        `--- a/${p}\n+++ b/${p}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n${prefixDiffLines(oldLines, "-")}\n${prefixDiffLines(newLines, "+")}`,
+        { label: "pending edit" },
+      ) || "";
+    }
     const body = args.patch || args.content || payload.output || payloadText(payload);
-    cards.push("<div class=\"tool-card " + kind + "\"><span class=\"label\">" + kind.toUpperCase() + "</span><strong>" + escapeHtml(toolPrimary(payload)) + "</strong>" + longTextBlock(body, { label: kind === "edit" ? "diff / patch" : "content", head: 28, tail: 18 }) + "</div>");
+    cards.push("<div class=\"tool-card " + kind + "\"><span class=\"label\">" + kind.toUpperCase() + "</span>" + link
+      + (previewDiff || longTextBlock(body, { label: kind === "edit" ? "diff / patch" : "content", head: 28, tail: 18 })) + "</div>");
   } else if (kind === "search") {
     cards.push("<div class=\"tool-card search\"><span class=\"label\">Search</span><strong>" + escapeHtml(toolPrimary(payload)) + "</strong>" + longTextBlock(JSON.stringify(args, null, 2), { label: "query", language: "json", head: 16, tail: 8 }) + "</div>");
   } else {
@@ -378,27 +649,43 @@ function renderToolResultBody(payload, ok) {
       + (code != null ? "<small>Exit code: " + escapeHtml(code) + "</small>" : "")
       + "<p>" + escapeHtml(errorAdvice(payload)) + "</p></div>");
   }
+  // C2: Edit/Write 结果优先渲染结构化 diff_preview（行号双列 + 统计徽标）
+  const diffPreview = payload?.data?.diff_preview;
+  const kind = toolKind(name);
+  if (typeof diffPreview === "string" && diffPreview.trim()) {
+    const diffHtml = renderDiffBlock(diffPreview, { label: kind === "edit" ? "edit diff" : "write diff" });
+    if (diffHtml) {
+      // 不能只显示 diff：Write/Edit 的 formatter、diagnostics、大小和
+      // backup 等有效摘要位于 result_content 的 Unified diff 之前。
+      const marker = "\nUnified diff preview:";
+      const summary = text.includes(marker) ? text.split(marker)[0].trim() : text;
+      if (summary) pieces.push(longTextBlock(summary, { label: "result summary", head: 24, tail: 12 }));
+      pieces.push(diffHtml);
+      return pieces.join("") + rawBlock(payload);
+    }
+  }
   pieces.push(longTextBlock(text, { label: ok ? "output" : "error output", head: 48, tail: 28 }));
   return pieces.join("") + rawBlock(payload);
 }
 
 function addActStep(event) {
   ensureStreamReady();
-  state.run.logStep = null;
-  state.run.steps += 1;
-  $("#vitalStep").textContent = String(state.run.steps);
+  const run = evtRun();
+  run.logStep = null;
+  run.steps += 1;
+  if (evtIsForeground()) $("#vitalStep").textContent = String(run.steps);
   const p = event.payload || {};
   let callId = toolCallId(p);
-  if (!callId) callId = "auto-" + state.run.steps + "-" + state.run.nodeIdx;
+  if (!callId) callId = "auto-" + run.steps + "-" + run.nodeIdx;
   const art = stepShell({
     phase: "act running tool-" + toolKind(toolName(p)), idx: nextIdx(), kicker: toolName(p).toUpperCase(),
     primary: toolPrimary(p),
     meta: "<span class=\"step-stat\">运行中</span>",
     body: renderToolCallBody(p),
   });
-  $("#chatStream").appendChild(art);
-  state.run.pendingTools.set(callId, { el: art, start: performance.now(), payload: p });
-  state.run.pendingOrder.push(callId);
+  chatStreamEl().appendChild(art);
+  run.pendingTools.set(callId, { el: art, start: performance.now(), payload: p });
+  run.pendingOrder.push(callId);
   scrollStream();
 }
 
@@ -411,7 +698,7 @@ function addStandaloneObserve(event) {
     meta: "<span class=\"step-stat\">" + (ok ? "✓" : "✗") + "</span>",
     body: renderToolResultBody(p, ok),
   });
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
@@ -458,14 +745,15 @@ function renderAskUserResult(payload, ok, el) {
 function resolveActStep(event) {
   const p = event.payload || {};
   const ok = toolResultStatus(p) === "success";
+  const run = evtRun();
   let callId = toolCallId(p);
-  if (!callId || !state.run.pendingTools.has(callId)) {
-    callId = state.run.pendingOrder.find((id) => state.run.pendingTools.has(id)) || "";
+  if (!callId || !run.pendingTools.has(callId)) {
+    callId = run.pendingOrder.find((id) => run.pendingTools.has(id)) || "";
   }
-  const pending = callId ? state.run.pendingTools.get(callId) : null;
+  const pending = callId ? run.pendingTools.get(callId) : null;
   if (!pending) return addStandaloneObserve(event);
-  state.run.pendingTools.delete(callId);
-  state.run.pendingOrder = state.run.pendingOrder.filter((id) => id !== callId);
+  run.pendingTools.delete(callId);
+  run.pendingOrder = run.pendingOrder.filter((id) => id !== callId);
   const el = pending.el;
   el.classList.remove("running");
   el.classList.add(ok ? "pass" : "fail");
@@ -489,13 +777,13 @@ function addBuiltinToolStep(event) {
   const text = clean(p.result_content || payloadText(p)).replace(/^Reasoning:\s*/i, "");
   if (!text) return;
   ensureStreamReady();
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const art = stepShell({
     phase: "think", idx: nextIdx(), kicker: "思考",
     primary: firstLine(text) || "模型思考",
     body: "<div class=\"body-text\">" + renderMarkdown(text) + "</div>",
   });
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
@@ -508,18 +796,19 @@ function buildAskForm(questions, jobId, onSubmitted) {
     const options = Array.isArray(q.options) && q.options.length ? q.options : [];
     let controlHtml;
     if (options.length) {
-      controlHtml = `<div class="ask-options" data-qid="${qid}">` + options.map((opt, oi) => {
+      const qidAttr = escapeHtml(qid);
+      controlHtml = `<div class="ask-options" data-qid="${qidAttr}">` + options.map((opt, oi) => {
         const label = String((opt && (opt.label || opt.text || opt.value)) || "");
         const value = String((opt && opt.value) || label);
-        return `<button type="button" class="ask-option" data-qid="${qid}" data-value="${escapeHtml(value)}">
+        return `<button type="button" class="ask-option" data-qid="${qidAttr}" data-value="${escapeHtml(value)}">
           <span class="ask-option-num">${oi + 1}</span>
           <span class="ask-option-label">${escapeHtml(label)}</span>
         </button>`;
       }).join("") + "</div>";
     } else {
-      controlHtml = `<textarea class="ask-input" data-qid="${qid}" rows="2" placeholder="输入你的回答…"></textarea>`;
+      controlHtml = `<textarea class="ask-input" data-qid="${escapeHtml(qid)}" rows="2" placeholder="输入你的回答…"></textarea>`;
     }
-    return `<div class="ask-question" data-qid="${qid}">
+    return `<div class="ask-question" data-qid="${escapeHtml(qid)}">
       <div class="ask-qtext">${renderInline(text)}</div>
       ${controlHtml}
     </div>`;
@@ -532,10 +821,12 @@ function buildAskForm(questions, jobId, onSubmitted) {
     </div>`;
 
   function wire(root) {
+    const byQid = (selector, qid) => [...root.querySelectorAll(selector)]
+      .filter((el) => el.dataset.qid === qid);
     root.querySelectorAll(".ask-option").forEach((btn) => {
       btn.addEventListener("click", () => {
         const qid = btn.dataset.qid;
-        root.querySelectorAll(`.ask-option[data-qid="${qid}"]`).forEach((b) => b.classList.remove("selected"));
+        byQid(".ask-option", qid).forEach((b) => b.classList.remove("selected"));
         btn.classList.add("selected");
       });
     });
@@ -544,10 +835,10 @@ function buildAskForm(questions, jobId, onSubmitted) {
       const answers = questions.map((q, qi) => {
         const qid = String(q.id || `q${qi + 1}`);
         let answer = "";
-        const selected = root.querySelector(`.ask-option.selected[data-qid="${qid}"]`);
+        const selected = byQid(".ask-option.selected", qid)[0];
         if (selected) answer = selected.dataset.value;
         else {
-          const ta = root.querySelector(`textarea[data-qid="${qid}"]`);
+          const ta = byQid("textarea", qid)[0];
           if (ta) answer = ta.value.trim();
         }
         return { id: qid, answer };
@@ -573,11 +864,12 @@ function buildAskForm(questions, jobId, onSubmitted) {
 
 function addAskUserCard(event) {
   ensureStreamReady();
-  state.run.logStep = null;
+  const run = evtRun();
+  run.logStep = null;
   const p = event.payload || {};
   const questions = Array.isArray(p.questions) ? p.questions : [];
   if (!questions.length) return;
-  const jobId = p.job_id || state.run.jobId;
+  const jobId = p.job_id || run.jobId;
   const form = buildAskForm(questions, jobId, (root) => {
     const hint = root.querySelector(".ask-hint");
     if (hint) hint.textContent = "已提交回答，等待模型继续执行…";
@@ -625,13 +917,13 @@ function addAskUserCard(event) {
   art.querySelector(".step-head").setAttribute("aria-expanded", "true");
   if (form.wire) form.wire(art);
   storeQuestions(art);
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
 function addErrorLine(text) {
   ensureStreamReady();
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const art = stepShell({
     phase: "fail", idx: nextIdx(), kicker: "错误",
     primary: firstLine(text) || "运行错误",
@@ -639,7 +931,7 @@ function addErrorLine(text) {
     body: "<div class=\"body-text\">" + escapeHtml(text) + "</div>",
   });
   art.querySelector(".step-main").classList.add("open");
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
@@ -647,14 +939,15 @@ function addLogLine(event) {
   ensureStreamReady();
   const line = payloadText(event.payload);
   if (!line) return;
-  if (state.run.logStep && state.run.logStep.isConnected) {
-    const list = state.run.logStep.querySelector(".log-list");
+  const run = evtRun();
+  if (run.logStep && run.logStep.isConnected) {
+    const list = run.logStep.querySelector(".log-list");
     const el = document.createElement("div");
     el.className = "log-line";
     el.textContent = line;
     list.appendChild(el);
     const count = list.children.length;
-    state.run.logStep.querySelector(".log-count").textContent = `${count} 行`;
+    run.logStep.querySelector(".log-count").textContent = `${count} 行`;
     return;
   }
   const art = stepShell({
@@ -663,38 +956,45 @@ function addLogLine(event) {
     body: `<div class="log-list" style="display:grid;gap:5px">` +
           `<div class="log-line">${escapeHtml(line)}</div></div>`,
   });
-  $("#chatStream").appendChild(art);
-  state.run.logStep = art;
+  chatStreamEl().appendChild(art);
+  run.logStep = art;
   scrollStream();
 }
 
 function addSystemLine(text) {
   ensureStreamReady();
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const art = document.createElement("article");
   art.className = "step system";
   art.innerHTML = `<div class="step-gutter"><span class="step-node"></span></div>
     <div class="step-main"><div class="step-head" style="cursor:default">
       <span class="step-kicker">系统</span>
       <span class="step-primary">${escapeHtml(text)}</span><span></span></div></div>`;
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
 function addAnswer(text, meta = {}, failed = false) {
   ensureStreamReady();
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const art = document.createElement("article");
   art.className = "answer" + (failed ? " failed" : "");
   art.innerHTML =
     "<div class=\"answer-body markdown-body\">" + renderMarkdown(text) + "</div>";
-  $("#chatStream").appendChild(art);
+  chatStreamEl().appendChild(art);
   scrollStream();
 }
 
-function handleEvent(event) {
+function handleEvent(event, tab) {
+  /* C6: tab 参数标记事件归属——后台 tab 的事件只渲染进它自己的 streamEl
+     （_streamOverride 已重定向），vitals DOM 仅在事件属于激活 tab 时更新。 */
   const t = event.type;
-  if (event.job) setVitalsStatus(event.job.status);
+  const active = !tab || isActiveTab(tab);
+  if (event.job && active) setVitalsStatus(event.job.status);
+  if (active && event.payload && event.payload.tokens != null) {
+    $("#vitalTokens").textContent = formatTokens(event.payload.tokens);
+    recordTokenSample(event.payload.tokens);  // C5: 运行中 token 曲线
+  }
   switch (t) {
     case "model_output": return addThinkStep(event);
     case "tool_call": return addActStep(event);
@@ -705,6 +1005,17 @@ function handleEvent(event) {
       const p = event.payload || {};
       return addSystemLine(`${toolName(p)}：${firstLine(p.result_content || "") || "已完成"}`);
     }
+    case "subagent_start": {
+      // Task 工具派生: 子代理开始执行 (并行派生时多个 start 可能交错)
+      const p = event.payload || {};
+      return addSystemLine(`⎇ [${p.role || "subagent"}] ${firstLine(p.task || "")}`);
+    }
+    case "subagent_finish": {
+      const p = event.payload || {};
+      const ok = p.success !== false;
+      const secs = typeof p.duration_seconds === "number" ? p.duration_seconds.toFixed(1) : "0.0";
+      return addSystemLine(`${ok ? "✓" : "✗"} [${p.role || "subagent"}] ${secs}s — ${firstLine(p.summary || "")}`);
+    }
     case "agent_error": return addErrorLine(String(event.payload?.message || "Agent 运行错误"));
     case "llm_error": return addErrorLine(`模型调用失败：${event.payload?.error || "未知错误"}`);
     case "console": return addLogLine(event);
@@ -714,7 +1025,7 @@ function handleEvent(event) {
 }
 
 function renderEmptyState() {
-  $("#chatStream").innerHTML = `
+  chatStreamEl().innerHTML = `
     <div class="empty-state">
       <h2>开始一次编码协作</h2>
       <p>输入你想完成的开发任务，WhaleCode 会实时展示思考过程、工具调用和最终结果。</p>
@@ -725,18 +1036,23 @@ function renderEmptyState() {
 }
 
 function resetAgentConversation() {
-  if (state.activeEventSource) { state.activeEventSource.close(); state.activeEventSource = null; }
-  stopRunTimer();
+  const tab = _tabs.active;
+  if (tab) {
+    if (tab.eventSource) { tab.eventSource.close(); tab.eventSource = null; }
+    if (tab.run.timer) clearInterval(tab.run.timer);
+    tab.run = makeRunState();
+    tab.vitals = { status: "idle", steps: "0", elapsedText: "—", tokensText: "—" };
+  }
   state.selectedSession = null;
   state.selectedSessionTitle = "新会话";
-  state.run = {
-    active: false, jobId: null, steps: 0, nodeIdx: 0, startedAt: 0, timer: null,
-    pendingTools: new Map(), pendingOrder: [], logStep: null,
-  };
   // The whole stream is being discarded, so the stored full-text blobs
   // backing its 复制/展开 buttons can be released too.
   state.blobs.clear();
   state.blobSeq = 0;
+  tokenSpark.samples = [];
+  tokenSpark.last = 0;
+  drawTokenSpark();
+  stopRunTimer();
   setVitalsStatus("idle");
   const cancel = $("#cancelAgentButton");
   if (cancel) { cancel.hidden = true; cancel.disabled = false; }
@@ -744,6 +1060,7 @@ function resetAgentConversation() {
   $("#vitalElapsed").textContent = "—";
   $("#vitalTokens").textContent = "—";
   renderEmptyState();
+  renderTabs();
 }
 
 /* ------------------------------ status -------------------------------- */
@@ -763,7 +1080,7 @@ function renderModelStatus(snapshot) {
 }
 /* ----------------------------- sessions ------------------------------- */
 async function renderSessionHistory(history) {
-  const stream = $("#chatStream");
+  const stream = chatStreamEl();
   if (!stream) return;
   stream.innerHTML = "";
   for (const msg of history || []) {
@@ -783,7 +1100,7 @@ async function renderSessionHistory(history) {
     }
     // tool 消息是过程噪音，历史回顾时跳过
   }
-  state.run.logStep = null;
+  evtRun().logStep = null;
   const s = $("#traceStream");
   if (s) s.scrollTop = s.scrollHeight;
 }
@@ -864,6 +1181,7 @@ async function refreshBenchmarkHistory() {
   const data = await api("/api/benchmarks/history");
   state.benchmarkHistory = data.history || [];
   renderBenchmarkHistory();
+  renderBenchChart();  // C7: 通过率柱状图
 }
 function renderBenchmarkHistory() {
   const filter = $("#historyFilter").value.trim().toLowerCase();
@@ -1106,17 +1424,29 @@ async function toggleBenchmarkTrajectory(button) {
 }
 
 /* ------------------------------- SSE ---------------------------------- */
-function subscribeJob(job, handlers = {}) {
+function subscribeJob(job, handlers = {}, tab = null) {
   const source = new EventSource(`/api/jobs/${encodeURIComponent(job.id)}/events`);
   const onAny = (event) => {
     const data = JSON.parse(event.data);
-    handlers.any?.(data);
-    if (handlers[data.type]) handlers[data.type](data);
+    // C6: 事件归属重定向——后台 tab 的事件渲染进自己的 streamEl，
+    // 且渲染函数读写的 run 状态 / vitals / 滚动行为都归属该 tab。
+    const prevOverride = _streamOverride;
+    const prevTab = _eventTab;
+    _streamOverride = tab ? tab.streamEl : null;
+    _eventTab = tab;
+    try {
+      handlers.any?.(data, tab);
+      if (handlers[data.type]) handlers[data.type](data);
+    } finally {
+      _streamOverride = prevOverride;
+      _eventTab = prevTab;
+    }
     if (["completed", "failed", "cancelled"].includes(data.type)) source.close();
   };
   ["job_created", "status", "console", "model_output", "tool_call", "tool_result",
    "builtin_tool", "control_tool", "ask_user", "agent_error", "llm_error",
-   "session_loaded", "benchmark_started", "benchmark_output", "completed", "failed", "cancelled"]
+   "subagent_start", "subagent_finish", "session_loaded", "benchmark_started",
+   "benchmark_output", "completed", "failed", "cancelled"]
     .forEach((name) => source.addEventListener(name, onAny));
   source.onerror = () => { if (["completed", "failed", "cancelled"].includes(job.status)) source.close(); };
   return source;
@@ -1126,14 +1456,20 @@ function subscribeJob(job, handlers = {}) {
 async function runAgent(event) {
   event.preventDefault();
   const prompt = $("#promptInput").value.trim();
-  if (!prompt || state.run.active) return;
-  if (state.activeEventSource) { state.activeEventSource.close(); state.activeEventSource = null; }
+  if (!prompt) return;
+  // C6: 当前 tab 正在运行 → 自动开新 tab 并行执行
+  if (state.run.active) {
+    createTab(prompt.slice(0, 12));
+    addSystemLine("当前会话运行中，已在新标签页启动本任务。");
+  }
 
   ensureStreamReady();
+  const tab = _tabs.active;
+  tab.title = prompt.slice(0, 12) || tab.title;
   const turn = document.createElement("article");
   turn.className = "turn-user";
   turn.innerHTML = escapeHtml(prompt).replace(/\n/g, "<br>");
-  $("#chatStream").appendChild(turn);
+  chatStreamEl().appendChild(turn);
 
   $("#promptInput").value = "";
   autoGrow();
@@ -1144,6 +1480,9 @@ async function runAgent(event) {
   state.run.pendingTools = new Map();
   state.run.pendingOrder = [];
   state.run.logStep = null;
+  tokenSpark.samples = [];
+  tokenSpark.last = 0;
+  drawTokenSpark();
   $("#vitalStep").textContent = "0";
   $("#vitalTokens").textContent = "—";
   setVitalsStatus("queued");
@@ -1152,16 +1491,23 @@ async function runAgent(event) {
   const cancelButton = $("#cancelAgentButton");
   // Disabled until the job id is known — a cancel click before that would no-op.
   if (cancelButton) { cancelButton.hidden = false; cancelButton.disabled = true; }
+  renderTabs();
 
   const finish = (status) => {
-    stopRunTimer();
-    state.run.active = false;
-    state.run.jobId = null;
-    setVitalsStatus(status);
-    setBusy($("#runAgentButton"), false);
-    if (cancelButton) { cancelButton.hidden = true; cancelButton.disabled = false; }
-    state.activeEventSource?.close();
-    state.activeEventSource = null;
+    // C6: 计时器与 vitals 均归属各自 tab——后台结束只停自己的 timer。
+    stopRunTimer(tab);
+    tab.run.active = false;
+    tab.run.jobId = null;
+    tab.eventSource?.close();
+    tab.eventSource = null;
+    if (isActiveTab(tab)) {
+      setVitalsStatus(status);
+      setBusy($("#runAgentButton"), false);
+      if (cancelButton) { cancelButton.hidden = true; cancelButton.disabled = false; }
+    } else {
+      tab.vitals.status = { completed: "已完成", failed: "失败", cancelled: "已取消" }[status] || tab.vitals.status;
+    }
+    renderTabs();
   };
 
   try {
@@ -1174,16 +1520,25 @@ async function runAgent(event) {
         model: state.modelSnapshot?.active_model || undefined,
       }),
     });
-    state.run.jobId = job.id;
-    if (cancelButton) cancelButton.disabled = false;
-    state.activeEventSource = subscribeJob(job, {
-      any: handleEvent,
+    tab.run.jobId = job.id;
+    if (cancelButton && isActiveTab(tab)) cancelButton.disabled = false;
+    // C6: subscribeJob 的 onAny 已把事件归属（DOM/状态/vitals 守卫）重定向到
+    // 本 tab，completed/failed/cancelled 内无需再手动切换 override。
+    tab.eventSource = subscribeJob(job, {
+      any: (data, ownerTab) => handleEvent(data, ownerTab),
       completed(data) {
         const r = data.payload || {};
         addAnswer(r.answer || "任务已完成，但没有返回文本。", r);
-        $("#vitalElapsed").textContent = formatDuration(r.duration_seconds);
-        if (r.tokens != null) $("#vitalTokens").textContent = formatTokens(r.tokens);
-        if (r.steps != null) $("#vitalStep").textContent = String(r.steps);
+        renderRunSummary(r);  // C5: 会话结束汇总卡片
+        if (isActiveTab(tab)) {
+          $("#vitalElapsed").textContent = formatDuration(r.duration_seconds);
+          if (r.tokens != null) $("#vitalTokens").textContent = formatTokens(r.tokens);
+          if (r.steps != null) $("#vitalStep").textContent = String(r.steps);
+        } else {
+          tab.vitals.elapsedText = formatDuration(r.duration_seconds);
+          if (r.tokens != null) tab.vitals.tokensText = formatTokens(r.tokens);
+          if (r.steps != null) tab.vitals.steps = String(r.steps);
+        }
         finish("completed");
         refreshSessions();
       },
@@ -1195,7 +1550,7 @@ async function runAgent(event) {
         addSystemLine(data.payload?.reason || "已取消当前 Agent 运行");
         finish("cancelled");
       },
-    });
+    }, tab);
   } catch (error) {
     addAnswer("提交失败：" + error.message, {}, true);
     finish("failed");
@@ -1287,6 +1642,266 @@ function autoGrow() {
   ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
 
+/* --------------------- C1: 工作区文件浏览器 ---------------------------- */
+const workspace = {
+  root: "",
+  openDirs: new Set(),
+  activeFile: null,
+  loadedDirs: new Map(),  // path -> entries
+};
+
+function wpVisible() { return !$("#workspacePanel").hidden; }
+function setWorkspacePanel(open) {
+  $("#workspacePanel").hidden = !open;
+  if (open) {
+    if (!workspace.root && state.projectRoot) workspace.root = state.projectRoot;
+    $("#wpRootPath").textContent = workspace.root ? workspace.root.split(/[\\/]/).pop() || workspace.root : "";
+    if (!workspace.loadedDirs.size) loadWorkspaceDir(".");
+  }
+}
+async function loadWorkspaceDir(path) {
+  const host = document.querySelector(`.wp-tree [data-dir="${CSS.escape(path)}"] .wp-children`) || $("#wpTree");
+  if (host) host.innerHTML = `<div class="wp-loading">加载中…</div>`;
+  try {
+    const result = await api(`/api/workspace/tree?path=${encodeURIComponent(path)}&limit=500&root=${encodeURIComponent(workspace.root || "")}`);
+    if (result.status === "error") throw new Error(result.error || "加载失败");
+    workspace.loadedDirs.set(path, result.data?.entries || []);
+    renderWorkspaceTree();
+  } catch (err) {
+    if (host) host.innerHTML = `<div class="wp-error">${escapeHtml(err.message)}</div>`;
+  }
+}
+function renderWorkspaceTree() {
+  const rootEntries = workspace.loadedDirs.get(".") || [];
+  const tree = $("#wpTree");
+  const buildDir = (entry, depth) => {
+    const path = entry.path;
+    const isOpen = workspace.openDirs.has(path);
+    const entries = workspace.loadedDirs.get(path) || [];
+    return `<div class="wp-dir" data-dir="${escapeHtml(path)}" style="--depth:${depth}">
+      <button type="button" class="wp-row dir ${isOpen ? "open" : ""}" data-toggle-dir="${escapeHtml(path)}">
+        <svg class="wp-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5z"/></svg>
+        <span class="wp-name">${escapeHtml(entry.name)}</span>
+      </button>
+      <div class="wp-children">${isOpen ? entries.map((e) => e.type === "directory" ? buildDir(e, depth + 1) : buildFile(e, depth + 1)).join("") : ""}</div>
+    </div>`;
+  };
+  const buildFile = (entry, depth) => {
+    const active = workspace.activeFile === entry.path ? " active" : "";
+    return `<button type="button" class="wp-row file${active}" data-open-file="${escapeHtml(entry.path)}" style="--depth:${depth}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 12h6m-6 4h6M9 8h6M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/></svg>
+      <span class="wp-name">${escapeHtml(entry.name)}</span>
+      <span class="wp-size">${escapeHtml(entry.size)}</span>
+    </button>`;
+  };
+  tree.innerHTML = rootEntries.map((e) => (e.type === "directory" ? buildDir(e, 0) : buildFile(e, 0))).join("")
+    || `<div class="wp-loading">空目录</div>`;
+}
+async function openWorkspaceFile(path, opts = {}) {
+  setWorkspacePanel(true);
+  const viewer = $("#wpViewer");
+  viewer.hidden = false;
+  viewer.innerHTML = `<div class="wp-loading">读取 ${escapeHtml(path)} …</div>`;
+  workspace.activeFile = path;
+  renderWorkspaceTree();
+  try {
+    const result = await api(`/api/workspace/file?path=${encodeURIComponent(path)}&limit=2000&root=${encodeURIComponent(workspace.root || "")}`);
+    if (result.status === "error") throw new Error(result.error || "读取失败");
+    const data = result.data || {};
+    const content = data.content ?? "";
+    const total = data.total_lines ?? content.split("\n").length;
+    const lines = content.split("\n");
+    const numbered = lines.map((l, i) => `<div class="wp-line" data-line="${i + 1}"><span class="wp-ln">${i + 1}</span><span class="wp-code">${escapeHtml(l) || " "}</span></div>`).join("");
+    viewer.innerHTML = `
+      <div class="wp-viewer-head">
+        <strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong>
+        <span class="wp-viewer-meta">${total} 行${data.truncated ? " · 已截断" : ""}${data.encoding ? " · " + escapeHtml(data.encoding) : ""}</span>
+        <button type="button" class="mini-button" data-copy-file="${escapeHtml(path)}">复制</button>
+        <button type="button" class="mini-button" id="wpCloseViewer" title="关闭查看器">关闭</button>
+      </div>
+      <pre class="wp-content">${numbered}</pre>`;
+    if (opts.line && opts.line > 0) {
+      const target = viewer.querySelector(`.wp-line[data-line="${opts.line}"]`);
+      if (target) {
+        target.scrollIntoView({ block: "center" });
+        target.classList.add("flash");
+      }
+    }
+  } catch (err) {
+    viewer.innerHTML = `<div class="wp-error">${escapeHtml(err.message)}</div>`;
+  }
+}
+/* 工具卡片上的 data-open-file 委托入口：路径可能带 :line 后缀 */
+function handleOpenFileRequest(pathWithLine) {
+  const m = String(pathWithLine).match(/^(.+?)(?::(\d+))?$/);
+  if (!m) return;
+  openWorkspaceFile(m[1], { line: m[2] ? Number(m[2]) : undefined });
+}
+
+/* --------------------- C5: Token sparkline 与汇总 ---------------------- */
+/* sparkline 为激活视图的全局简化实现：仅记录前台事件（后台 tab 的事件不采样，
+   避免多会话曲线混叠）；切回历史 tab 时曲线不恢复（快照仅恢复数字 vitals）。 */
+const tokenSpark = {
+  samples: [],       // {t: elapsedMs, v: tokens}
+  last: 0,
+};
+function recordTokenSample(tokens) {
+  const v = Number(tokens);
+  if (!Number.isFinite(v) || v <= 0 || v === tokenSpark.last) return;
+  tokenSpark.last = v;
+  tokenSpark.samples.push({ t: performance.now(), v });
+  drawTokenSpark();
+}
+function drawTokenSpark() {
+  const svg = $("#tokenSpark");
+  if (!svg) return;
+  const pts = tokenSpark.samples;
+  if (pts.length < 2) { svg.innerHTML = ""; return; }
+  const maxV = Math.max(...pts.map((p) => p.v), 1);
+  const path = pts.map((p, i) => {
+    const x = (i / (pts.length - 1)) * 100;
+    const y = 22 - (p.v / maxV) * 20;
+    return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  svg.innerHTML = `<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+}
+function renderRunSummary(data) {
+  /* C5: 会话结束汇总卡片（tokens/步数/耗时/工具调用 Top）。
+     工具统计来自本会话 stream 内的 act 步骤卡片（事件归属 tab 的 DOM）。 */
+  const toolCounts = {};
+  chatStreamEl().querySelectorAll(".step.act").forEach((el) => {
+    const kicker = el.querySelector(".step-kicker");
+    if (kicker) {
+      const key = kicker.textContent.trim();
+      toolCounts[key] = (toolCounts[key] || 0) + 1;
+    }
+  });
+  const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const tokens = data.tokens != null ? formatTokens(data.tokens) : "—";
+  const steps = data.steps ?? evtRun().steps;
+  const dur = data.duration_seconds != null ? formatDuration(data.duration_seconds) : $("#vitalElapsed").textContent;
+  const art = document.createElement("article");
+  art.className = "run-summary";
+  art.innerHTML = `
+    <div class="rs-grid">
+      <div><span class="label">Tokens</span><strong>${tokens}</strong></div>
+      <div><span class="label">步数</span><strong>${steps}</strong></div>
+      <div><span class="label">用时</span><strong>${dur}</strong></div>
+      ${topTools.length ? `<div><span class="label">工具 Top</span><strong>${topTools.map(([n, c]) => `${escapeHtml(n)}×${c}`).join(" · ")}</strong></div>` : ""}
+    </div>`;
+  chatStreamEl().appendChild(art);
+  scrollStream();
+}
+
+/* --------------------- C7: Benchmark 通过率图表 ------------------------ */
+function renderBenchChart() {
+  const host = $("#benchChart");
+  const groups = new Map();  // dataset -> [{rate, time, model}]
+  for (const item of state.benchmarkHistory) {
+    const pr = passRateOf(item);
+    if (!pr) continue;
+    const name = datasetLabel(item);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push({ rate: pr.rate, time: item.modified_at || "", model: modelLabel(item) });
+  }
+  if (groups.size < 1) { host.hidden = true; return; }
+  host.hidden = false;
+  const maxPerGroup = Math.max(...[...groups.values()].map((v) => v.length));
+  const cellW = 26, barW = 16, gapX = 10, rowH = 44, headH = 22, axisW = 108;
+  const width = axisW + groups.size * (cellW * Math.max(maxPerGroup, 1) + gapX);
+  const height = headH + groups.size * rowH + 8;
+  let svg = "";
+  let ci = 0;
+  for (const [name, runs] of groups) {
+    const y = headH + ci * rowH;
+    svg += `<text x="${axisW - 10}" y="${y + 14}" text-anchor="end" class="chart-label">${escapeHtml(name.length > 16 ? name.slice(0, 15) + "…" : name)}</text>`;
+    runs.forEach((run, ri) => {
+      const pct = Math.round(Math.max(0, Math.min(1, run.rate)) * 100);
+      const barH = Math.max(3, (run.rate * 28));
+      const x = axisW + ri * cellW;
+      const color = run.rate >= 0.8 ? "var(--pass)" : run.rate >= 0.5 ? "var(--aqua)" : run.rate >= 0.25 ? "var(--warn)" : "var(--fail)";
+      svg += `<rect x="${x}" y="${y + 28 - barH}" width="${barW}" height="${barH}" rx="3" fill="${color}" opacity="0.85"><title>${escapeHtml(name)} · ${pct}% · ${escapeHtml(run.model || "")} · ${escapeHtml(run.time)}</title></rect>`;
+      svg += `<text x="${x + barW / 2}" y="${y + 40}" text-anchor="middle" class="chart-value">${pct}</text>`;
+    });
+    ci += 1;
+  }
+  host.innerHTML = `<div class="chart-wrap"><svg viewBox="0 0 ${width} ${height}" width="${Math.min(width, 900)}" height="${height}" role="img" aria-label="各数据集通过率柱状图">${svg}</svg></div>`;
+}
+
+/* --------------------- C4: 主题切换 ------------------------------------ */
+const THEMES = ["dark", "light"];
+function applyTheme(theme) {
+  document.body.dataset.theme = theme;
+  try { localStorage.setItem("whalecode-theme", theme); } catch { /* 隐私模式 */ }
+}
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem("whalecode-theme"); } catch { /* ignore */ }
+  if (!THEMES.includes(saved)) {
+    saved = window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+  applyTheme(saved);
+}
+function toggleTheme() {
+  applyTheme(document.body.dataset.theme === "dark" ? "light" : "dark");
+}
+
+/* --------------------- C9: 命令面板 ------------------------------------ */
+const cmdk = {
+  commands: [],
+  visible: false,
+};
+function buildCommandRegistry() {
+  cmdk.commands = [
+    { id: "new-session", label: "新会话 / New session", hint: "Cmd+N", run: () => $("#newSessionButton").click() },
+    { id: "view-agent", label: "切换到智能体视图 / Switch to Agent view", run: () => setView("agent") },
+    { id: "view-bench", label: "切换到评测视图 / Switch to Benchmarks view", run: () => setView("benchmarks") },
+    { id: "workspace", label: "打开工作区面板 / Toggle workspace panel", run: () => setWorkspacePanel(wpVisible() ? false : true) },
+    { id: "theme", label: "切换浅色/深色主题 / Toggle theme", run: toggleTheme },
+    { id: "trace", label: "打开最近 Trace 报告 / Open latest trace report", run: openLatestTrace },
+    { id: "refresh-sessions", label: "刷新会话列表 / Refresh sessions", run: () => refreshSessions() },
+    { id: "run-bench", label: "运行评测（跳转）/ Run benchmark", run: () => { setView("benchmarks"); $("#benchModel")?.focus(); } },
+  ];
+}
+function renderCmdkList(filter) {
+  const q = (filter || "").trim().toLowerCase();
+  const items = cmdk.commands.filter((c) => !q || c.label.toLowerCase().includes(q));
+  $("#cmdkList").innerHTML = items.length ? items.map((c) => `
+    <button type="button" class="cmdk-item" id="cmdk-option-${escapeHtml(c.id)}" role="option"
+            aria-selected="false" data-cmdk-id="${escapeHtml(c.id)}">
+      <span>${escapeHtml(c.label)}</span>${c.hint ? `<kbd>${escapeHtml(c.hint)}</kbd>` : ""}
+    </button>`).join("") : `<div class="cmdk-empty">无匹配命令</div>`;
+  $("#cmdkInput")?.removeAttribute("aria-activedescendant");
+  return items;
+}
+function openCmdk() {
+  cmdk.visible = true;
+  $("#cmdkOverlay").hidden = false;
+  $("#cmdkInput").value = "";
+  renderCmdkList("");
+  $("#cmdkInput").focus();
+}
+function closeCmdk() {
+  cmdk.visible = false;
+  $("#cmdkOverlay").hidden = true;
+}
+function runCmdkCommand(id) {
+  const command = cmdk.commands.find((c) => c.id === id);
+  closeCmdk();
+  if (command) command.run();
+}
+async function openLatestTrace() {
+  try {
+    const data = await api("/api/traces");
+    const traces = data.traces || [];
+    if (!traces.length) { addSystemLine("暂无 Trace 报告（运行一次任务后生成）。"); return; }
+    window.open(traces[0].url, "_blank", "noopener");
+  } catch (err) {
+    addSystemLine(`Trace 列表加载失败：${err.message}`);
+  }
+}
+
 /* ------------------------------ events -------------------------------- */
 function bindEvents() {
   $$(".nav-item").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
@@ -1294,12 +1909,81 @@ function bindEvents() {
   $("#cancelAgentButton")?.addEventListener("click", cancelAgentRun);
   $("#promptInput").addEventListener("input", autoGrow);
   $("#promptInput").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#agentForm").requestSubmit(); }
+    if (e.key !== "Enter") return;
+    // Enter 或 Cmd/Ctrl+Enter 发送；纯 Shift+Enter 换行
+    const send = !e.shiftKey || e.metaKey || e.ctrlKey;
+    if (send) { e.preventDefault(); $("#agentForm").requestSubmit(); }
   });
   $("#benchForm").addEventListener("submit", runBenchmark);
   $("#cancelBenchButton")?.addEventListener("click", cancelBenchmarkRun);
   $("#refreshSessions").addEventListener("click", refreshSessions);
-  $("#newSessionButton").addEventListener("click", async () => { resetAgentConversation(); await refreshSessions(); });
+  $("#newSessionButton").addEventListener("click", async () => {
+    // C6: 当前 tab 有内容时开新 tab，否则原地重置
+    const stream = chatStreamEl();
+    if (_tabs.list.length > 1 || (stream && stream.querySelector(".step, .turn-user, .answer"))) {
+      createTab();
+    } else {
+      resetAgentConversation();
+    }
+    await refreshSessions();
+  });
+  // C4/C1/C8: 新控件
+  $("#themeToggle")?.addEventListener("click", toggleTheme);
+  $("#traceReportButton")?.addEventListener("click", openLatestTrace);
+  $("#workspaceToggle")?.addEventListener("click", () => setWorkspacePanel(wpVisible() ? false : true));
+  $("#wpClose")?.addEventListener("click", () => setWorkspacePanel(false));
+  $("#wpRefresh")?.addEventListener("click", () => {
+    workspace.loadedDirs.clear();
+    loadWorkspaceDir(".");
+  });
+  // C9: 命令面板（键盘导航高亮保持在 input 上，焦点不移入列表项）
+  $("#cmdkInput")?.addEventListener("input", (e) => { renderCmdkList(e.target.value); });
+  $("#cmdkInput")?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); closeCmdk(); return; }
+    const items = Array.from($("#cmdkList .cmdk-item"));
+    if (!items.length && e.key !== "Enter") return;
+    const currentIdx = Math.max(0, items.findIndex((el) => el.classList.contains("selected")));
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      items.forEach((el) => {
+        el.classList.remove("selected");
+        el.setAttribute("aria-selected", "false");
+      });
+      const nextIdx = e.key === "ArrowDown"
+        ? (currentIdx + 1) % items.length
+        : (currentIdx - 1 + items.length) % items.length;
+      items[nextIdx].classList.add("selected");
+      items[nextIdx].setAttribute("aria-selected", "true");
+      $("#cmdkInput").setAttribute("aria-activedescendant", items[nextIdx].id);
+      items[nextIdx].scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // Enter 执行高亮项；无高亮则执行第一项
+      const target = items[currentIdx] || items[0];
+      if (target) runCmdkCommand(target.dataset.cmdkId);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    // C9: 全局快捷键
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      cmdk.visible ? closeCmdk() : openCmdk();
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
+      e.preventDefault();
+      createTab();
+      return;
+    }
+    if (e.key === "Escape") {
+      if (cmdk.visible) { closeCmdk(); return; }
+      const cancel = $("#cancelAgentButton");
+      if (cancel && !cancel.hidden && !cancel.disabled) { cancelAgentRun(); return; }
+      if (wpVisible()) { setWorkspacePanel(false); }
+    }
+  });
 
   document.addEventListener("click", async (e) => {
     const copy = e.target.closest("[data-copy-blob]");
@@ -1310,6 +1994,50 @@ function bindEvents() {
       setTimeout(() => { if (copy.isConnected) copy.textContent = "复制"; }, 1200);
       return;
     }
+    // C1: 文件链接（工具卡片）→ 工作区面板打开
+    const fileLink = e.target.closest("[data-open-file]");
+    if (fileLink && !fileLink.dataset.toggleDir) {
+      e.preventDefault();
+      handleOpenFileRequest(fileLink.dataset.openFile);
+      return;
+    }
+    // C1: 工作区面板文件树交互
+    const dirToggle = e.target.closest("[data-toggle-dir]");
+    if (dirToggle) {
+      const dirPath = dirToggle.dataset.toggleDir;
+      if (workspace.openDirs.has(dirPath)) workspace.openDirs.delete(dirPath);
+      else {
+        workspace.openDirs.add(dirPath);
+        if (!workspace.loadedDirs.has(dirPath)) loadWorkspaceDir(dirPath);
+      }
+      renderWorkspaceTree();
+      return;
+    }
+    const closeViewer = e.target.closest("#wpCloseViewer");
+    if (closeViewer) {
+      $("#wpViewer").hidden = true;
+      $("#wpViewer").innerHTML = "";
+      return;
+    }
+    const copyFile = e.target.closest("[data-copy-file]");
+    if (copyFile) {
+      // 查看器当前内容已在 DOM 中，从行元素拼接复制
+      const lines = Array.from($("#wpViewer").querySelectorAll(".wp-code")).map((el) => el.textContent);
+      try { await navigator.clipboard.writeText(lines.join("\n")); copyFile.textContent = "已复制"; }
+      catch { copyFile.textContent = "复制失败"; }
+      setTimeout(() => { if (copyFile.isConnected) copyFile.textContent = "复制"; }, 1200);
+      return;
+    }
+    // C6: tab 切换/关闭
+    const closeTabBtn = e.target.closest("[data-close-tab]");
+    if (closeTabBtn) { closeTab(closeTabBtn.dataset.closeTab); return; }
+    const switchTabBtn = e.target.closest("[data-switch-tab]");
+    if (switchTabBtn) { switchTab(switchTabBtn.dataset.switchTab); return; }
+    // C9: 命令面板项
+    const cmdkItem = e.target.closest("[data-cmdk-id]");
+    if (cmdkItem) { runCmdkCommand(cmdkItem.dataset.cmdkId); return; }
+    // C9: 点击遮罩关闭命令面板
+    if (cmdk.visible && e.target === $("#cmdkOverlay")) { closeCmdk(); return; }
     const expand = e.target.closest("[data-expand-blob]");
     if (expand) {
       const box = expand.closest(".long-output");
@@ -1320,7 +2048,8 @@ function bindEvents() {
     }
   });
 
-  $("#chatStream").addEventListener("click", (e) => {
+  // 事件委托绑定在 traceStream 父容器上：tab 的 streamEl 会动态挂载/卸载
+  $("#traceStream").addEventListener("click", (e) => {
     const chip = e.target.closest("[data-example]");
     if (chip) { $("#promptInput").value = chip.dataset.example; autoGrow(); $("#promptInput").focus(); }
   });
@@ -1374,8 +2103,10 @@ function bindEvents() {
 }
 
 async function init() {
+  initTheme();          // C4: 主题（系统偏好 + localStorage）
+  buildCommandRegistry();  // C9: 命令面板
+  createTab();          // C6: 首个会话 tab（含 streamEl 与空状态）
   bindEvents();
-  renderEmptyState();
   await Promise.allSettled([refreshStatus(), refreshSessions(), refreshDatasets(), refreshBenchmarkHistory()]);
   // GPU 读数与服务状态随时间变化，低频轮询保持侧栏鲜活（15s，远轻于 SSE）。
   setInterval(() => { refreshStatus().catch(() => {}); }, 15000);

@@ -2,71 +2,53 @@
 
 ## 📖 概述
 
-HelloAgents 框架提供**四种日志范式**，满足不同场景的日志需求：
+HelloAgents 框架提供**三种日志范式**，满足不同场景的日志需求 / The framework ships three logging paradigms:
 
-1. **TraceLogger** - 执行轨迹审计（JSONL + HTML）
-2. **AgentLogger** - Agent 运行日志（结构化）
-3. **DevLogTool** - 开发日志工具（Agent 可用）
-4. **标准 logging** - Python 标准日志
+1. **TraceLogger** - 执行轨迹审计（JSONL + HTML 双格式）
+2. **agent_print / agent_eprint** - 框架统一输出门面
+3. **标准 logging** - Python 标准日志（集成方自配）
+
+> ⚠️ **API 变更（2026-08-20）**：`set_agent_print` / `set_agent_eprint` sink 注入函数已随死代码清理移除（生产与测试均零调用，注入机制从未接线——见 `IMPROVEMENT.md` Q1-A）。`agent_print` / `agent_eprint` 仍作为框架统一输出门面保留，但其输出固定走 `sys.stdout` / `sys.stderr`；本文后续章节中涉及 `set_agent_print` 的注入示例已失效，集成方如需重定向输出请拦截 `sys.stdout` 或配置标准 logging。
 
 ---
 
 ## 🚀 快速开始
 
-### 1. TraceLogger（执行轨迹）
+### 1. TraceLogger（执行轨迹 / Execution Trace）
 
-```python
-from hello_agents import ReActAgent, HelloAgentsLLM
-from hello_agents.core.observability import TraceLogger
-
-# 启用 TraceLogger
-logger = TraceLogger(output_dir="logs")
-agent = ReActAgent("assistant", HelloAgentsLLM(), trace_logger=logger)
-
-# 执行任务
-agent.run("分析项目")
-
-# 查看日志
-# - logs/trace.jsonl（机器可读）
-# - logs/trace.html（人类可读）
-```
-
-### 2. AgentLogger（Agent 日志）
-
-```python
-from hello_agents import ReActAgent, HelloAgentsLLM
-from hello_agents.core.logging import AgentLogger
-
-# 启用 AgentLogger
-logger = AgentLogger(name="assistant", level="INFO")
-agent = ReActAgent("assistant", HelloAgentsLLM(), logger=logger)
-
-# 执行任务
-agent.run("分析项目")
-
-# 日志输出：
-# [2026-02-21 10:30:45] [INFO] [assistant] Agent 开始执行
-# [2026-02-21 10:30:46] [INFO] [assistant] 调用工具: Read
-# [2026-02-21 10:30:47] [INFO] [assistant] Agent 完成
-```
-
-### 3. DevLogTool（开发日志）
+TraceLogger 通过 `Config` 启用（Agent 构造函数**不接收** `trace_logger` 参数）：
 
 ```python
 from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
-# 启用 DevLogTool
-config = Config(devlog_enabled=True)
+# 启用 TraceLogger
+config = Config(trace_enabled=True, trace_dir="logs")
 agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
 
-# Agent 可以使用 DevLog 工具
-agent.run("记录开发决策：使用 Redis 作为缓存")
+# 执行任务
+agent.run("分析项目")
 
-# 查看日志
-# - memory/devlogs/devlog-xxx.json
+# 查看日志（文件名含会话 ID）
+# - logs/trace-<session_id>.jsonl（机器可读）
+# - logs/trace-<session_id>.html（人类可读）
 ```
 
-### 4. 标准 logging
+### 2. agent_print / agent_eprint（框架输出门面 / Injectable Sink）
+
+框架内部所有输出均经过 `agent_print` / `agent_eprint`（`core/logging.py`），默认转发到 stdout/stderr；集成方可注入自定义 sink（CLI 入口用它接入 Rich 渲染层，Web 端用它转发到 SSE）：
+
+```python
+from hello_agents.core.logging import (
+    agent_print, agent_eprint,
+    set_agent_print, set_agent_eprint,
+)
+
+# 重定向框架输出（无需 monkey-patch sys.stdout）
+set_agent_print(lambda *a, **kw: my_logger.info(" ".join(map(str, a))))
+set_agent_eprint(lambda *a, **kw: my_logger.error(" ".join(map(str, a))))
+```
+
+### 3. 标准 logging（通用日志 / Standard Logging）
 
 ```python
 import logging
@@ -80,21 +62,17 @@ logging.basicConfig(
 
 agent = ReActAgent("assistant", HelloAgentsLLM())
 agent.run("分析项目")
-
-# 日志输出：
-# 2026-02-21 10:30:45,123 [INFO] Agent 开始执行
 ```
 
 ---
 
-## 💡 四种范式对比
+## 💡 三种范式对比
 
-| 范式         | 用途           | 格式         | 可读性 | Agent 可用 | 持久化 |
-| ------------ | -------------- | ------------ | ------ | ---------- | ------ |
-| TraceLogger  | 执行轨迹审计   | JSONL + HTML | 高     | ❌          | ✅      |
-| AgentLogger  | Agent 运行日志 | 结构化文本   | 中     | ❌          | ✅      |
-| DevLogTool   | 开发决策记录   | JSON         | 高     | ✅          | ✅      |
-| 标准 logging | 通用日志       | 文本         | 低     | ❌          | ✅      |
+| 范式 | 用途 | 格式 | 可读性 | 持久化 |
+| --- | --- | --- | --- | --- |
+| TraceLogger | 执行轨迹审计 | JSONL + HTML | 高 | ✅ |
+| agent_print / agent_eprint | 框架运行输出（可重定向） | 文本 | 中 | 取决于 sink |
+| 标准 logging | 集成方应用日志 | 文本 | 低 | ✅ |
 
 ---
 
@@ -103,125 +81,75 @@ agent.run("分析项目")
 ### 1. TraceLogger 详细说明
 
 **特点：**
-- ✅ 记录所有 LLM 请求和工具调用
-- ✅ 双格式输出（JSONL + HTML）
-- ✅ 支持审计和回放
+- ✅ 记录会话、模型输出、工具调用等关键事件
+- ✅ 双格式输出（JSONL + HTML，文件名含 session_id）
+- ✅ 敏感信息脱敏（`trace_sanitize`）
+- ✅ 支持审计与回放
 
-**配置：**
+**配置（全部为 `Config` 字段）：**
 ```python
-from hello_agents.core.observability import TraceLogger
-
-logger = TraceLogger(
-    output_dir="logs",           # 输出目录
-    jsonl_file="trace.jsonl",    # JSONL 文件名
-    html_file="trace.html",      # HTML 文件名
-    enable_jsonl=True,           # 启用 JSONL
-    enable_html=True             # 启用 HTML
+config = Config(
+    trace_enabled=True,                        # 总开关
+    trace_dir="logs",                          # 输出目录
+    trace_sanitize=True,                       # 敏感信息脱敏
+    trace_html_include_raw_response=False,     # HTML 是否含原始响应
 )
 ```
 
-**日志内容：**
+**JSONL 事件结构（字段为 `ts` / `event` / `payload`）：**
 ```json
-{
-  "timestamp": "2026-02-21T10:30:45.123Z",
-  "event_type": "llm_request",
-  "data": {
-    "messages": [...],
-    "model": "gpt-4",
-    "temperature": 0.7
-  }
-}
-{
-  "timestamp": "2026-02-21T10:30:46.456Z",
-  "event_type": "tool_call",
-  "data": {
-    "tool_name": "Read",
-    "parameters": {"path": "config.py"},
-    "result": "..."
-  }
-}
+{"ts": "2026-02-21T10:30:45.123Z", "event": "session_start", "payload": {"session_id": "s-20260221-103045-a1b2"}}
+{"ts": "2026-02-21T10:30:46.456Z", "event": "tool_call", "payload": {"tool_name": "Read", "parameters": {"path": "config.py"}}}
+{"ts": "2026-02-21T10:30:47.789Z", "event": "model_output", "payload": {"content": "...", "usage": {...}}}
 ```
+
+**已记录的事件类型：** `session_start`、`session_end`、`tool_call`、`tool_result`、`message_written`、`model_output`、`hook_timeout`、`hook_error`
 
 **查看 HTML 报告：**
 ```bash
-# 在浏览器中打开
-open logs/trace.html
+open logs/trace-<session_id>.html
 ```
 
-### 2. AgentLogger 详细说明
-
-**特点：**
-- ✅ 结构化日志（时间戳、级别、消息）
-- ✅ 支持多个 Agent 独立日志
-- ✅ 可配置日志级别
-
-**配置：**
+**直接使用 TraceLogger（不经 Agent）：**
 ```python
-from hello_agents.core.logging import AgentLogger
+from hello_agents.observability import TraceLogger
 
-logger = AgentLogger(
-    name="assistant",           # Logger 名称
-    level="INFO",               # 日志级别（DEBUG/INFO/WARNING/ERROR）
-    output_file="agent.log",    # 输出文件
-    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+logger = TraceLogger(
+    output_dir="logs",                 # 输出目录
+    sanitize=True,                     # 敏感信息脱敏
+    html_include_raw_response=False,   # HTML 含原始响应
 )
+logger.log_event("tool_call", {"tool_name": "Read"}, step=1)
+logger.finalize()  # 生成 HTML 汇总
 ```
 
-**日志级别：**
-```python
-logger.debug("调试信息")
-logger.info("普通信息")
-logger.warning("警告信息")
-logger.error("错误信息")
-```
-
-**多 Agent 日志：**
-```python
-# Agent 1
-logger1 = AgentLogger(name="explorer", output_file="explorer.log")
-agent1 = ReActAgent("explorer", llm, logger=logger1)
-
-# Agent 2
-logger2 = AgentLogger(name="analyzer", output_file="analyzer.log")
-agent2 = ReActAgent("analyzer", llm, logger=logger2)
-```
-
-### 3. DevLogTool 详细说明
+### 2. agent_print 详细说明
 
 **特点：**
-- ✅ Agent 可以主动记录日志
-- ✅ 7 种日志类别（decision、progress、issue 等）
-- ✅ 结构化存储（JSON）
+- ✅ 框架内部输出的唯一通道（建议-7 改造，替代直接 print）
+- ✅ sink 可注入：`set_agent_print` / `set_agent_eprint`
+- ✅ 默认行为等价于 `print`（向后兼容）
 
-**使用：**
+**典型用法——把框架输出接入文件：**
 ```python
-# 启用 DevLogTool
-config = Config(devlog_enabled=True)
-agent = ReActAgent("assistant", llm, config=config)
+from hello_agents.core.logging import set_agent_print, set_agent_eprint
 
-# Agent 使用 DevLog 工具
-agent.run("""
-记录开发决策：
-- category: decision
-- content: 使用 Redis 作为缓存
-- metadata: {"reason": "高性能"}
-""")
+log_file = open("agent-run.log", "a", encoding="utf-8")
+set_agent_print(lambda *a, **kw: print(*a, file=log_file, flush=True))
+set_agent_eprint(lambda *a, **kw: print(*a, file=log_file, flush=True))
 ```
 
-**详细文档：** 参见 [DevLog 指南](./devlog-guide.md)
-
-### 4. 标准 logging 详细说明
+### 3. 标准 logging 详细说明
 
 **特点：**
 - ✅ Python 标准库，无需额外依赖
-- ✅ 灵活配置（Handler、Formatter）
+- ✅ 灵活配置（Handler、Formatter、轮转）
 - ✅ 与其他库兼容
 
 **配置：**
 ```python
 import logging
 
-# 基本配置
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -231,7 +159,6 @@ logging.basicConfig(
     ]
 )
 
-# 使用
 logger = logging.getLogger(__name__)
 logger.info("Agent 开始执行")
 ```
@@ -242,26 +169,17 @@ logger.info("Agent 开始执行")
 
 ### 案例 1：生产环境监控
 
-**场景：** 监控 Agent 运行状态
-
 ```python
-# 使用 AgentLogger + 标准 logging
 import logging
-from hello_agents.core.logging import AgentLogger
+from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
-# 配置标准 logging（应用级别）
+# 应用级日志（标准 logging）
 logging.basicConfig(level=logging.INFO)
 
-# 配置 AgentLogger（Agent 级别）
-agent_logger = AgentLogger(
-    name="production_agent",
-    level="INFO",
-    output_file="logs/agent.log"
-)
+# Agent 级轨迹（TraceLogger）
+config = Config(trace_enabled=True, trace_dir="logs/prod")
+agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
 
-agent = ReActAgent("assistant", llm, logger=agent_logger)
-
-# 执行任务
 try:
     result = agent.run("处理用户请求")
 except Exception as e:
@@ -270,87 +188,59 @@ except Exception as e:
 
 ### 案例 2：开发调试
 
-**场景：** 调试 Agent 执行过程
-
 ```python
-# 使用 TraceLogger + AgentLogger
-from hello_agents.core.observability import TraceLogger
-from hello_agents.core.logging import AgentLogger
+from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
-# TraceLogger（详细轨迹）
-trace_logger = TraceLogger(output_dir="debug_logs")
-
-# AgentLogger（DEBUG 级别）
-agent_logger = AgentLogger(name="debug_agent", level="DEBUG")
-
-agent = ReActAgent(
-    "assistant",
-    llm,
-    trace_logger=trace_logger,
-    logger=agent_logger
+# 详细轨迹 + HTML 可视化 + 保留原始响应
+config = Config(
+    trace_enabled=True,
+    trace_dir="debug_logs",
+    trace_html_include_raw_response=True,  # 调试时查看原始 LLM 响应
 )
-
-# 执行任务
+agent = ReActAgent("assistant", llm, config=config)
 agent.run("分析项目")
 
-# 查看日志
-# - debug_logs/trace.html（可视化轨迹）
-# - agent.log（详细日志）
+# 查看 debug_logs/trace-<session_id>.html 可视化轨迹
 ```
 
-### 案例 3：项目复盘
-
-**场景：** 记录开发决策和问题
+### 案例 3：捕获框架输出到自定义管道
 
 ```python
-# 使用 DevLogTool
-config = Config(devlog_enabled=True)
-agent = ReActAgent("assistant", llm, config=config)
+from hello_agents import ReActAgent, HelloAgentsLLM
+from hello_agents.core.logging import set_agent_print
 
-# Agent 记录开发日志
-agent.run("""
-1. 记录决策：使用 PostgreSQL 作为数据库
-2. 记录问题：内存泄漏导致服务崩溃
-3. 记录解决方案：修复内存泄漏
-""")
+# 把框架输出送入消息队列/面板等自定义通道
+events = []
+set_agent_print(lambda *a, **kw: events.append(" ".join(map(str, a))))
 
-# 查询日志
-agent.run("查询所有问题日志")
+agent = ReActAgent("assistant", HelloAgentsLLM())
+agent.run("分析项目")
 ```
 
 ---
 
 ## 🎯 最佳实践
 
-### 1. 根据场景选择日志范式
+### 1. 根据场景选择范式
 
 ```python
-# ✅ 生产环境：AgentLogger + 标准 logging
-agent_logger = AgentLogger(name="prod", level="INFO")
+# ✅ 生产审计：TraceLogger（脱敏开启）
+config = Config(trace_enabled=True, trace_sanitize=True)
+
+# ✅ 集成宿主（CLI/Web）：注入 agent_print sink
+set_agent_print(my_render_fn)
+
+# ✅ 应用日志：标准 logging
 logging.basicConfig(level=logging.WARNING)
-
-# ✅ 开发调试：TraceLogger + AgentLogger（DEBUG）
-trace_logger = TraceLogger(output_dir="debug")
-agent_logger = AgentLogger(name="dev", level="DEBUG")
-
-# ✅ 项目管理：DevLogTool
-config = Config(devlog_enabled=True)
 ```
 
-### 2. 日志分级
+### 2. 日志分级（标准 logging）
 
 ```python
-# DEBUG：详细调试信息
-logger.debug(f"工具参数: {parameters}")
-
-# INFO：普通信息
-logger.info("Agent 开始执行")
-
-# WARNING：警告信息
-logger.warning("工具调用超时，重试中...")
-
-# ERROR：错误信息
-logger.error(f"Agent 执行失败: {error}")
+logger.debug(f"工具参数: {parameters}")      # 详细调试信息
+logger.info("Agent 开始执行")                 # 普通信息
+logger.warning("工具调用超时，重试中...")      # 警告
+logger.error(f"Agent 执行失败: {error}")      # 错误
 ```
 
 ### 3. 日志轮转
@@ -372,7 +262,6 @@ logging.basicConfig(handlers=[handler])
 ## 🔗 相关文档
 
 - [可观测性](./observability-guide.md) - TraceLogger 详细说明
-- [DevLog 指南](./devlog-guide.md) - DevLogTool 详细说明
 
 ---
 
@@ -380,37 +269,35 @@ logging.basicConfig(handlers=[handler])
 
 **Q: 如何同时使用多种日志范式？**
 
-A: 可以组合使用：
+A: 三者互不冲突，可同时开启：
 ```python
-trace_logger = TraceLogger(output_dir="logs")
-agent_logger = AgentLogger(name="assistant", level="INFO")
-config = Config(devlog_enabled=True)
+import logging
+from hello_agents import ReActAgent, HelloAgentsLLM, Config
+from hello_agents.core.logging import set_agent_print
 
-agent = ReActAgent(
-    "assistant",
-    llm,
-    trace_logger=trace_logger,
-    logger=agent_logger,
-    config=config
-)
+logging.basicConfig(level=logging.INFO)                  # 应用日志
+set_agent_print(lambda *a, **kw: print("[agent]", *a))  # 框架输出加前缀
+config = Config(trace_enabled=True, trace_dir="logs")    # 执行轨迹
+agent = ReActAgent("assistant", llm, config=config)
 ```
 
 **Q: 日志文件太大怎么办？**
 
-A: 使用日志轮转：
+A: TraceLogger 每个会话独立文件（trace-<session_id>），按会话归档即可；应用日志用轮转：
 ```python
 from logging.handlers import RotatingFileHandler
 
 handler = RotatingFileHandler("agent.log", maxBytes=10*1024*1024, backupCount=5)
 ```
 
-**Q: 如何禁用所有日志？**
+**Q: 如何禁用 TraceLogger？**
 
-A: 设置日志级别为 CRITICAL：
-```python
-logging.basicConfig(level=logging.CRITICAL)
-```
+A: `Config(trace_enabled=False)`（默认即为关闭状态）。
+
+**Q: 框架输出能重定向到 SSE / WebSocket 吗？**
+
+A: 可以，这正是 `set_agent_print` 的设计目的（建议-7）——Web 控制台通过注入 sink 把框架输出转发到 SSE 事件流。
 
 ---
 
-**最后更新**: 2026-02-21
+**最后更新**: 2026-08-19

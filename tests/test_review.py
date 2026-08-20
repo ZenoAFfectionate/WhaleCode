@@ -292,7 +292,10 @@ class TestReviewAgentHelpers:
         assert "No changes" in report.summary
 
     def test_get_git_diff_staged_flag(self, monkeypatch, tmp_path):
+        # Q2-9: get_git_diff now routes through git_tools._run_git, so the
+        # subprocess boundary lives in the git_tools module.
         from hello_agents.agents import review_agent
+        from hello_agents.tools.builtin import git_tools
 
         calls = []
 
@@ -303,7 +306,7 @@ class TestReviewAgentHelpers:
             m.stdout = "diff"
             return m
 
-        monkeypatch.setattr(review_agent.subprocess, "run", _fake_run)
+        monkeypatch.setattr(git_tools.subprocess, "run", _fake_run)
         review_agent.get_git_diff(str(tmp_path), staged=True)
         assert "--cached" in calls[0]
         review_agent.get_git_diff(str(tmp_path), staged=False)
@@ -313,11 +316,12 @@ class TestReviewAgentHelpers:
         import subprocess as sp
 
         from hello_agents.agents import review_agent
+        from hello_agents.tools.builtin import git_tools
 
         def _boom(cmd, **kwargs):
             raise sp.TimeoutExpired(cmd, 10)
 
-        monkeypatch.setattr(review_agent.subprocess, "run", _boom)
+        monkeypatch.setattr(git_tools.subprocess, "run", _boom)
         assert review_agent.get_git_diff(str(tmp_path)) == ""
 
     def test_fetch_pr_diff_strips_hash(self, monkeypatch, tmp_path):

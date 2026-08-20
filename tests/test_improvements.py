@@ -258,7 +258,7 @@ class TestCircuitBreakerIsFaultIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 重要-5-category: Tool categories + ToolFilter category-based filtering
+# 重要-5-category: Tool categories
 # ---------------------------------------------------------------------------
 
 class TestToolCategoryAndFilter:
@@ -306,130 +306,6 @@ class TestToolCategoryAndFilter:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_readonly_filter_by_category(self):
-        from hello_agents.tools.tool_filter import ReadOnlyFilter
-        from hello_agents.tools.registry import ToolRegistry
-        from hello_agents.tools.base import Tool, ToolParameter
-        from hello_agents.tools.response import ToolResponse
-
-        reg = ToolRegistry(verbose=False)
-
-        class _ReadTool(Tool):
-            def __init__(self):
-                super().__init__(name="MyRead", description="", category="readonly")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        class _WriteTool(Tool):
-            def __init__(self):
-                super().__init__(name="MyWrite", description="", category="write")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        class _GeneralTool(Tool):
-            def __init__(self):
-                super().__init__(name="MyGeneral", description="")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        reg.register_tool(_ReadTool())
-        reg.register_tool(_WriteTool())
-        reg.register_tool(_GeneralTool())
-
-        rof = ReadOnlyFilter(tool_categories=reg.get_tool_categories())
-        allowed = rof.filter(reg.list_tools())
-
-        assert "MyRead" in allowed, f"readonly tool must be allowed: {allowed}"
-        assert "MyWrite" not in allowed, f"write tool must be denied: {allowed}"
-        # General tools (no explicit category → "general") should NOT pass
-        # ReadOnlyFilter unless added to allowed_tools.
-        assert "MyGeneral" not in allowed
-
-    def test_fullaccess_filter_by_category(self):
-        from hello_agents.tools.tool_filter import FullAccessFilter
-        from hello_agents.tools.registry import ToolRegistry
-        from hello_agents.tools.base import Tool, ToolParameter
-        from hello_agents.tools.response import ToolResponse
-
-        reg = ToolRegistry(verbose=False)
-
-        class _DangerTool(Tool):
-            def __init__(self):
-                super().__init__(name="Danger", description="", category="dangerous")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        class _WriteTool(Tool):
-            def __init__(self):
-                super().__init__(name="Write", description="", category="write")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        reg.register_tool(_DangerTool())
-        reg.register_tool(_WriteTool())
-
-        faf = FullAccessFilter(tool_categories=reg.get_tool_categories())
-        allowed = faf.filter(reg.list_tools())
-
-        assert "Danger" not in allowed, f"dangerous tool must be denied: {allowed}"
-        assert "Write" in allowed, f"write tool must be allowed: {allowed}"
-
-    def test_custom_filter_with_categories(self):
-        from hello_agents.tools.tool_filter import CustomFilter
-        from hello_agents.tools.registry import ToolRegistry
-        from hello_agents.tools.base import Tool, ToolParameter
-        from hello_agents.tools.response import ToolResponse
-
-        reg = ToolRegistry(verbose=False)
-
-        class _A(Tool):
-            def __init__(self):
-                super().__init__(name="A", description="", category="readonly")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        class _B(Tool):
-            def __init__(self):
-                super().__init__(name="B", description="", category="dangerous")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        class _C(Tool):
-            def __init__(self):
-                super().__init__(name="C", description="", category="write")
-            def get_parameters(self): return []
-            def run(self, p): return ToolResponse.success(text="ok")
-
-        reg.register_tool(_A())
-        reg.register_tool(_B())
-        reg.register_tool(_C())
-
-        categories = reg.get_tool_categories()
-
-        # Whitelist: allow only readonly category + explicit "C"
-        cf = CustomFilter(
-            mode="whitelist",
-            allowed=["C"],
-            allowed_categories={"readonly"},
-            tool_categories=categories,
-        )
-        allowed = cf.filter(reg.list_tools())
-        assert "A" in allowed   # readonly category
-        assert "C" in allowed   # explicit name
-        assert "B" not in allowed  # dangerous, not allowed
-
-        # Blacklist: deny dangerous category + explicit "C"
-        cf2 = CustomFilter(
-            mode="blacklist",
-            denied=["C"],
-            denied_categories={"dangerous"},
-            tool_categories=categories,
-        )
-        allowed2 = cf2.filter(reg.list_tools())
-        assert "A" in allowed2
-        assert "B" not in allowed2  # dangerous category denied
-        assert "C" not in allowed2  # explicit deny
-
     def test_registry_get_tool_category(self):
         from hello_agents.tools.registry import ToolRegistry
         from hello_agents.tools.base import Tool, ToolParameter
@@ -449,20 +325,6 @@ class TestToolCategoryAndFilter:
 
         cats = reg.get_tool_categories()
         assert cats["MyTool"] == "readonly"
-
-    def test_filter_backward_compatible_without_categories(self):
-        """Without tool_categories, filters work on name-based allow/deny only."""
-        from hello_agents.tools.tool_filter import ReadOnlyFilter, FullAccessFilter
-
-        rof = ReadOnlyFilter()
-        assert "Read" in rof.filter(["Read", "Bash", "Write"])
-        assert "Bash" not in rof.filter(["Read", "Bash", "Write"])
-        assert "Write" not in rof.filter(["Read", "Bash", "Write"])
-
-        faf = FullAccessFilter()
-        assert "Read" in faf.filter(["Read", "Bash", "Write"])
-        assert "Bash" not in faf.filter(["Read", "Bash", "Write"])
-        assert "Write" in faf.filter(["Read", "Bash", "Write"])
 
 
 # ---------------------------------------------------------------------------
@@ -767,105 +629,9 @@ def test_retry_wraps_invoke():
     assert FakeOpenAI.instance.calls >= 3, f"expected >=3 calls (retries), got {FakeOpenAI.instance.calls}"
 
 
-# ---------------------------------------------------------------------------
-# 重要-6: subagent tool filter is non-destructive
-# ---------------------------------------------------------------------------
-
-def test_apply_tool_filter_does_not_mutate_original_tools():
-    from hello_agents.tools.registry import ToolRegistry
-    from hello_agents.tools.base import Tool, ToolParameter
-    from hello_agents.tools.tool_filter import ReadOnlyFilter
-    from hello_agents.core.config import Config
-
-    registry = ToolRegistry(config=Config(), verbose=False)
-
-    class _FakeTool(Tool):
-        def __init__(self, n):
-            super().__init__(name=n, description="")
-        def get_parameters(self):
-            return []
-        def run(self, params):
-            from hello_agents.tools.response import ToolResponse
-            return ToolResponse.success(text="ok")
-
-    registry.register_tool(_FakeTool("Read"))
-    registry.register_tool(_FakeTool("Bash"))
-    registry.register_tool(_FakeTool("Edit"))
-
-    # Apply filter (ReadOnly allows Read, not Bash/Edit).
-    from hello_agents.core.config import Config
-    from hello_agents.core.llm import HelloAgentsLLM
-    from hello_agents.agents.react_agent import ReActAgent
-
-    llm = HelloAgentsLLM(model="gpt-4", api_key="sk-t", base_url="http://x")
-    # Don't auto-register TodoWrite so the test doesn't get interference.
-    cfg = Config(todowrite_enabled=False)
-    agent = ReActAgent(name="test", llm=llm, tool_registry=registry,
-                       max_steps=1, config=cfg)
-    # Capture the full set *after* agent init (which adds builtins like
-    # Thought/Finish).
-    original = dict(registry._tools)
-    assert "Read" in original
-
-    saved = agent._apply_tool_filter(ReadOnlyFilter())
-    assert saved is not None
-    assert "Read" in registry._tools
-    assert "Bash" not in registry._tools  # filtered out of current view
-
-    # Restore
-    agent._restore_tools(saved)
-    assert registry._tools == original
-    assert "Bash" in registry._tools
-    assert "Edit" in registry._tools
-
-
-# ---------------------------------------------------------------------------
-# 重要-9/10: shared tool-calling loop and PlanSolve no-per-step-agent
-# ---------------------------------------------------------------------------
-
-def test_shared_tool_loop_returns_plain_text_when_no_tools():
-    from hello_agents.agents._tool_loop import build_tool_schemas, run_tool_calling_loop
-    from hello_agents.tools.registry import ToolRegistry
-    from hello_agents.core.config import Config
-
-    registry = ToolRegistry(config=Config(), verbose=False)
-    schemas = build_tool_schemas(registry)
-    assert schemas == []
-
-    result = run_tool_calling_loop(
-        llm=None,
-        tool_schemas=[],
-        messages=[],
-        execute_tool=lambda n, a: "unreachable",
-        max_iterations=1,
-    )
-    # Without a real LLM we'd crash on the first invoke; that's expected.
-    # The important thing is the function parses its arguments and
-    # build_tool_schemas is importable and non-None for an empty registry.
-
-
-def test_build_tool_schemas_returns_schemas():
-    from hello_agents.agents._tool_loop import build_tool_schemas
-    from hello_agents.tools.registry import ToolRegistry
-    from hello_agents.tools.base import Tool, ToolParameter
-    from hello_agents.tools.response import ToolResponse
-    from hello_agents.core.config import Config
-
-    registry = ToolRegistry(config=Config(), verbose=False)
-
-    class EchoTool(Tool):
-        def __init__(self):
-            super().__init__(name="Echo", description="echos input")
-        def get_parameters(self):
-            return [ToolParameter(name="msg", type="string", description="the message", required=True)]
-        def run(self, params):
-            return ToolResponse.success(text=params.get("msg", ""))
-
-    registry.register_tool(EchoTool())
-    schemas = build_tool_schemas(registry)
-    assert len(schemas) == 1
-    assert schemas[0]["function"]["name"] == "Echo"
-    assert "msg" in schemas[0]["function"]["parameters"]["properties"]
+# 注：重要-9/10 的共享工具循环（_tool_loop.py）及其测试已随三个教学型
+# agent（SimpleAgent/PlanSolveAgent/ReflectionAgent）一并移除（2026-08-19
+# 精简决策，见 IMPROVEMENT.md 第 10 轮）。ReAct 主循环与 CodeAgent 不受影响。
 
 
 # ---------------------------------------------------------------------------
@@ -1049,12 +815,12 @@ def test_factory_supports_code_type():
     assert agent is not None
     assert "code-agent" in str(type(agent)).lower() or "CodeAgent" in str(type(agent))
 
-    # simple with tool_registry
+    # react with tool_registry（simple/reflection/plan 已随教学型 agent 移除）
     from hello_agents.tools.registry import ToolRegistry
     from hello_agents.core.config import Config
     reg = ToolRegistry(config=Config(), verbose=False)
-    simple = create_agent("simple", name="test", llm=llm, tool_registry=reg)
-    assert simple.enable_tool_calling is True
+    react = create_agent("react", name="test", llm=llm, tool_registry=reg)
+    assert type(react).__name__ == "ReActAgent"
 
 
 # ---------------------------------------------------------------------------
@@ -1499,3 +1265,418 @@ class TestNormalizeToolCallsDefensive:
         result = hm._normalize_tool_calls(["not_a_dict", {"id": "ok", "name": "T", "arguments": {}}])
         assert len(result) == 1
         assert result[0]["name"] == "T"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 改进项 8/F2: lcb6 --timeout must reach the controlled evaluation
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestLCB6TimeoutPlumbing:
+    """Verify the CLI --timeout value flows into the stdio/functional
+    evaluation adapters instead of a hardcoded 10s."""
+
+    def _capture_adapter_kwargs(self, monkeypatch, module, adapter_name):
+        captured = {}
+
+        class _FakeAdapter:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def evaluate(self, **kwargs):
+                return {"passed": True, "public": {"passed": 1, "failed": 0},
+                        "private": {"passed": 1, "failed": 0}, "details": []}
+
+        monkeypatch.setattr(module, adapter_name, _FakeAdapter)
+        return captured
+
+    def test_stdin_eval_honors_timeout_kwarg(self, tmp_path, monkeypatch):
+        import hello_agents.benchmark.lcb6_bench as lcb6
+        captured = self._capture_adapter_kwargs(monkeypatch, lcb6, "PythonStdinAdapter")
+        result = lcb6._evaluate_stdin_solution(
+            tmp_path / "solution.py", [{"input": "1\n", "output": "1\n"}], 1, timeout=42,
+        )
+        assert result["passed"] is True
+        assert captured["timeout"] == 42, "stdin evaluation must honor the timeout parameter"
+
+    def test_functional_eval_honors_timeout_kwarg(self, tmp_path, monkeypatch):
+        import hello_agents.benchmark.lcb6_bench as lcb6
+        captured = self._capture_adapter_kwargs(monkeypatch, lcb6, "PythonFunctionalAdapter")
+        result = lcb6._evaluate_functional_solution(
+            tmp_path / "solution.py", [], 0, "class Solution:", {}, timeout=33,
+        )
+        assert result["passed"] is True
+        assert captured["timeout"] == 33, "functional evaluation must honor the timeout parameter"
+
+    def test_default_timeout_still_10(self, tmp_path, monkeypatch):
+        """Back-compat: without an explicit timeout the old 10s default applies."""
+        import hello_agents.benchmark.lcb6_bench as lcb6
+        captured = self._capture_adapter_kwargs(monkeypatch, lcb6, "PythonStdinAdapter")
+        lcb6._evaluate_stdin_solution(tmp_path / "solution.py", [], 0)
+        assert captured["timeout"] == 10
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 改进项 9/F3: LSPManager shared per workspace root
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSharedLSPManager:
+    """Verify get_shared_manager caches one manager per resolved root so
+    sub-agents reuse the main agent's language servers."""
+
+    def test_same_root_returns_same_instance(self, tmp_path):
+        from hello_agents.tools.lsp import get_shared_manager, LSPManager
+        m1 = get_shared_manager(tmp_path)
+        m2 = get_shared_manager(tmp_path)
+        assert m1 is m2
+        assert isinstance(m1, LSPManager)
+
+    def test_different_roots_return_different_instances(self, tmp_path):
+        from hello_agents.tools.lsp import get_shared_manager
+        other = tmp_path / "other"
+        other.mkdir()
+        m1 = get_shared_manager(tmp_path)
+        m2 = get_shared_manager(other)
+        assert m1 is not m2
+
+    def test_unresolved_paths_share_by_resolved_root(self, tmp_path):
+        """Symlinked / non-normalized paths to the same root share one manager."""
+        from hello_agents.tools.lsp import get_shared_manager
+        m1 = get_shared_manager(tmp_path)
+        m2 = get_shared_manager(str(tmp_path) + "/./subdir/../")
+        assert m1 is m2
+
+    def test_concurrent_access_is_thread_safe(self, tmp_path):
+        import concurrent.futures
+        from hello_agents.tools.lsp import get_shared_manager
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            managers = list(pool.map(lambda _: get_shared_manager(tmp_path), range(32)))
+        assert all(m is managers[0] for m in managers), (
+            "concurrent get_shared_manager calls must return a single instance"
+        )
+
+    def test_two_code_agents_share_one_manager(self, tmp_path, monkeypatch):
+        """Main agent + sub-agent on the same root must share the LSP manager."""
+        from hello_agents.tools.lsp import manager as lsp_manager_mod
+        from hello_agents.agents.code_agent import CodeAgent
+
+        class _StubLLM:
+            model = "stub-model"
+
+            def invoke_with_tools(self, *args, **kwargs):
+                raise RuntimeError("not used during construction")
+
+        created = []
+        real_cls = lsp_manager_mod.LSPManager
+
+        class _CountingManager(real_cls):
+            def __init__(self, workspace_root):
+                created.append(workspace_root)
+                super().__init__(workspace_root)
+
+        monkeypatch.setattr(lsp_manager_mod, "LSPManager", _CountingManager)
+        # get_shared_manager resolves LSPManager from the module namespace at
+        # call time, so the patch above takes effect for new roots only.
+        lsp_manager_mod._SHARED_MANAGERS.clear()
+        try:
+            for _ in range(2):
+                CodeAgent(
+                    "agent",
+                    _StubLLM(),
+                    project_root=str(tmp_path),
+                    register_default_tools=True,
+                    enable_task_tool=False,
+                    enable_subagent_task=False,
+                    interactive=False,
+                )
+            assert len(created) == 1, (
+                f"two CodeAgents on the same root must share one LSPManager, "
+                f"created {len(created)}"
+            )
+        finally:
+            lsp_manager_mod._SHARED_MANAGERS.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q2-5/Q2-6: shared env parsing (core/env_utils.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestEnvUtils:
+    """Single implementation of tolerant env parsing."""
+
+    def test_env_bool_tokens(self, monkeypatch):
+        from hello_agents.core.env_utils import env_bool
+        for token in ("1", "true", "TRUE", "Yes", "on"):
+            monkeypatch.setenv("X_FLAG", token)
+            assert env_bool("X_FLAG", False) is True, token
+        for token in ("0", "false", "no", "off", "garbage"):
+            monkeypatch.setenv("X_FLAG", token)
+            assert env_bool("X_FLAG", True) is False, token
+
+    def test_env_bool_unset_and_empty(self, monkeypatch):
+        from hello_agents.core.env_utils import env_bool
+        monkeypatch.delenv("X_FLAG", raising=False)
+        assert env_bool("X_FLAG", True) is True
+        assert env_bool("X_FLAG", False) is False
+        monkeypatch.setenv("X_FLAG", "   ")
+        assert env_bool("X_FLAG", True) is True
+
+    def test_env_int_clamps_negative_and_invalid(self, monkeypatch):
+        from hello_agents.core.env_utils import env_int
+        monkeypatch.setenv("X_INT", "42")
+        assert env_int("X_INT", 7) == 42
+        monkeypatch.setenv("X_INT", "  17 ")
+        assert env_int("X_INT", 7) == 17
+        monkeypatch.setenv("X_INT", "-5")
+        assert env_int("X_INT", 7) == 7, "negative values must fall back to default"
+        monkeypatch.setenv("X_INT", "not-a-number")
+        assert env_int("X_INT", 7) == 7
+
+    def test_env_float_clamps_negative_and_invalid(self, monkeypatch):
+        from hello_agents.core.env_utils import env_float
+        monkeypatch.setenv("X_FLOAT", "0.5")
+        assert env_float("X_FLOAT", 1.0) == 0.5
+        monkeypatch.setenv("X_FLOAT", "-3")
+        assert env_float("X_FLOAT", 1.0) == 1.0
+        monkeypatch.setenv("X_FLOAT", "zzz")
+        assert env_float("X_FLOAT", 1.0) == 1.0
+
+    def test_debug_env_now_accepts_standard_true_tokens(self, monkeypatch):
+        """Q4-5: DEBUG previously only matched the literal string 'true'."""
+        from hello_agents.core.config import Config
+        monkeypatch.setenv("DEBUG", "1")
+        assert Config.from_env().debug is True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q2-7: single atomic_write implementation (context/io_utils.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAtomicWriteShared:
+    def test_writes_and_creates_parent_dirs(self, tmp_path):
+        from hello_agents.context.io_utils import atomic_write
+        target = tmp_path / "a" / "b" / "file.txt"
+        atomic_write(target, "hello")
+        assert target.read_text(encoding="utf-8") == "hello"
+
+    def test_preserves_file_mode(self, tmp_path):
+        import os
+        from hello_agents.context.io_utils import atomic_write
+        target = tmp_path / "file.txt"
+        atomic_write(target, "first")
+        os.chmod(target, 0o640)
+        atomic_write(target, "second")
+        assert (os.stat(target).st_mode & 0o777) == 0o640
+        assert target.read_text(encoding="utf-8") == "second"
+
+    def test_tool_layer_reexports_same_function(self):
+        """_code_utils.atomic_write must be the very same object (single source)."""
+        from hello_agents.context.io_utils import atomic_write as impl
+        from hello_agents.tools.builtin._code_utils import atomic_write as reexported
+        assert reexported is impl
+
+    def test_no_local_duplicates_remain(self):
+        import inspect
+        from hello_agents.context import history as history_mod
+        from hello_agents.context import truncator as truncator_mod
+        assert not hasattr(history_mod.HistoryManager, "_atomic_write")
+        assert not hasattr(truncator_mod.ObservationTruncator, "_atomic_write")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q2-8: shared search-exclusion constants
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSharedSearchConstants:
+    def test_grep_and_glob_share_the_same_constants(self):
+        from hello_agents.tools.builtin.glob_tool import GlobTool
+        from hello_agents.tools.builtin.grep_tool import GrepTool
+        assert GlobTool.DEFAULT_EXCLUDE_GLOBS is GrepTool.DEFAULT_EXCLUDE_GLOBS
+        assert GlobTool.INTERNAL_ARTIFACT_DIRS == GrepTool.INTERNAL_ARTIFACT_DIRS
+        assert ".backups" in GlobTool.INTERNAL_ARTIFACT_DIRS
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q3-1: append-only result persistence
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAppendResultRecord:
+    def _utils(self):
+        # _utils is importable both as package module and standalone script.
+        try:
+            from hello_agents.benchmark import _utils
+        except ImportError:
+            import importlib.util, sys
+            from pathlib import Path
+            spec = importlib.util.spec_from_file_location(
+                "_utils_standalone",
+                Path(__file__).resolve().parents[1] / "code" / "benchmark" / "_utils.py",
+            )
+            _utils = importlib.util.module_from_spec(spec)
+            sys.modules["_utils_standalone"] = _utils
+            spec.loader.exec_module(_utils)
+        return _utils
+
+    def test_append_then_load_collapses_duplicates(self, tmp_path):
+        utils = self._utils()
+        path = tmp_path / "results.jsonl"
+        utils.append_result_record(path, {"task_id": "t1", "passed": False})
+        utils.append_result_record(path, {"task_id": "t2", "passed": True})
+        utils.append_result_record(path, {"task_id": "t1", "passed": True})  # rerun wins
+
+        records = utils.load_result_records(path)
+        assert len(records) == 3, "append keeps all lines; resume collapses later"
+        latest = utils.latest_result_records(records)
+        by_id = {r["task_id"]: r for r in latest}
+        assert by_id["t1"]["passed"] is True, "last write must win"
+        assert len(latest) == 2
+
+    def test_torn_final_line_is_skipped(self, tmp_path):
+        utils = self._utils()
+        path = tmp_path / "results.jsonl"
+        utils.append_result_record(path, {"task_id": "t1", "passed": True})
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write('{"task_id": "t2", "pass')  # simulate crash mid-write
+        records = utils.load_result_records(path)
+        assert [r["task_id"] for r in records] == ["t1"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q3-2: _node_metrics single-pass equivalence
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestNodeMetricsSinglePass:
+    def _node(self, tag, text=""):
+        from hello_agents.tools.builtin.web_tool import _HTMLNode
+        node = _HTMLNode(tag)
+        if text:
+            node.text_parts.append(text)
+        return node
+
+    def test_counts_match_legacy_semantics(self):
+        from hello_agents.tools.builtin.web_tool import _node_metrics
+        root = self._node("div", "intro ")
+        p1 = self._node("p", "para one ")
+        p2 = self._node("p", "para two ")
+        h = self._node("h2", "Title")
+        ul = self._node("ul")
+        li = self._node("li", "bullet")
+        pre = self._node("pre", "code()")
+        a = self._node("a", "link text")
+        p1.children.append(a)
+        ul.children.append(li)
+        for child in (p1, p2, h, ul, pre):
+            root.children.append(child)
+
+        m = _node_metrics(root)
+        # tag_count excludes the root itself; descendants = p,p2,h,ul,li,pre,a = 7
+        assert m["tag_count"] == 7
+        assert m["paragraph_count"] == 2
+        assert m["heading_count"] == 1
+        assert m["list_item_count"] == 1
+        assert m["code_block_count"] == 1
+        assert m["link_text_len"] == len("link text")
+        assert "intro" in m["text"] and "para one" in m["text"]
+
+    def test_node_itself_counts_in_per_tag_counters(self):
+        """iter_nodes() yields self first — per-tag counters include it (legacy semantics)."""
+        from hello_agents.tools.builtin.web_tool import _node_metrics
+        p = self._node("p", "only")
+        m = _node_metrics(p)
+        assert m["tag_count"] == 0
+        assert m["paragraph_count"] == 1, "root matching the tag is counted"
+        link = self._node("a", "self link")
+        assert _node_metrics(link)["link_text_len"] == len("self link")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q2-11: sub-agent token estimate prefers TokenCounter over chars//4
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSubagentTokenEstimate:
+    def test_uses_history_manager_estimate_when_available(self):
+        """When TokenCounter estimation is available it must win over chars//4."""
+        from hello_agents.core.agent import Agent
+        from hello_agents.core.message import Message
+
+        class _HM:
+            def get_history(self):
+                return [Message("assistant", "assistant")]
+
+            def get_estimated_token_count(self):
+                return 12345  # distinct sentinel
+
+        class _A(Agent):
+            def __init__(self):
+                self.history_manager = _HM()
+
+            def run(self, *args, **kwargs):  # abstract stub
+                raise NotImplementedError
+
+        meta = _A()._get_subagent_metadata(duration=1.0, error=None)
+        assert meta["tokens"] == 12345
+
+    def test_falls_back_to_chars_div_4(self):
+        from hello_agents.core.agent import Agent
+        from hello_agents.core.message import Message
+
+        class _HM:
+            def get_history(self):
+                return [Message("x" * 400, "assistant"), Message("y" * 400, "assistant")]
+
+            def get_estimated_token_count(self):
+                raise RuntimeError("estimator unavailable")
+
+        class _A(Agent):
+            def __init__(self):
+                self.history_manager = _HM()
+
+            def run(self, *args, **kwargs):  # abstract stub
+                raise NotImplementedError
+
+        meta = _A()._get_subagent_metadata(duration=1.0, error=None)
+        assert meta["tokens"] == 200  # 800 chars // 4
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Q1: dead-code removal contracts (must stay removed)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDeadCodeRemoval:
+    def test_llm_dead_methods_removed(self):
+        from hello_agents.core.llm import HelloAgentsLLM
+        for name in ("think", "stream_invoke", "ainvoke", "astream_invoke"):
+            assert not hasattr(HelloAgentsLLM, name), name
+        # Active entry points stay.
+        for name in ("invoke", "invoke_with_tools", "ainvoke_with_tools"):
+            assert hasattr(HelloAgentsLLM, name), name
+
+    def test_exceptions_pruned_to_base(self):
+        from hello_agents.core import exceptions as exc_mod
+        for name in ("LLMException", "AgentException", "ConfigException", "ToolException"):
+            assert not hasattr(exc_mod, name), name
+        assert hasattr(exc_mod, "HelloAgentsException")
+
+    def test_global_registry_removed(self):
+        import hello_agents
+        from hello_agents.tools import registry as registry_mod
+        assert not hasattr(registry_mod, "global_registry")
+        assert "global_registry" not in getattr(hello_agents, "__all__", [])
+
+    def test_streaming_dead_helpers_removed(self):
+        from hello_agents.core import streaming
+        for name in ("StreamBuffer", "stream_to_sse", "stream_to_json"):
+            assert not hasattr(streaming, name), name
+        assert hasattr(streaming, "StreamEvent")
+
+    def test_config_to_dict_removed(self):
+        from hello_agents.core.config import Config
+        assert not hasattr(Config, "to_dict")

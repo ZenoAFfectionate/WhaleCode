@@ -21,9 +21,9 @@ except ImportError:  # pragma: no cover - platform dependent
     _resource = None
 
 try:
-    from ._utils import build_minimal_child_env, _env_int
+    from ._utils import build_minimal_child_env
 except ImportError:  # pragma: no cover - direct script execution
-    from _utils import build_minimal_child_env, _env_int
+    from _utils import build_minimal_child_env  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -201,21 +201,6 @@ def validate_python_source_safe(source: str, *, filename: str = "solution.py") -
                 raise UnsafeBenchmarkCodeError(
                     f"Unsafe benchmark submission: reading os.environ is not allowed in {filename}."
                 )
-
-
-def default_benchmark_limits(timeout_s: int) -> BenchmarkSandboxLimits:
-    """Return conservative evaluator limits, overridable via environment."""
-
-    cpu_default = max(1, int(timeout_s) + 2)
-    return BenchmarkSandboxLimits(
-        cpu_seconds=_env_int("WHALE_BENCH_EVAL_CPU_SECONDS", cpu_default),
-        address_space_bytes=_env_int("WHALE_BENCH_EVAL_MEMORY_BYTES", 0),
-        max_processes=_env_int("WHALE_BENCH_EVAL_MAX_PROCESSES", 128),
-        file_size_bytes=_env_int(
-            "WHALE_BENCH_EVAL_FILE_SIZE_BYTES",
-            256 * 1024 * 1024,
-        ),
-    )
 
 
 def benchmark_child_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:

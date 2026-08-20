@@ -21,11 +21,11 @@ HelloAgents 的会话持久化功能允许你：
 ### 基本使用
 
 ```python
-from hello_agents import SimpleAgent, HelloAgentsLLM, Config
+from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
 # 创建 Agent（默认启用会话持久化）
 config = Config(session_enabled=True)
-agent = SimpleAgent("assistant", HelloAgentsLLM(), config=config)
+agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
 
 # 正常使用
 result = agent.run("帮我分析这个项目")
@@ -132,7 +132,7 @@ config = Config(
     auto_save_interval=10  # 每 10 条消息自动保存
 )
 
-agent = SimpleAgent("assistant", llm, config=config)
+agent = ReActAgent("assistant", llm, config=config)
 
 # 每 10 条消息自动保存到 session-auto.json
 agent.run("长时间任务")
@@ -142,7 +142,7 @@ agent.run("长时间任务")
 
 ```python
 config = Config(session_enabled=False)
-agent = SimpleAgent("assistant", llm, config=config)
+agent = ReActAgent("assistant", llm, config=config)
 
 # 尝试保存会话会抛出异常
 # RuntimeError: 会话持久化未启用
@@ -365,7 +365,7 @@ config = Config(
     session_enabled=True,
     session_dir="my-custom-sessions"  # 自定义目录
 )
-agent = SimpleAgent("assistant", llm, config=config)
+agent = ReActAgent("assistant", llm, config=config)
 ```
 
 ### 2. 编程式访问 SessionStore

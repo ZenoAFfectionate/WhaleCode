@@ -61,20 +61,31 @@ def sse(type_, payload, status="running", progress=0):
     return {"timestamp": time.strftime("%H:%M:%S"), "type": type_, "payload": payload,
             "job": {"id": "job-1", "status": status, "progress": progress, "completed": 0, "total": 0}}
 
+# C1: 工作区树 mock（数据结构与真实 ListFilesTool 返回对齐）
+WORKSPACE_ENTRIES = [
+    {"name": "src", "type": "directory", "size": "<DIR>", "mtime": "2026-08-19 10:00:00", "path": "src"},
+    {"name": "tests", "type": "directory", "size": "<DIR>", "mtime": "2026-08-19 09:30:00", "path": "tests"},
+    {"name": "test_api.py", "type": "file", "size": "1.2K", "mtime": "2026-08-19 11:00:00", "path": "test_api.py"},
+    {"name": "config.py", "type": "file", "size": "0.4K", "mtime": "2026-08-18 18:00:00", "path": "config.py"},
+    {"name": "README.md", "type": "file", "size": "2.1K", "mtime": "2026-08-18 18:00:00", "path": "README.md"},
+]
+
 AGENT_SCRIPT = [
-    ("model_output", {"thought": "先阅读 config.py 了解现有配置，再定位失败的测试并修复。"}, 0.4),
+    ("model_output", {"thought": "先阅读 config.py 了解现有配置，再定位失败的测试并修复。", "tokens": 2100}, 0.4),
     ("tool_call", {"name": "Read", "path": "config.py"}, 0.5),
     ("tool_result", {"status": "success", "output": "PORT = 8000\nDEBUG = False\nTIMEOUT = 30"}, 0.5),
     ("tool_call", {"name": "Edit", "path": "test_api.py",
                    "output": "  def test_login():\n-    assert login(None) == 200\n+    assert login(None) == 400"}, 0.6),
-    ("tool_result", {"status": "success", "output": "已写入 test_api.py（+1 −1）"}, 0.5),
+    # C2: Edit 结果带结构化 diff_preview（新前端渲染行号双列 diff）
+    ("tool_result", {"status": "success", "output": "已写入 test_api.py（+1 −1）", "tokens": 4800,
+                     "data": {"diff_preview": "--- a/test_api.py\n+++ b/test_api.py\n@@ -1,4 +1,4 @@\n from api import login\n \n def test_login():\n-    assert login(None) == 200\n+    assert login(None) == 400\n     assert login(\"u\") == 200", "path": "test_api.py", "changed_bytes": 1}}, 0.5),
     ("console", {"message": "collecting tests..."}, 0.2),
     ("console", {"message": "test_api.py::test_login"}, 0.2),
     ("tool_call", {"name": "Bash", "command": "pytest -q test_api.py"}, 0.5),
-    ("tool_result", {"status": "failed", "error": "1 failed, 2 passed in 1.2s\nAssertionError: 400 != 200"}, 0.6),
-    ("model_output", {"thought": "断言方向反了，修正期望值后重跑。"}, 0.5),
+    ("tool_result", {"status": "failed", "error": "1 failed, 2 passed in 1.2s\nAssertionError: 400 != 200", "tokens": 7600}, 0.6),
+    ("model_output", {"thought": "断言方向反了，修正期望值后重跑。", "tokens": 9800}, 0.5),
     ("tool_call", {"name": "Bash", "command": "pytest -q test_api.py"}, 0.5),
-    ("tool_result", {"status": "success", "output": "3 passed in 1.1s"}, 0.5),
+    ("tool_result", {"status": "success", "output": "3 passed in 1.1s", "tokens": 12480}, 0.5),
 ]
 BENCH_SCRIPT = [
     ("benchmark_started", {"dataset": {"name": "LiveCodeBench v6"}}, 0.3),
@@ -119,10 +130,43 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         p = parsed.path
         if p == "/": self.path = "/index.html"; return super().do_GET()
-        if p == "/api/status": return self._json({"ok": True, "project_root": "/home/kemove/CodeingAgent/WhaleCode", "model": MODEL})
+        if p == "/api/status": return self._json({"ok": True, "project_root": "/path/to/WhaleCode", "model": MODEL})
         if p == "/api/models": return self._json(MODEL)
         if p == "/api/sessions": return self._json({"sessions": SESSIONS})
         if p == "/api/datasets": return self._json({"datasets": DATASETS})
+        # ── C1: 工作区浏览（mock 数据结构与真实 server 对齐） ──
+        if p == "/api/workspace/tree":
+            qs = parse_qs(parsed.query)
+            req_path = qs.get("path", ["."])[0]
+            # 根目录返回 mock 清单；子目录返回空（mock 无深层目录数据，
+            # 与真实 server 的懒加载行为兼容——前端展开后渲染"空目录"）
+            entries = WORKSPACE_ENTRIES if req_path in (".", "") else []
+            return self._json({"status": "success", "text": "mock listing",
+                               "data": {"path": req_path, "entries": entries}})
+        if p == "/api/workspace/file":
+            qs = parse_qs(parsed.query)
+            path = qs.get("path", [""])[0]
+            entry = next((e for e in WORKSPACE_ENTRIES if e["type"] == "file" and e["path"] == path), None)
+            if not entry:
+                return self._json({"status": "error", "error": f"File '{path}' is outside the project root, access denied"}, 400)
+            content = "def login(user):\n    if user is None:\n        return 400\n    return 200\n"
+            return self._json({"status": "success", "text": "mock read",
+                               "data": {"path": path, "content": content, "lines": 5, "total_lines": 5,
+                                        "offset": 0, "limit": 2000, "encoding": "utf-8", "truncated": False}})
+        # ── C8: Trace 报告 ──
+        if p == "/api/traces":
+            return self._json({"traces": [{"name": "trace-mock-session.html", "url": "/traces/trace-mock-session.html",
+                                            "size_bytes": 4096, "modified_at": "2026-08-19T12:00:00"}]})
+        if p.startswith("/traces/"):
+            if not p.endswith(".html"):
+                return self._json({"error": "trace report not found"}, 404)
+            body = b"<html><body><h1>Mock Trace Report</h1></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if p == "/api/benchmarks/history": return self._json({"history": HISTORY})
         if p == "/api/benchmarks/trajectory":
             task_id = parse_qs(parsed.query).get("task_id", [""])[0]

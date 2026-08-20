@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from ..base import ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
+from ._code_utils import INTERNAL_ARTIFACT_DIRS, SEARCH_EXCLUDE_GLOBS
 from .file_tools import _WorkspaceFileTool
 
 
@@ -16,15 +17,9 @@ class GlobTool(_WorkspaceFileTool):
     """Find files via ripgrep-backed file enumeration."""
 
     MAX_RESULTS = 100
-    DEFAULT_EXCLUDE_GLOBS = (
-        "!.git/**",
-        "!**/.git/**",
-        "!.backups/**",
-        "!**/.backups/**",
-        "!.delete_trash/**",
-        "!**/.delete_trash/**",
-    )
-    INTERNAL_ARTIFACT_DIRS = {".backups", ".delete_trash"}
+    # Q2-8: 单一事实来源在 _code_utils（与 GrepTool 共享，防止漂移）
+    DEFAULT_EXCLUDE_GLOBS = SEARCH_EXCLUDE_GLOBS
+    INTERNAL_ARTIFACT_DIRS = set(INTERNAL_ARTIFACT_DIRS)
 
     def __init__(
         self,

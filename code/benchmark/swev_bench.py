@@ -1418,7 +1418,9 @@ class SWEBenchVerifiedBenchmark(BenchmarkRunner):
                     total_time += float(result.get("elapsed_s", 0.0) or 0.0)
 
                     self._upsert_result_record(persisted_records, record_index, result)
-                    self._write_result_records(results_file, persisted_records)
+                    # Q3-1: append one JSONL line instead of a full rewrite
+                    # (lock held — concurrent workers append serially).
+                    self._append_result_record(results_file, result)
 
                     status = "PASS" if result.get("passed") is True else "FAIL"
                     if result.get("passed") is None:

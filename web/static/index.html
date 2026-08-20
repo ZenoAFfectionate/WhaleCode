@@ -11,9 +11,10 @@
     href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="./styles.css?v=9" />
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="./styles.css?v=11" />
 </head>
-<body>
+<body data-theme="dark">
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
@@ -60,47 +61,82 @@
     <main class="main">
       <!-- ===================== Agent view ===================== -->
       <section class="view active" id="agentView">
-        <header class="vitals" id="agentVitals">
-          <div class="vital vital-status">
-            <span class="label">状态</span>
-            <strong id="vitalStatus">就绪</strong>
-          </div>
-          <div class="vital">
-            <span class="label">步数</span>
-            <strong id="vitalStep">0</strong>
-          </div>
-          <div class="vital">
-            <span class="label">用时</span>
-            <strong id="vitalElapsed">—</strong>
-          </div>
-          <div class="vital">
-            <span class="label">Tokens</span>
-            <strong id="vitalTokens">—</strong>
-          </div>
-          <div class="vitals-spacer"></div>
-          <button class="ghost-button" id="newSessionButton" type="button">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-            新会话
-          </button>
-          <button class="ghost-button danger-button" id="cancelAgentButton" type="button" hidden>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
-            取消运行
-          </button>
-        </header>
+        <div class="agent-layout">
+          <div class="agent-primary">
+            <header class="vitals" id="agentVitals">
+              <div class="vital vital-status">
+                <span class="label">状态</span>
+                <strong id="vitalStatus">就绪</strong>
+              </div>
+              <div class="vital">
+                <span class="label">步数</span>
+                <strong id="vitalStep">0</strong>
+              </div>
+              <div class="vital">
+                <span class="label">用时</span>
+                <strong id="vitalElapsed">—</strong>
+              </div>
+              <div class="vital vital-tokens">
+                <span class="label">Tokens</span>
+                <strong id="vitalTokens">—</strong>
+                <svg class="token-spark" id="tokenSpark" viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"></svg>
+              </div>
+              <div class="vitals-spacer"></div>
+              <button class="ghost-button" id="traceReportButton" type="button" title="打开最近的 Trace 报告（新窗口）">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+                Trace
+              </button>
+              <button class="ghost-button icon-only" id="workspaceToggle" type="button" title="工作区文件浏览器" aria-label="打开工作区面板">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5z"/></svg>
+              </button>
+              <button class="ghost-button icon-only" id="themeToggle" type="button" title="切换主题（浅色/深色）" aria-label="切换主题">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+              </button>
+              <button class="ghost-button" id="newSessionButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                新会话
+              </button>
+              <button class="ghost-button danger-button" id="cancelAgentButton" type="button" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                取消运行
+              </button>
+            </header>
 
-        <div class="trace-stream" id="traceStream">
-          <div class="trace-inner" id="chatStream"></div>
+            <div class="tab-bar" id="agentTabs" hidden></div>
+
+            <div class="trace-stream" id="traceStream">
+              <div class="trace-inner" id="chatStream"></div>
+            </div>
+
+            <form class="composer" id="agentForm">
+              <div class="prompt-box">
+                <textarea id="promptInput" rows="1" placeholder="输入代码问题、开发任务或调试需求…（⌘K 命令面板）"></textarea>
+                <button class="primary-button" id="runAgentButton" type="submit">
+                  运行
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <aside class="workspace-panel" id="workspacePanel" hidden>
+            <div class="wp-header">
+              <div class="wp-title">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5z"/></svg>
+                <strong>工作区</strong>
+                <span class="wp-path" id="wpRootPath"></span>
+              </div>
+              <button class="icon-button" id="wpRefresh" title="刷新目录" aria-label="刷新目录">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6"/></svg>
+              </button>
+              <button class="icon-button" id="wpClose" title="收起面板" aria-label="收起面板">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              </button>
+            </div>
+            <div class="wp-tree" id="wpTree" role="tree" aria-label="工作区文件树"></div>
+            <div class="wp-viewer" id="wpViewer" hidden></div>
+          </aside>
         </div>
-
-        <form class="composer" id="agentForm">
-          <div class="prompt-box">
-            <textarea id="promptInput" rows="1" placeholder="输入代码问题、开发任务或调试需求…"></textarea>
-            <button class="primary-button" id="runAgentButton" type="submit">
-              运行
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
-            </button>
-          </div>
-        </form>
       </section>
 
       <!-- ===================== Benchmarks view ===================== -->
@@ -170,6 +206,7 @@
                 </select>
               </div>
             </div>
+            <div class="bench-chart" id="benchChart" hidden></div>
             <div class="history-table" id="historyTable"></div>
           </section>
         </div>
@@ -177,6 +214,18 @@
     </main>
   </div>
 
-  <script type="module" src="./app.js?v=9"></script>
+  <!-- ===================== Command palette (C9) ===================== -->
+  <div class="cmdk-overlay" id="cmdkOverlay" hidden>
+    <div class="cmdk" role="dialog" aria-label="命令面板">
+      <div class="cmdk-input-row">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="cmdkInput" type="text" placeholder="输入命令或搜索…" autocomplete="off" />
+        <kbd>Esc</kbd>
+      </div>
+      <div class="cmdk-list" id="cmdkList" role="listbox"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js?v=11"></script>
 </body>
 </html>

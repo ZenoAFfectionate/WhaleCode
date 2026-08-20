@@ -10,8 +10,6 @@ from ..core.config import Config
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
-    from .code_agent import CodeAgent
-    from .orchestra import AgentOrchestra
 
 
 def create_agent(
@@ -23,14 +21,11 @@ def create_agent(
     system_prompt: Optional[str] = None
 ) -> Agent:
     """Create an Agent instance
-    
+
     Args:
         agent_type: Agent type, supports:
             - "react": ReActAgent (Reasoning-Action loop)
             - "code": CodeAgent (repository-aware coding agent)
-            - "reflection": ReflectionAgent (Reflective type)
-            - "plan": PlanAndSolveAgent (Planning-Execution)
-            - "simple": SimpleAgent (Simple conversation)
         name: Agent name
         llm: LLM instance
         tool_registry: Tool registry (optional)
@@ -66,151 +61,8 @@ def create_agent(
             system_prompt=system_prompt,
         )
 
-    elif agent_type == "reflection":
-        from .reflection_agent import ReflectionAgent
-        return ReflectionAgent(
-            name=name,
-            llm=llm,
-            tool_registry=tool_registry,
-            config=config,
-            system_prompt=system_prompt
-        )
-
-    elif agent_type == "plan":
-        from .plan_solve_agent import PlanSolveAgent
-        return PlanSolveAgent(
-            name=name,
-            llm=llm,
-            tool_registry=tool_registry,
-            config=config,
-            system_prompt=system_prompt
-        )
-
-    elif agent_type == "simple":
-        from .simple_agent import SimpleAgent
-        return SimpleAgent(
-            name=name,
-            llm=llm,
-            tool_registry=tool_registry,  # 建议-8: don't drop the registry
-            config=config,
-            system_prompt=system_prompt
-        )
-
     else:
         raise ValueError(
             f"Unsupported agent_type: {agent_type}. "
-            f"Supported types: react, code, reflection, plan, simple"
+            f"Supported types: react, code"
         )
-
-
-def default_subagent_factory(
-    agent_type: str,
-    llm: HelloAgentsLLM,
-    tool_registry: Optional['ToolRegistry'] = None,
-    config: Optional[Config] = None
-) -> Agent:
-    """Default sub-agent factory function
-    
-    Default implementation provided by the framework, which users can customize and replace.
-    
-    Args:
-        agent_type: Agent type
-        llm: LLM instance
-        tool_registry: Tool registry (optional)
-        config: Configuration object (optional)
-        
-    Returns:
-        Configured sub-agent instance
-    """
-    config = config or Config()
-    
-    # Sub-agent name
-    name = f"subagent-{agent_type}"
-    
-    # Select system prompt based on type
-    system_prompt = _get_system_prompt_for_type(agent_type)
-    
-    # Create sub-agent
-    subagent = create_agent(
-        agent_type=agent_type,
-        name=name,
-        llm=llm,
-        tool_registry=tool_registry,
-        config=config,
-        system_prompt=system_prompt
-    )
-    
-    # Configure sub-agent specific parameters
-    if hasattr(subagent, 'max_steps'):
-        subagent.max_steps = config.subagent_max_steps
-    
-    return subagent
-
-
-def create_orchestra(
-    main_agent: "CodeAgent",
-    config: Optional[Config] = None,
-) -> "AgentOrchestra":
-    """Create an AgentOrchestra bound to a CodeAgent (main orchestrator).
-
-    Args:
-        main_agent: 主 Agent (必须提供 llm / project_root / working_dir)
-        config: 可选配置覆盖 (默认复用 main_agent.config)
-
-    Returns:
-        AgentOrchestra instance
-    """
-    from .orchestra import AgentOrchestra
-
-    return AgentOrchestra(main_agent=main_agent, config=config)
-
-
-def _get_system_prompt_for_type(agent_type: str) -> str:
-    """Get type-specific system prompt
-    
-    Args:
-        agent_type: Agent type
-        
-    Returns:
-        System prompt
-    """
-    prompts = {
-        "react": """You are an efficient task execution expert.
-
-Goal: Quickly complete the specified subtask.
-
-Rules:
-- Use available tools to complete tasks efficiently
-- Keep output concise and clear
-- Complete within the given step limit
-""",
-        "reflection": """You are a reflective expert.
-
-Goal: Deeply analyze problems and provide high-quality solutions.
-
-Rules:
-- First give an initial solution
-- Reflect and improve the solution
-- Output the final optimized result
-""",
-        "plan": """You are a task planning expert.
-
-Goal: Break down complex tasks into executable steps.
-
-Rules:
-- Analyze task requirements
-- Develop a detailed execution plan
-- Mark step dependencies
-""",
-        "simple": """You are a concise and efficient assistant.
-
-Goal: Directly answer questions or complete tasks.
-
-Rules:
-- Keep answers concise
-- Provide results directly
-- Avoid redundant information
-"""
-    }
-    
-    return prompts.get(agent_type.lower(), prompts["simple"])

@@ -20,14 +20,12 @@ try:
     from ..safe_exec import (
         BenchmarkSandboxLimits,
         benchmark_child_env,
-        default_benchmark_limits,
         make_benchmark_preexec,
     )
 except ImportError:  # pragma: no cover - direct script execution
     from safe_exec import (  # type: ignore
         BenchmarkSandboxLimits,
         benchmark_child_env,
-        default_benchmark_limits,
         make_benchmark_preexec,
     )
 

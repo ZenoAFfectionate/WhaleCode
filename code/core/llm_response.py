@@ -42,18 +42,6 @@ class LLMResponse:
             parts.append("has_reasoning=True")
         parts.append(f"content_length={len(self.content)})")
         return ", ".join(parts)
-    
-    def to_dict(self) -> Dict:
-        """转换为字典格式，方便日志记录"""
-        result = {
-            "content": self.content,
-            "model": self.model,
-            "usage": self.usage,
-            "latency_ms": self.latency_ms,
-        }
-        if self.reasoning_content:
-            result["reasoning_content"] = self.reasoning_content
-        return result
 
 
 @dataclass

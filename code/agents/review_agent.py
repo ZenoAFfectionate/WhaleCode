@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
+from pathlib import Path
 from typing import Optional
 
 from ..core.config import Config
 from ..core.llm import HelloAgentsLLM
+from ..tools.builtin.git_tools import _GitFailure, _run_git
 from .roles.reviewer import ReviewerRole, ReviewReport
 
 
@@ -37,14 +38,20 @@ async def review_staged_diff(
 
 
 def get_git_diff(project_root: str, staged: bool = False) -> str:
-    """获取 git diff 内容 (同步, 10s 超时, 异常返回空串)."""
-    cmd = ["git", "-C", project_root, "diff"]
+    """获取 git diff 内容 (异常返回空串).
+
+    Q2-9: 复用 git_tools._run_git 的沙箱化封装（脱敏 env、
+    GIT_TERMINAL_PROMPT=0 防凭证阻塞、统一超时），替代原先的裸
+    subprocess.run——后者绕过了 BashTool 的环境一致性控制。
+    """
+    root = Path(project_root)
+    args = ["diff"]
     if staged:
-        cmd.append("--cached")
+        args.append("--cached")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        returncode, stdout, _stderr = _run_git(args, cwd=root, project_root=root)
+    except (_GitFailure, OSError):
         return ""
-    if result.returncode != 0:
+    if returncode != 0:
         return ""
-    return result.stdout
+    return stdout

@@ -46,8 +46,17 @@ class CodeAgent(ReActAgent):
         max_steps: int = DEFAULT_CODE_AGENT_MAX_STEPS,
         register_default_tools: bool = True,
         enable_task_tool: bool = True,
+        enable_subagent_task: bool = True,
         interactive: bool = True,
     ):
+        """Initialize the coding agent.
+
+        注意两个易混淆的开关 (命名历史遗留):
+            - ``enable_task_tool``: 控制 **TodoWrite** (进度管理工具) 的注册
+            - ``enable_subagent_task``: 控制 **Task** 工具 (子代理动态派生, A1)
+              的注册; 亦可经 ``Config.subagent_task_enabled`` /
+              env ``SUBAGENT_TASK_ENABLED`` 全局关闭
+        """
         self.project_root = Path(project_root).expanduser().resolve()
         initial_working_dir = (
             Path(working_dir).expanduser().resolve()
@@ -60,6 +69,12 @@ class CodeAgent(ReActAgent):
         effective_config = _copy_config(config)
         effective_config.todowrite_enabled = bool(
             register_default_tools and enable_task_tool and effective_config.todowrite_enabled
+        )
+        # Task 工具 (子代理动态派生): 构造参数与 Config 开关双重控制。
+        effective_config.subagent_task_enabled = bool(
+            register_default_tools
+            and enable_subagent_task
+            and effective_config.subagent_task_enabled
         )
 
         registry = tool_registry or ToolRegistry(config=effective_config)
@@ -186,15 +201,28 @@ class CodeAgent(ReActAgent):
         if enable_task_tool and self.config.todowrite_enabled and self.tool_registry.get_tool("TodoWrite") is None:
             self._register_todowrite_tool()
 
+        # Task 工具 — 主循环内 LLM 可调用的子代理动态派生 (A1)。
+        # 开关三重条件已在 __init__ 合并进 config.subagent_task_enabled
+        # (register_default_tools × enable_subagent_task × Config 开关)。
+        # 子代理创建时经 Role.create_subagent 传 enable_subagent_task=False,
+        # 天然防递归; 同一轮的多个 Task 调用由 _execute_tools 并行执行。
+        if self.config.subagent_task_enabled and self.tool_registry.get_tool("Task") is None:
+            from ..tools.builtin.task_tool import TaskTool
+
+            self.tool_registry.register_tool(TaskTool(agent=self))
+
         # LSP tools — always available (graceful degradation when server absent)
         from ..tools.lsp import (
             LSPDefinitionTool,
             LSPDiagnosticsTool,
             LSPHoverTool,
             LSPReferencesTool,
-            LSPManager,
+            get_shared_manager,
         )
-        manager = LSPManager(self.project_root)
+        # 改进项 9/F3: share one LSPManager per workspace root across the main
+        # agent and all dynamically spawned sub-agents instead of re-launching
+        # a full set of language-server subprocesses per agent.
+        manager = get_shared_manager(self.project_root)
         self.tool_registry.register_tool(
             LSPDefinitionTool(workspace_root=str(self.project_root), manager=manager)
         )
@@ -269,21 +297,3 @@ class CodeAgent(ReActAgent):
             "All file paths must stay within the workspace root."
         )
         return "\n\n".join(system_parts)
-
-    def _create_subagent(self, agent_type: str = "code") -> "CodeAgent":
-        """Create a fresh sub-agent with isolated tool state."""
-        sub_config = _copy_config(self.config)
-        sub_config.trace_enabled = False
-
-        return CodeAgent(
-            name=f"{self.name}-{agent_type}-subagent",
-            llm=self.llm,
-            tool_registry=ToolRegistry(config=sub_config),
-            project_root=str(self.project_root),
-            working_dir=str(self.working_dir),
-            config=sub_config,
-            max_steps=sub_config.subagent_max_steps,
-            register_default_tools=True,
-            enable_task_tool=False,
-            interactive=False,
-        )

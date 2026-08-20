@@ -29,10 +29,9 @@ from hello_agents import ReActAgent, HelloAgentsLLM, Config
 
 # 配置历史压缩（默认：简单摘要）
 config = Config(
-    context_window=128000,           # 上下文窗口大小
-    compression_threshold=0.8,       # 压缩阈值（80%）
-    min_retain_rounds=10,            # 保留最近 10 轮
-    enable_smart_compression=False   # 默认：简单摘要（无需额外 API）
+    context_window=128000,               # 上下文窗口大小
+    compression_threshold=0.8,           # 压缩阈值（80%）
+    compact_preserve_recent_rounds=10,   # 压缩后保留最近 10 轮
 )
 
 agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
@@ -56,14 +55,12 @@ for i in range(50):
 ### 2. 智能摘要（可选，需额外 API）
 
 ```python
-# 启用智能摘要（使用轻量 LLM 生成结构化摘要）
+# 压缩时自动调用 LLM 生成结构化摘要（auto_compact 内置行为）
 config = Config(
-    enable_smart_compression=True,      # 启用智能摘要
-    summary_llm_provider="deepseek",    # 摘要专用 LLM
-    summary_llm_model="deepseek-chat",
-    summary_max_tokens=800,
-    summary_temperature=0.3,
-    min_retain_rounds=10
+    compact_enabled=True,             # 启用 auto_compact
+    summary_max_tokens=800,           # 摘要长度预算
+    summary_temperature=0.3,          # 摘要生成温度
+    compact_preserve_recent_rounds=10 # 压缩后保留最近 10 轮
 )
 
 agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
@@ -92,21 +89,21 @@ agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
 
 ### 2. 工具输出截断
 
-```python
-from hello_agents import Config
+截断参数属于 `ObservationTruncator` 构造函数（非 Config 字段）：
 
-config = Config(
-    tool_output_max_lines=2000,      # 最大行数
-    tool_output_max_bytes=51200,     # 最大字节数（50KB）
-    tool_output_dir="tool-output",   # 完整输出保存目录
-    tool_output_truncate_direction="head"  # 截断方向
+```python
+from hello_agents.context.truncator import ObservationTruncator
+
+truncator = ObservationTruncator(
+    max_lines=2000,                            # 最大行数
+    max_bytes=51200,                           # 最大字节数（50KB）
+    truncate_direction="head",                 # 截断方向
+    output_dir="memory/tool-output",           # 完整输出保存目录
+    retention_days=7,                          # 保存天数
 )
 
-agent = ReActAgent("assistant", llm, config=config)
-
-# 工具输出超过限制时自动截断
-agent.run("读取大文件")
-# 自动截断 + 保存完整输出到 tool-output/tool_xxx.json
+# 工具输出超过限制时自动截断（预览进上下文 + 全量落盘）
+# 截断提示包含 hint："Use Read to inspect specific sections of the saved output."
 ```
 
 ---
@@ -127,7 +124,6 @@ agent.run("读取大文件")
 from hello_agents.context import HistoryManager
 
 manager = HistoryManager(
-    min_retain_rounds=10,
     compression_threshold=0.8
 )
 
@@ -278,17 +274,16 @@ from hello_agents import Config
 
 config = Config(
     # 上下文工程配置
-    context_window=128000,              # 上下文窗口大小
-    compression_threshold=0.8,          # 压缩阈值（80%）
-    min_retain_rounds=10,               # 保留最小轮次数
-    enable_smart_compression=False,     # 智能摘要（需额外 LLM 调用）
-    
-    # 工具输出截断配置
-    tool_output_max_lines=2000,         # 最大行数
-    tool_output_max_bytes=51200,        # 最大字节数
-    tool_output_dir="tool-output",      # 输出目录
-    tool_output_truncate_direction="head"  # 截断方向
+    context_window=128000,                # 上下文窗口大小
+    compression_threshold=0.8,            # 压缩阈值（80%）
+    compact_preserve_recent_rounds=10,    # 压缩后保留最近轮次
+    compact_enabled=True,                 # auto_compact 总开关
+    compact_output_buffer=1024,           # 压缩输出缓冲预算
+    summary_max_tokens=1024,              # 摘要长度预算
+    summary_temperature=0.2,              # 摘要生成温度
 )
+# 注：工具输出截断参数在 ObservationTruncator 构造函数中（见上文），
+# 不属于 Config 字段。
 ```
 
 ---
@@ -366,23 +361,24 @@ config = Config(compression_threshold=0.8)  # 80% 时压缩
 
 ```python
 # ❌ 不好：保留太少，丢失上下文
-config = Config(min_retain_rounds=3)
+config = Config(compact_preserve_recent_rounds=3)
 
 # ✅ 好：保留足够轮次，维持对话连贯性
-config = Config(min_retain_rounds=10)
+config = Config(compact_preserve_recent_rounds=10)
 ```
 
 ### 3. 根据场景选择截断方向
 
+截断方向是 `ObservationTruncator` 的构造参数（`truncate_direction`，默认 `"head"`），而非 Config 字段：
+
 ```python
+from hello_agents.context.truncator import ObservationTruncator
+
 # 日志分析：保留开头（错误通常在开头）
-config = Config(tool_output_truncate_direction="head")
+truncator = ObservationTruncator(truncate_direction="head")
 
 # 实时输出：保留结尾（最新信息在结尾）
-config = Config(tool_output_truncate_direction="tail")
-
-# 长文件：保留开头和结尾
-config = Config(tool_output_truncate_direction="head_tail")
+truncator = ObservationTruncator(truncate_direction="tail")
 ```
 
 ---
@@ -394,15 +390,17 @@ config = Config(tool_output_truncate_direction="head_tail")
 ```python
 from hello_agents import Config
 
-# 启用智能摘要（需要额外 LLM 调用）
+# auto_compact 的摘要行为随压缩自动进行（无单独开关）
 config = Config(
-    enable_smart_compression=True,
-    compression_threshold=0.8
+    compact_enabled=True,           # 启用 auto_compact
+    compression_threshold=0.8,      # 触发阈值
+    summary_max_tokens=1024,        # 摘要长度预算
+    summary_temperature=0.2,        # 摘要生成温度
 )
 
 agent = ReActAgent("assistant", llm, config=config)
 
-# 压缩时会调用 LLM 生成智能摘要
+# 压缩时自动调用 LLM 生成摘要
 # 摘要质量更高，但会消耗额外 Token
 ```
 

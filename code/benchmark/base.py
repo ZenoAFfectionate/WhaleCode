@@ -52,6 +52,7 @@ try:
         _display_width,
         _json_safe,
         _json_safe_full,
+        append_result_record as _append_result_record,
         build_benchmark_system_prompt as _build_benchmark_system_prompt,
         build_minimal_child_env,
         build_progress_update as _build_progress_update,
@@ -76,6 +77,7 @@ except ImportError:
         _display_width,
         _json_safe,
         _json_safe_full,
+        append_result_record as _append_result_record,
         build_benchmark_system_prompt as _build_benchmark_system_prompt,
         build_minimal_child_env,
         build_progress_update as _build_progress_update,
@@ -614,8 +616,16 @@ class BenchmarkRunner(ABC):
         error_extra_builder: Optional[Callable[[int], Optional[Dict[str, Any]]]] = (
             lambda round_idx: {"submission_rounds": round_idx}
         ),
+        feedback_max_lines: int = 80,
+        feedback_max_chars: int = 12000,
     ) -> Dict[str, Any]:
-        """Run repeated controlled submissions with bounded evaluator feedback."""
+        """Run repeated controlled submissions with bounded evaluator feedback.
+
+        ``feedback_max_lines`` / ``feedback_max_chars``: 评测反馈进入下一轮
+        retry prompt 前的统一截断上限 (与 lcb6 的防线一致)。评测器输出
+        (stdout+stderr) 无天然上限 — 大 repr / 长 traceback 直接进 prompt
+        会撑爆 LLM 上下文并随轮次在对话历史中累积, 必须在此统一设界。
+        """
         total_rounds = max(1, int(max_rounds))
         agent_response = ""
         evaluation: Dict[str, Any] = {"passed": False, "output": ""}
@@ -666,7 +676,11 @@ class BenchmarkRunner(ABC):
                     "output": output,
                 }
 
-            feedback = str(evaluation.get("feedback") or output)
+            feedback = truncate_feedback(
+                str(evaluation.get("feedback") or output),
+                max_lines=feedback_max_lines,
+                max_chars=feedback_max_chars,
+            )
 
         return {
             "agent_response": agent_response,
@@ -907,6 +921,7 @@ class BenchmarkRunner(ABC):
     _load_result_records = staticmethod(_load_result_records)
     _latest_result_records = staticmethod(_latest_result_records)
     _write_result_records = staticmethod(_write_result_records)
+    _append_result_record = staticmethod(_append_result_record)
     _upsert_result_record = staticmethod(_upsert_result_record)
     _summarize_result_records = staticmethod(_summarize_result_records)
 
@@ -1063,7 +1078,10 @@ class BenchmarkRunner(ABC):
                 progress.finish_task(result)
 
                 self._upsert_result_record(persisted_records, record_index, result)
-                self._write_result_records(results_file, persisted_records)
+                # Q3-1: append one JSONL line instead of rewriting the whole
+                # results file per task (O(n²) → O(n) IO). Resume collapses
+                # duplicate task_ids via latest_result_records.
+                self._append_result_record(results_file, result)
         finally:
             progress.close()
             self._progress_manager = None

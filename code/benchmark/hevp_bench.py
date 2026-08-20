@@ -59,7 +59,7 @@ _HEVP_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Host-side test instrumentation for richer but bounded hidden-test feedback.
 # ---------------------------------------------------------------------------
-def _instrument_test_code(test_code: str, entry_point: str) -> str:
+def _instrument_test_code(test_code: str) -> str:
     """Rewrite check() so hidden-test failures are fully accumulated and reported.
 
     Mechanisms:
@@ -226,7 +226,7 @@ def _evaluate_solution(
     test_code: str,
     timeout: int,
 ) -> tuple[bool, str]:
-    instrumented_test = _instrument_test_code(test_code, entry_point)
+    instrumented_test = _instrument_test_code(test_code)
 
     def _build_verify_code(solution_code: str) -> str:
         return (

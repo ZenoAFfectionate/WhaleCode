@@ -24,7 +24,7 @@ from hello_agents import ReActAgent, HelloAgentsLLM, Config
 # TraceLogger 默认启用
 config = Config(
     trace_enabled=True,
-    trace_output_dir="memory/traces"
+    trace_dir="memory/traces"
 )
 
 agent = ReActAgent("assistant", HelloAgentsLLM(), config=config)
@@ -69,29 +69,27 @@ HTML 界面包含：
 
 ### 事件类型
 
-TraceLogger 记录以下事件：
+TraceLogger 记录以下事件（以代码中实际 `log_event` 调用为准）：
 
-| 事件类型          | 描述           | 关键字段                    |
-| ----------------- | -------------- | --------------------------- |
-| `session_start`   | 会话开始       | agent_name, config          |
-| `session_end`     | 会话结束       | duration, total_tokens      |
-| `step_start`      | ReAct 步骤开始 | step, max_steps             |
-| `step_end`        | ReAct 步骤结束 | step, action                |
-| `tool_call`       | 工具调用       | tool_name, parameters       |
-| `tool_result`     | 工具结果       | tool_name, status, duration |
-| `llm_request`     | LLM 请求       | model, messages             |
-| `llm_response`    | LLM 响应       | content, usage              |
-| `error`           | 错误事件       | error_type, message         |
-| `compression`     | 历史压缩       | before_count, after_count   |
-| `session_save`    | 会话保存       | filepath                    |
-| `circuit_breaker` | 熔断器触发     | tool_name, state            |
+| 事件类型          | 描述               | 典型载荷字段                 |
+| ----------------- | ------------------ | ---------------------------- |
+| `session_start`   | 会话开始           | agent_name, config           |
+| `session_end`     | 会话结束           | duration, total_tokens       |
+| `tool_call`       | 工具调用           | tool_name, parameters        |
+| `tool_result`     | 工具结果           | tool_name, status, duration  |
+| `message_written` | 历史消息写入       | role, content                |
+| `model_output`    | LLM 响应输出       | content, usage               |
+| `hook_timeout`    | 生命周期钩子超时   | hook_name, timeout           |
+| `hook_error`      | 生命周期钩子错误   | hook_name, error             |
+
+> 注：`step_start`/`step_end`/`llm_request`/`compression`/`circuit_breaker` 等事件**当前实现不记录**（step 进度属于渲染/流事件层，LLM 响应统一记为 `model_output`）。
 
 ### 事件结构
 
 ```json
 {
   "ts": "2026-02-21T10:30:45.123Z",
-  "session_id": "s-20250220-a3f2d8e1",
+  "session_id": "s-20260221-103045-a3f2",
   "step": 3,
   "event": "tool_call",
   "payload": {
@@ -147,10 +145,10 @@ from hello_agents import Config
 
 config = Config(
     # 可观测性配置
-    trace_enabled=True,                 # 启用 TraceLogger
-    trace_output_dir="memory/traces",   # 输出目录
-    trace_sanitize=True,                # 自动脱敏
-    trace_html_raw_response=False       # HTML 包含原始响应
+    trace_enabled=True,                        # 启用 TraceLogger
+    trace_dir="memory/traces",                 # 输出目录
+    trace_sanitize=True,                       # 自动脱敏
+    trace_html_include_raw_response=False      # HTML 包含原始响应
 )
 ```
 
@@ -164,10 +162,10 @@ TraceLogger 自动脱敏以下信息：
 # 脱敏后
 "api_key": "sk-***"
 
-# 路径
+# 路径中的用户名
 "path": "/Users/john/projects/myapp/config.py"
 # 脱敏后
-"path": ".../myapp/config.py"
+"path": "/Users/***/projects/myapp/config.py"
 
 # Authorization Header
 "Authorization": "Bearer token123"
@@ -207,7 +205,7 @@ open memory/traces/trace-xxx.html
 ```bash
 # 使用 jq 分析 JSONL
 cat memory/traces/trace-xxx.jsonl | jq '
-  select(.event=="llm_response") | 
+  select(.event=="model_output") | 
   .payload.usage.total_tokens
 ' | awk '{sum+=$1} END {print "Total tokens:", sum}'
 
@@ -226,8 +224,8 @@ cat memory/traces/trace-xxx.jsonl | jq '
 # 启用完整 trace（包含原始响应）
 config = Config(
     trace_enabled=True,
-    trace_html_raw_response=True,  # 包含 LLM 原始响应
-    trace_sanitize=True            # 仍然脱敏敏感信息
+    trace_html_include_raw_response=True,  # 包含 LLM 原始响应
+    trace_sanitize=True                    # 仍然脱敏敏感信息
 )
 
 agent = ReActAgent("assistant", llm, config=config)
@@ -250,8 +248,8 @@ agent.run("处理用户数据")
 # ✅ 好：生产环境启用，便于问题排查
 config = Config(
     trace_enabled=True,
-    trace_sanitize=True,           # 必须脱敏
-    trace_html_raw_response=False  # 不包含原始响应（节省空间）
+    trace_sanitize=True,                     # 必须脱敏
+    trace_html_include_raw_response=False    # 不包含原始响应（节省空间）
 )
 ```
 
@@ -289,8 +287,8 @@ print(tool_calls)
 
 ## 🔗 相关文档
 
-- [日志系统](./logging-system-guide.md) - 四种日志范式对比
-- [开发日志](./devlog-guide.md) - DevLogTool 使用
+- [日志系统](./logging-system-guide.md) - 三种日志范式对比
+- [开发日志](./devlog-guide.md) - DevLogTool 使用（历史设计稿，功能未实现）
 - [会话持久化](./session-persistence-guide.md) - 保存和恢复会话
 
 ---

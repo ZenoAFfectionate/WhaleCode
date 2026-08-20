@@ -22,30 +22,6 @@ class Skill:
     path: Path
     dir: Path
 
-    @property
-    def scripts(self) -> List[Path]:
-        """Get all files under the scripts/ directory"""
-        scripts_dir = self.dir / "scripts"
-        if not scripts_dir.exists():
-            return []
-        return [f for f in scripts_dir.rglob("*") if f.is_file()]
-
-    @property
-    def examples(self) -> List[Path]:
-        """Get all files under the examples/ directory"""
-        examples_dir = self.dir / "examples"
-        if not examples_dir.exists():
-            return []
-        return [f for f in examples_dir.rglob("*") if f.is_file()]
-
-    @property
-    def references(self) -> List[Path]:
-        """Get all files under the references/ directory"""
-        references_dir = self.dir / "references"
-        if not references_dir.exists():
-            return []
-        return [f for f in references_dir.rglob("*") if f.is_file()]
-
 
 class SkillLoader:
     """
@@ -216,9 +192,3 @@ class SkillLoader:
             List of skill names
         """
         return list(self.metadata_cache.keys())
-
-    def reload(self):
-        """Rescan the skills directory (hot reload)"""
-        self.skills_cache.clear()
-        self.metadata_cache.clear()
-        self._scan_skills()

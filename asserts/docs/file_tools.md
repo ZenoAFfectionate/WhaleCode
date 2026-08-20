@@ -129,29 +129,25 @@ HelloAgents 提供 4 个专业的文件操作工具：
 }
 ```
 
-### 4. MultiEditTool - 批量替换
+### 4. 批量替换（多次 EditTool）
 
-**功能**：
-- 批量执行多个替换操作
-- 原子性保证（要么全部成功，要么全部失败）
-- 乐观锁冲突检测（所有替换前检查一次）
+> **说明**：框架未内置 MultiEditTool。批量替换通过对同一文件**多次调用 EditTool** 实现，每次替换独立进行 old_string 唯一性校验与乐观锁检查（见示例 3）。
 
-**参数**：
+**单次 EditTool 参数**：
 - `path` (必需): 文件路径
-- `edits` (必需): 替换列表 `[{"old_string": "...", "new_string": "..."}]`
+- `old_string` / `new_string` (必需): 替换对
 - `file_mtime_ms` (可选): 缓存的 mtime
 
-**返回**：
+**每次返回**：
 ```json
 {
   "status": "success",
   "data": {
     "modified": true,
-    "num_edits": 3,
     "changed_bytes": 25,
     "backup_path": ".backups/config.py.20250119_143022.bak"
   },
-  "text": "成功执行 3 个替换操作 (变化 +25 字节)"
+  "text": "成功编辑 config.py (变化 +25 字节)"
 }
 ```
 
@@ -275,21 +271,25 @@ if response.status.value == "error":
 
 ### 示例 3：批量编辑
 
+框架未内置 MultiEditTool——批量修改请对同一文件**多次调用 EditTool**（每次一个 old/new 对，均带乐观锁与 diff 预览）：
+
 ```python
-from hello_agents.tools.builtin import MultiEditTool
+from hello_agents.tools.builtin import EditTool
 
-multiedit_tool = MultiEditTool(project_root="./")
+edit_tool = EditTool(project_root="./")
 
-response = multiedit_tool.run({
-    "path": "settings.py",
-    "edits": [
-        {"old_string": 'API_KEY = "old"', "new_string": 'API_KEY = "new"'},
-        {"old_string": "DEBUG = False", "new_string": "DEBUG = True"},
-        {"old_string": "PORT = 8000", "new_string": "PORT = 9000"}
-    ]
-})
-
-print(response.text)  # 成功执行 3 个替换操作
+# 逐个替换（每步独立校验 old_string 唯一性与 mtime）
+for old, new in [
+    ('API_KEY = "old"', 'API_KEY = "new"'),
+    ("DEBUG = False", "DEBUG = True"),
+    ("PORT = 8000", "PORT = 9000"),
+]:
+    response = edit_tool.run({
+        "path": "settings.py",
+        "old_string": old,
+        "new_string": new,
+    })
+    print(response.text)  # 每次输出该步的 diff 预览
 ```
 
 ### 示例 4：在 Agent 中使用
@@ -364,10 +364,11 @@ class EditTool(Tool):
     )
 ```
 
-### MultiEditTool
+### API 签名一览（builtin 实际导出的工具）
 
 ```python
-class MultiEditTool(Tool):
+# ReadTool / WriteTool / EditTool / DeleteTool / ListFilesTool 共用构造签名
+class ReadTool(Tool):  # WriteTool / EditTool / DeleteTool / ListFilesTool 同构
     def __init__(
         self,
         project_root: str = ".",

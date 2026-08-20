@@ -1852,7 +1852,6 @@ SLASH_COMMANDS: tuple = (
     ("/sessions", "List saved sessions"),
     ("/compact", "Compact conversation context: /compact [focus]"),
     ("/review", "Code review: (none)=working diff, --staged, <files...>, <pr_url|#num>, --focus <dim>"),
-    ("/orchestra", "Multi-agent run: /orchestra [--parallel|--pipeline] [--confirm] <task>"),
 )
 
 
@@ -1930,7 +1929,7 @@ if PROMPT_TOOLKIT_AVAILABLE:
                         )
 
 
-# ── /review & /orchestra: 参数解析与渲染 (模块级纯函数, 便于单测) ──
+# ── /review: 参数解析与渲染 (模块级纯函数, 便于单测) ──
 
 
 def _parse_review_args(raw: str) -> dict:
@@ -1963,29 +1962,6 @@ def _parse_review_args(raw: str) -> dict:
             targets.append(tok)
             i += 1
     return {"focus": focus, "staged": staged, "targets": targets}
-
-
-def _parse_orchestra_args(raw: str):
-    """Parse `/orchestra` args → (mode, confirm, task). Flags may appear in any order."""
-    from hello_agents.agents.orchestra import ExecutionMode
-
-    parts = raw.split(maxsplit=1)
-    task = parts[1].strip() if len(parts) > 1 else ""
-    mode = ExecutionMode.HYBRID
-    confirm = False
-    progressed = True
-    while progressed and task:
-        progressed = False
-        for prefix, m in (("--parallel", ExecutionMode.PARALLEL), ("--pipeline", ExecutionMode.PIPELINE)):
-            if task == prefix or task.startswith(prefix + " "):
-                mode = m
-                task = task[len(prefix):].strip()
-                progressed = True
-        if task == "--confirm" or task.startswith("--confirm "):
-            confirm = True
-            task = task[len("--confirm"):].strip()
-            progressed = True
-    return mode, confirm, task
 
 
 _REVIEW_SEVERITY_STYLE = {
@@ -2035,95 +2011,6 @@ def _render_review_report(ui: CLIUI, report) -> None:
     if report.recommendations:
         rec_text = "\n".join(f"{i}. {r}" for i, r in enumerate(report.recommendations, 1))
         ui.console.print(Panel(rec_text, title="Recommendations", border_style="green"))
-
-
-def _render_orchestra_plan(ui: CLIUI, plan) -> None:
-    """Render an ExecutionPlan (stages + subtasks) for user review.
-
-    Rich mode draws a bordered table with a role column (SubAgent 身份一眼可辨);
-    plain mode keeps the simple indented text layout.
-    """
-    if ui.use_rich and Table is not None:
-        stage_of = {sid: idx for idx, stage in enumerate(plan.stages, 1) for sid in stage}
-        table = Table(
-            title=f"Whale ▸ Execution Plan — {plan.mode.value} mode · {len(plan.subtasks)} subtasks",
-            title_justify="left",
-            box=ROUNDED,
-            border_style=Palette.BORDER_DIM,
-            header_style=f"bold {Palette.CYAN}",
-            expand=True,
-        )
-        table.add_column("#", style=Palette.MUTED, width=3, justify="right")
-        table.add_column("Role", style=f"bold {Palette.THINKING}", no_wrap=True)
-        table.add_column("Subtask", style=Palette.CYAN, no_wrap=True)
-        if plan.stages:
-            table.add_column("Stage", style=Palette.MUTED, width=5, justify="center")
-        table.add_column("Description", style=Palette.TEXT, overflow="fold")
-        for idx, st in enumerate(plan.subtasks, 1):
-            row = [str(idx), str(st.role), str(st.id)]
-            if plan.stages:
-                row.append(str(stage_of.get(st.id, "·")))
-            row.append(str(st.description))
-            table.add_row(*row)
-        ui.spacer(1)
-        ui.console.print(table)
-        return
-
-    lines = [f"Mode: {plan.mode.value}", ""]
-    if plan.stages:
-        for idx, stage in enumerate(plan.stages, 1):
-            lines.append(f"Stage {idx}:")
-            for st in plan.subtasks:
-                if st.id in stage:
-                    lines.append(f"  - [{st.role}] {st.id}: {st.description}")
-    else:
-        for st in plan.subtasks:
-            lines.append(f"  - [{st.role}] {st.id}: {st.description}")
-    ui.print("\n".join(lines))
-
-
-def _render_subtask_start(ui: CLIUI, st, index: Optional[int] = None, total: Optional[int] = None) -> None:
-    """One compact line announcing a sub-agent starting its subtask."""
-    tag = f"[{index}/{total}] " if index and total else ""
-    msg = f"⎇ {tag}[{st.role}] {st.id} — {st.description}"
-    if ui.use_rich:
-        # Text (not markup): the "[role]"/"[i/n]" brackets must not be parsed
-        # as Rich style tags.
-        ui.console.print(Text(msg, style=Palette.THINKING))
-    else:
-        ui.status(msg)
-
-
-def _render_subtask_finish(ui: CLIUI, st, result, elapsed: float = 0.0) -> None:
-    """Render a finished subtask as a compact card with an output preview.
-
-    Mirrors the tool-card visual language (status marker + elapsed + preview)
-    so SubAgent results read as first-class citizens of the transcript.
-    """
-    secs = result.metadata.get("duration_seconds", None)
-    try:
-        secs = float(secs) if secs is not None else float(elapsed)
-    except (TypeError, ValueError):
-        secs = float(elapsed or 0.0)
-    preview_source = str(getattr(result, "summary", "") or getattr(result, "full_result", "") or "")
-    preview_lines = [ln for ln in preview_source.strip().splitlines() if ln.strip()][:4]
-    preview = "\n".join(preview_lines)
-    if len(preview) > 300:
-        preview = preview[:297] + "..."
-    if ui.use_rich and hasattr(ui, "render_tool_card"):
-        ui.render_tool_card(
-            f"⎇ [{st.role}] {st.id}",
-            "",
-            is_error=not result.success,
-            elapsed=secs,
-            meta="subagent",
-            body=preview or "(no output)",
-        )
-    else:
-        marker = "✓" if result.success else "✗"
-        ui.info(f"{marker} [{st.role}] {st.id} ({secs:.1f}s)")
-        if preview:
-            ui.print(preview)
 
 
 def show_runtime_info(agent, workspace: Path, ui: CLIUI) -> None:
@@ -2417,9 +2304,6 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             ui.error(f"Compact failed: {exc}")
 
     def _cmd_review(raw, lowered):
-        if not getattr(agent.config, "orchestra_enabled", True):
-            ui.warning("Orchestra/review features are disabled (orchestra_enabled=False).")
-            return
         from hello_agents.agents.review_agent import review_staged_diff, review_working_diff
         from hello_agents.agents.roles.reviewer import ReviewerRole
 
@@ -2447,63 +2331,6 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
             return
         _render_review_report(ui, report)
 
-    def _cmd_orchestra(raw, lowered):
-        if not getattr(agent.config, "orchestra_enabled", True):
-            ui.warning("Orchestra is disabled (orchestra_enabled=False).")
-            return
-        from hello_agents.agents.orchestra import AgentOrchestra, SubtaskHooks
-
-        mode, confirm, task = _parse_orchestra_args(raw)
-        if not task:
-            ui.warning("Usage: /orchestra [--parallel|--pipeline] [--confirm] <task>")
-            return
-
-        plan_holder: dict = {}
-
-        async def _on_start(st):
-            plan = plan_holder.get("plan")
-            total = len(plan.subtasks) if plan else None
-            index = None
-            if plan:
-                for i, sub in enumerate(plan.subtasks, 1):
-                    if sub.id == st.id:
-                        index = i
-                        break
-            _render_subtask_start(ui, st, index=index, total=total)
-
-        async def _on_finish(st, result):
-            _render_subtask_finish(ui, st, result)
-
-        async def _on_error(st, exc):
-            ui.warning(f"✗ [{st.role}] {st.id}: {exc}")
-
-        async def _run():
-            orchestra = AgentOrchestra(agent)
-            with ui.turn_spinner(f"Decomposing task ({mode.value} mode)..."):
-                plan = await orchestra.decompose(task, mode)
-            plan_holder["plan"] = plan
-            _render_orchestra_plan(ui, plan)
-            if confirm:
-                answer = input("Execute this plan? [y/N] ").strip().lower()
-                if answer not in ("y", "yes"):
-                    ui.info("Cancelled.")
-                    return
-            hooks = SubtaskHooks(
-                on_subtask_start=_on_start,
-                on_subtask_finish=_on_finish,
-                on_subtask_error=_on_error,
-            )
-            with ui.turn_spinner("Executing subtasks..."):
-                results = await orchestra.execute(plan, hooks=hooks)
-            with ui.turn_spinner("Aggregating results..."):
-                answer_text = await orchestra.aggregate(plan, results)
-            ui.render_assistant(answer_text)
-
-        try:
-            asyncio.run(_run())
-        except Exception as exc:
-            ui.error(f"Orchestra failed: {exc}")
-
     # Exact-match commands (lowered == key)
     _exact_cmds = {
         "/help": _cmd_help,
@@ -2524,7 +2351,6 @@ def run_interactive(agent, workspace: Path, args, ui: CLIUI) -> int:
         ("/resume", _cmd_resume),
         ("/compact", _cmd_compact),
         ("/review", _cmd_review),
-        ("/orchestra", _cmd_orchestra),
     ]
 
     def _dispatch_command(raw: str, lowered: str) -> bool:

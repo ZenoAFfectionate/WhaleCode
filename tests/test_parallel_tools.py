@@ -603,7 +603,7 @@ class TestExecuteToolsSync:
 
     def test_execute_one_tool_call_still_works(self):
         """The original _execute_one_tool_call method must still function
-        correctly for callers that use it directly (PlanSolveAgent, etc.)."""
+        correctly for callers that use it directly."""
         registry = ToolRegistry(verbose=False)
         registry.register_tool(_DelayedTool("Direct", delay=0.01))
 

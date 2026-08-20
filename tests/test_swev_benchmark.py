@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +26,16 @@ from typing import Any, Dict, List, Optional
 from unittest import mock
 
 import pytest
+
+# ── 项目路径与 main 模块（与 test_main.py 相同的加载方式） ──────────
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
+
+_MAIN_PATH = PROJECT_ROOT / "main.py"
+_main_spec = importlib.util.spec_from_file_location("whale_main_for_swev_tests", str(_MAIN_PATH))
+assert _main_spec is not None and _main_spec.loader is not None, f"无法加载 {_MAIN_PATH}"
+whale_main = importlib.util.module_from_spec(_main_spec)
+_main_spec.loader.exec_module(whale_main)
 
 from hello_agents.benchmark.swev_bench import (
     DockerBashTool,
@@ -961,18 +972,21 @@ class TestCLIArgParsing:
 
     def test_shell_script_defaults(self):
         """Match the exact arguments run_swev.sh passes."""
+        data_path = str(DEFAULT_DATA_ROOT / "SWEV" / "test.jsonl")
+        output_dir = str(PROJECT_ROOT / "result" / "_results")
+        repo_cache_dir = str(PROJECT_ROOT / "result" / "_repo_cache")
         args = self._parse(
             [
-                "--data-path", "/home/kemove/CodeingAgent/data/SWEV/test.jsonl",
-                "--output-dir", "/home/kemove/CodeingAgent/WhaleCode/result/_results",
-                "--repo-cache-dir", "/home/kemove/CodeingAgent/WhaleCode/result/_repo_cache",
+                "--data-path", data_path,
+                "--output-dir", output_dir,
+                "--repo-cache-dir", repo_cache_dir,
                 "--workers", "1",
                 "--max-steps", "128",
             ]
         )
-        assert args.data_path == "/home/kemove/CodeingAgent/data/SWEV/test.jsonl"
-        assert args.output_dir == "/home/kemove/CodeingAgent/WhaleCode/result/_results"
-        assert args.repo_cache_dir == "/home/kemove/CodeingAgent/WhaleCode/result/_repo_cache"
+        assert args.data_path == data_path
+        assert args.output_dir == output_dir
+        assert args.repo_cache_dir == repo_cache_dir
         assert args.workers == 1
         assert args.max_steps == 128
         assert args.dry_run is False
@@ -1035,7 +1049,7 @@ class TestCLIArgParsing:
         """Realistic invocation: bash scripts/run_swev.sh --limit 10 --workers 4."""
         args = self._parse(
             [
-                "--data-path", "/home/kemove/CodeingAgent/data/SWEV/test.jsonl",
+                "--data-path", str(DEFAULT_DATA_ROOT / "SWEV" / "test.jsonl"),
                 "--output-dir", "result/_results",
                 "--repo-cache-dir", "result/_repo_cache",
                 "--workers", "4",
@@ -1065,20 +1079,15 @@ class TestCLIArgParsing:
 # ═══════════════════════════════════════════════════════════════════
 
 class TestEnvironmentResolution:
-    def test_whale_bench_data_root_default(self):
-        """Without WHALE_BENCH_DATA_ROOT, falls back to hard-coded path."""
-        default = os.environ.pop("WHALE_BENCH_DATA_ROOT", None)
-        try:
-            root = os.environ.get("WHALE_BENCH_DATA_ROOT", "/home/kemove/CodeingAgent/data")
-            assert "CodeingAgent/data" in root
-        finally:
-            if default:
-                os.environ["WHALE_BENCH_DATA_ROOT"] = default
+    def test_whale_bench_data_root_default(self, monkeypatch):
+        """Without WHALE_BENCH_DATA_ROOT, falls back to PROJECT_ROOT/data."""
+        monkeypatch.delenv("WHALE_BENCH_DATA_ROOT", raising=False)
+        root = whale_main._resolve_data_root()
+        assert root == str(PROJECT_ROOT / "data")
 
     def test_whale_bench_data_root_env_var(self, monkeypatch):
         monkeypatch.setenv("WHALE_BENCH_DATA_ROOT", "/custom/data/root")
-        root = os.environ.get("WHALE_BENCH_DATA_ROOT", "/home/kemove/CodeingAgent/data")
-        assert root == "/custom/data/root"
+        assert whale_main._resolve_data_root() == "/custom/data/root"
 
     def test_swev_workers_env_var(self, monkeypatch):
         monkeypatch.setenv("SWEV_WORKERS", "8")
@@ -1190,7 +1199,9 @@ class TestRunMethod:
 # 17. Real SWEV Data Validation (integration test)
 # ═══════════════════════════════════════════════════════════════════
 
-REAL_DATA_PATH = Path("/home/kemove/CodeingAgent/data/SWEV/test.jsonl")
+REAL_DATA_PATH = Path(
+    os.getenv("WHALE_BENCH_DATA_ROOT", str(DEFAULT_DATA_ROOT))
+) / "SWEV" / "test.jsonl"
 
 
 @pytest.mark.integration

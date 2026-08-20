@@ -29,9 +29,9 @@ if "hello_agents" not in sys.modules:
     sys.modules["hello_agents"] = pkg
 sys.path.insert(0, str(ROOT))
 
+from hello_agents.core.env_utils import env_int as _env_int
 from hello_agents.tools.builtin.bash import (
     BashTool, _is_sensitive_env_key, build_sandbox_env, make_rlimit_preexec,
-    _env_int, _env_int as _bash_env_int,
 )
 from hello_agents.tools.builtin.web_tool import (
     _ip_is_blocked, _host_is_blocked, SSRFBlockedError, WebFetchTool,

@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - platform dependent
     _resource = None
 
 from ...context.truncator import ObservationTruncator
+from ...core.env_utils import env_int
 from ..base import Tool, ToolParameter
 from ..errors import ToolErrorCode
 from ..response import ToolResponse
@@ -89,16 +90,6 @@ def build_sandbox_env(project_root: Path, extra: Optional[Dict[str, str]] = None
             if not _is_sensitive_env_key(k):
                 env[k] = v
     return env
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
 
 
 def make_rlimit_preexec(
@@ -811,7 +802,7 @@ class BashTool(Tool):
         def _int_cfg(field: str, env: str, default: int) -> int:
             if config is not None and hasattr(config, field):
                 return int(getattr(config, field))
-            return _env_int(env, default)
+            return env_int(env, default)
 
         self.allow_network = _bool_cfg("bash_allow_network", "BASH_ALLOW_NETWORK", False)
 
@@ -819,7 +810,7 @@ class BashTool(Tool):
         self.max_cpu_seconds = _int_cfg("bash_max_cpu_seconds", "BASH_MAX_CPU_SECONDS", self.DEFAULT_MAX_CPU_SECONDS)
         self.max_memory_bytes = _int_cfg("bash_max_memory_bytes", "BASH_MAX_MEMORY_BYTES", self.DEFAULT_MAX_MEMORY_BYTES)
         self.max_processes = _int_cfg("bash_max_processes", "BASH_MAX_PROCESSES", self.DEFAULT_MAX_PROCESSES)
-        self.max_file_size_bytes = _env_int("BASH_MAX_FILE_SIZE_BYTES", self.DEFAULT_MAX_FILE_SIZE_BYTES)
+        self.max_file_size_bytes = _int_cfg("bash_max_file_size_bytes", "BASH_MAX_FILE_SIZE_BYTES", self.DEFAULT_MAX_FILE_SIZE_BYTES)
         # Absolute wall-clock kill for backgrounded/long commands (ms). 0 = never
         # force-kill (preserves intentional long-running background servers).
         self.max_execution_ms = _int_cfg("bash_max_execution_ms", "BASH_MAX_EXECUTION_MS", self.DEFAULT_MAX_EXECUTION_MS)
@@ -1142,10 +1133,6 @@ class BashTool(Tool):
                 return "Delete-related shell commands are blocked in Bash; use the Delete tool instead."
 
         return None
-
-    @staticmethod
-    def _extract_segment_leaders(command: str) -> List[str]:
-        return [tokens[0] for tokens in BashTool._extract_command_invocations(command)]
 
     def validate_command_policy(self, command: str) -> Optional[str]:
         return self._validate_command(command)

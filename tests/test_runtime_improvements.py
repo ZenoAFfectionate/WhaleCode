@@ -21,7 +21,6 @@ from hello_agents.benchmark._utils import _env_bool, _env_int
 from hello_agents.benchmark.runtime import (
     BenchmarkArtifactStore,
     BenchmarkExecutionEnvironment,
-    DockerExecutionEnvironment,
     EvalRequest,
     EvalResult,
     PythonSubprocessEnvironment,
@@ -323,16 +322,8 @@ class TestRuntimeCheckableProtocol:
         env = PythonSubprocessEnvironment()
         assert isinstance(env, BenchmarkExecutionEnvironment)
 
-    def test_docker_execution_is_instance(self):
-        from hello_agents.benchmark.runtime import DockerCommandRunner
-        env = DockerExecutionEnvironment(runner=DockerCommandRunner())
-        assert isinstance(env, BenchmarkExecutionEnvironment)
-
     def test_python_subprocess_is_subclass(self):
         assert issubclass(PythonSubprocessEnvironment, BenchmarkExecutionEnvironment)
-
-    def test_docker_execution_is_subclass(self):
-        assert issubclass(DockerExecutionEnvironment, BenchmarkExecutionEnvironment)
 
     def test_eval_result_not_environment(self):
         """Sanity: unrelated types should NOT be instances."""
@@ -379,12 +370,6 @@ class TestCodeQualityFixes:
     def test_for_profile_values(self, profile, expected):
         config = BenchmarkRuntimeConfig.for_profile(profile)
         assert (config.max_processes, config.file_size_bytes) == expected
-
-    # C3: DockerCommandRunner has no executable field
-    def test_docker_command_runner_no_executable_field(self):
-        from hello_agents.benchmark.runtime import DockerCommandRunner
-        runner = DockerCommandRunner()
-        assert not hasattr(runner, "executable")
 
     # C4: _json_safe handles typical metadata correctly
     def test_json_safe_handles_standard_types(self):

@@ -117,13 +117,13 @@ asyncio.run(main())
 ```python
 import asyncio
 from hello_agents import ReActAgent, HelloAgentsLLM, ToolRegistry
-from hello_agents.tools.builtin import ReadTool, SearchTool
+from hello_agents.tools.builtin import ReadTool, WebSearchTool
 
 async def main():
     # 创建 Agent
     registry = ToolRegistry()
     registry.register_tool(ReadTool(project_root="./"))
-    registry.register_tool(SearchTool())
+    registry.register_tool(WebSearchTool())
     
     agent = ReActAgent("assistant", HelloAgentsLLM(), tool_registry=registry)
     

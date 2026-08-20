@@ -8,10 +8,13 @@ import os
 import re
 import shutil
 import subprocess
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+
+# Q2-7: single implementation lives in the context layer; re-exported here so
+# existing ``from ._code_utils import atomic_write`` call sites keep working.
+from ...context.io_utils import atomic_write  # noqa: F401  (re-export)
 
 
 DEFAULT_IGNORES = {
@@ -39,6 +42,18 @@ DEFAULT_IGNORES = {
 
 SUPPORTED_TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "latin-1")
 
+# Q2-8: shared search-exclusion constants — previously duplicated verbatim as
+# class attributes in both GrepTool and GlobTool (drift risk when editing one).
+SEARCH_EXCLUDE_GLOBS = (
+    "!.git/**",
+    "!**/.git/**",
+    "!.backups/**",
+    "!**/.backups/**",
+    "!.delete_trash/**",
+    "!**/.delete_trash/**",
+)
+INTERNAL_ARTIFACT_DIRS = frozenset({".backups", ".delete_trash"})
+
 
 @dataclass(frozen=True)
 class TextWindow:
@@ -54,10 +69,26 @@ class TextWindow:
     next_offset: int | None
 
 
+def _expanduser_or_value_error(path: str | Path) -> Path:
+    """``Path.expanduser`` wrapper: 无法展开的 ``~unknownuser`` 归一为 ValueError.
+
+    该模块的错误契约统一为 ValueError (调用方 ``except ValueError`` 捕获);
+    expanduser 对不存在的用户前缀抛 RuntimeError 会穿透上游防护.
+    """
+    try:
+        return Path(path).expanduser()
+    except RuntimeError as exc:
+        raise ValueError(f"cannot expand user path: {path!r}") from exc
+
+
 def ensure_working_dir(project_root: str | Path, working_dir: str | Path | None) -> Path:
     """Resolve and validate a working directory within the project root."""
-    root = Path(project_root).expanduser().resolve()
-    candidate = Path(working_dir).expanduser().resolve() if working_dir else root
+    root = _expanduser_or_value_error(project_root).resolve()
+    # None/""/"." 统一视为 root 本身: "." 若走 Path.resolve() 会解析到进程
+    # cwd 而非 root, 与调用方 "当前目录=项目内" 的语义相悖 (property 测试发现).
+    if working_dir is None or str(working_dir) in ("", "."):
+        return root
+    candidate = _expanduser_or_value_error(working_dir).resolve()
     candidate.relative_to(root)
     return candidate
 
@@ -68,9 +99,9 @@ def resolve_path(
     raw_path: str | Path | None,
 ) -> Path:
     """Resolve a user path and ensure it stays inside the project root."""
-    root = Path(project_root).expanduser().resolve()
+    root = _expanduser_or_value_error(project_root).resolve()
     base = ensure_working_dir(root, working_dir)
-    requested = Path(raw_path or ".").expanduser()
+    requested = _expanduser_or_value_error(raw_path or ".")
     candidate = requested.resolve() if requested.is_absolute() else (base / requested).resolve()
     candidate.relative_to(root)
     return candidate
@@ -306,29 +337,6 @@ def apply_line_limit(text: str, max_lines: int = 200) -> tuple[str, bool]:
     return "\n".join(lines[:max_lines]) + "\n[output truncated]", True
 
 
-def atomic_write(path: str | Path, content: str, encoding: str = "utf-8") -> None:
-    """Write a file atomically via a temporary sibling path."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target.with_name(f".{target.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-    original_mode = None
-    if target.exists():
-        try:
-            original_mode = target.stat().st_mode
-        except OSError:
-            original_mode = None
-
-    try:
-        with open(temp_path, "w", encoding=encoding, newline="") as handle:
-            handle.write(content)
-        if original_mode is not None:
-            os.chmod(temp_path, original_mode)
-        os.replace(temp_path, target)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-
-
 def detect_line_ending(content: str) -> str:
     """Detect the dominant line ending of existing content."""
     if "\r\n" in content:
@@ -383,6 +391,10 @@ def replace_with_flexible_match(
     *,
     replace_all: bool = False,
 ) -> ReplaceResult:
+    if not old_text:
+        # 空 old_text 会让 _exact_matches 的游标永不前进 (start == index),
+        # 必须在此拒绝; Edit 工具层虽已有同样校验, 但纯函数须自洽.
+        raise EditMatchError("old_string cannot be empty.")
     if old_text == new_text:
         raise EditMatchError("No changes to apply: old_string and new_string are identical.")
 

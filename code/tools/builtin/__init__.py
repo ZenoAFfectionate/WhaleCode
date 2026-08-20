@@ -15,6 +15,7 @@ A collection of built-in tools for the HelloAgents framework, including:
 - WebFetchTool: Web content scraping tool
 - GitStatusTool / GitDiffTool / GitLogTool / GitBlameTool: Structured read-only git tools
 - GitCommitTool: Guarded git commit tool
+- TaskTool: Dynamic role-specialized sub-agent delegation (A1)
 """
 
 from .bash import BashTool
@@ -24,6 +25,7 @@ from .grep_tool import GrepTool
 from .git_tools import GitBlameTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool
 from .skill_tool import SkillTool
 from .file_tools import ListFilesTool, ReadTool, WriteTool, DeleteTool, EditTool
+from .task_tool import TaskTool
 from .todowrite_tool import TodoSessionStore, TodoWriteTool
 from .web_tool import WebSearchTool, WebFetchTool
 
@@ -45,6 +47,7 @@ __all__ = [
     "TodoWriteTool",
     "TodoSessionStore",
     "SkillTool",
+    "TaskTool",
     "WebSearchTool",
     "WebFetchTool",
 ]

@@ -17,7 +17,7 @@ Scenarios:
 - Truncation retry (finish_reason="length")
 - Role subagents (Explorer read-only enforcement / Tester writes+runs tests)
 - ReviewerRole full review chain (structured output → ReviewReport)
-- AgentOrchestra full chain (decompose → execute → aggregate)
+- Task tool full chain (LLM-driven sub-agent delegation inside the main loop)
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ class ScriptedLLM:
     ) -> _FakeResponse:
         return self.invoke_with_tools(messages, tools, tool_choice, **kwargs)
 
-    # ── plain text invocation (AgentOrchestra decompose/aggregate) ──────
+    # ── plain text invocation (compact / misc helpers) ────────────────────
 
     def invoke(self, messages: List[Dict[str, Any]], **kwargs):
         """Plain-text LLM call; script entry ``{"_text": "..."}`` supplies content."""
@@ -785,50 +785,9 @@ class TestCodeAgentE2EErrorHandling:
 
 
 # ============================================================================
-# E2E Scenario 10: Subagent Delegation
+# E2E Scenario 10: Subagent Delegation → 由 tests/test_task_tool.py 的
+# TestTaskToolE2E 全面接管 (Task 工具链路 + 隔离契约)。
 # ============================================================================
-
-
-class TestSubagentE2E:
-    """Verify subagent creation and isolated execution."""
-
-    @pytest.fixture
-    def workspace(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / "task.py").write_text("def work():\n    return 42\n")
-            yield root
-
-    def test_subagent_isolation_and_restoration(self, workspace):
-        """Subagent runs with filtered tools, parent state restored afterward."""
-        agent = CodeAgent(
-            "parent",
-            ScriptedLLM(),
-            project_root=str(workspace),
-            config=_e2e_config(),
-            register_default_tools=True,
-            enable_task_tool=False,
-            interactive=False,
-            max_steps=20,
-        )
-
-        # Create subagent
-        sub = agent._create_subagent("worker")
-        assert sub.name == "parent-worker-subagent"
-        assert sub.project_root == agent.project_root
-        assert sub.max_steps > 0
-
-        # Subagent should have its own tool registry
-        assert sub.tool_registry is not agent.tool_registry
-
-        # Verify parent's tools are unchanged after subagent creation
-        parent_tools_before = set(agent.tool_registry.list_tools())
-        sub_tools = set(sub.tool_registry.list_tools())
-        parent_tools_after = set(agent.tool_registry.list_tools())
-        assert parent_tools_before == parent_tools_after
-        # Sub should have similar tools (default registration)
-        for t in ("Read", "Write", "Edit", "Bash", "Grep"):
-            assert t in sub_tools
 
 
 # ============================================================================
@@ -1148,147 +1107,3 @@ class TestReviewerRoleE2E:
 
         assert report.error == "parse_fallback"
         assert report.findings == []
-
-
-# ============================================================================
-# E2E Scenario 16: AgentOrchestra Full Chain
-# ============================================================================
-
-
-class TestAgentOrchestraE2E:
-    """Orchestra 完整链路: decompose → 真实子 Agent 执行 → aggregate."""
-
-    @pytest.fixture
-    def workspace(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / "app.py").write_text("def work():\n    return 42\n")
-            yield root
-
-    def _main_agent(self, workspace, llm):
-        return CodeAgent(
-            "orchestrator",
-            llm,
-            project_root=str(workspace),
-            config=_e2e_config(),
-            register_default_tools=True,
-            enable_task_tool=False,
-            interactive=False,
-            max_steps=20,
-        )
-
-    def test_full_pipeline_chain(self, workspace):
-        """decompose(hybrid) → Explorer(Read→Finish) → Reviewer(Finish) → aggregate."""
-        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
-
-        plan_json = json.dumps({
-            "subtasks": [
-                {"id": "exp-1", "description": "探索 app.py 的功能", "role": "explorer",
-                 "dependencies": []},
-                {"id": "rev-1", "description": "审查发现的问题", "role": "reviewer",
-                 "dependencies": ["exp-1"]},
-            ],
-            "mode": "hybrid",
-            "stages": [["exp-1"], ["rev-1"]],
-        }, ensure_ascii=False)
-
-        script = [
-            {"_text": plan_json},                                        # 1. decompose
-            {"Read": {"path": "app.py"}},                                # 2. explorer round 1
-            {"Finish": {"answer": "app.py: work() returns 42"}},         # 3. explorer round 2
-            {"Finish": {"answer": "审查通过, 无严重问题"}},               # 4. reviewer round 1
-            {"_text": "最终答案: 项目健康"},                              # 5. aggregate
-        ]
-        llm = ScriptedLLM(script)
-        main = self._main_agent(workspace, llm)
-        orchestra = AgentOrchestra(main)
-
-        answer = asyncio.run(orchestra.run("分析这个项目", ExecutionMode.HYBRID))
-
-        assert answer == "最终答案: 项目健康"
-        assert llm.call_count == 5
-        # 阶段间上下文注入: reviewer 的 prompt 包含 explorer 的结果摘要
-        reviewer_call = llm.invoke_history[3]
-        reviewer_prompt = json.dumps(reviewer_call["messages"], ensure_ascii=False, default=str)
-        assert "work() returns 42" in reviewer_prompt
-
-    def test_parallel_chain(self, workspace):
-        """decompose(parallel) → 两个 Explorer 并行 → aggregate."""
-        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
-
-        plan_json = json.dumps({
-            "subtasks": [
-                {"id": "e1", "description": "探索结构", "role": "explorer", "dependencies": []},
-                {"id": "e2", "description": "探索依赖", "role": "explorer", "dependencies": []},
-            ],
-            "mode": "parallel",
-            "stages": [],
-        }, ensure_ascii=False)
-
-        script = [
-            {"_text": plan_json},
-            {"Finish": {"answer": "结构分析"}},
-            {"Finish": {"answer": "依赖分析"}},
-            {"_text": "并行汇总答案"},
-        ]
-        llm = ScriptedLLM(script)
-        main = self._main_agent(workspace, llm)
-        orchestra = AgentOrchestra(main)
-
-        answer = asyncio.run(orchestra.run("并行分析", ExecutionMode.PARALLEL))
-
-        assert answer == "并行汇总答案"
-        assert llm.call_count == 4
-
-    def test_decompose_failure_falls_back_and_completes(self, workspace):
-        """decompose 两次输出非法 JSON → fallback 计划仍完整跑完流程."""
-        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
-
-        script = [
-            {"_text": "这不是 JSON"},
-            {"_text": "依然不是 JSON"},
-            {"Finish": {"answer": "fallback 探索完成"}},
-            {"_text": "fallback 汇总"},
-        ]
-        llm = ScriptedLLM(script)
-        main = self._main_agent(workspace, llm)
-        orchestra = AgentOrchestra(main)
-
-        answer = asyncio.run(orchestra.run("任意任务", ExecutionMode.HYBRID))
-
-        assert answer == "fallback 汇总"
-        # 2 次 decompose 尝试 + 1 次子 Agent 执行 + 1 次 aggregate
-        assert llm.call_count == 4
-
-    def test_context_isolation_main_history_unpolluted(self, workspace):
-        """隔离性契约: 子 Agent 的中间过程 (工具调用/试错) 不进入主 Agent 历史."""
-        from hello_agents.agents.orchestra import AgentOrchestra, ExecutionMode
-
-        plan_json = json.dumps({
-            "subtasks": [
-                {"id": "exp-1", "description": "探索 app.py", "role": "explorer",
-                 "dependencies": []},
-            ],
-            "mode": "hybrid",
-            "stages": [["exp-1"]],
-        }, ensure_ascii=False)
-        script = [
-            {"_text": plan_json},
-            {"Read": {"path": "app.py"}},
-            {"Grep": {"pattern": "work"}},
-            {"Finish": {"answer": "app.py: work() returns 42"}},
-            {"_text": "最终答案"},
-        ]
-        llm = ScriptedLLM(script)
-        main = self._main_agent(workspace, llm)
-        history_before = len(main.get_history())
-
-        answer = asyncio.run(
-            AgentOrchestra(main).run("探索项目", ExecutionMode.HYBRID)
-        )
-
-        assert answer == "最终答案"
-        # 子 Agent 的 Read/Grep 等中间步骤未污染主 Agent 历史
-        assert len(main.get_history()) == history_before
-        for msg in main.get_history():
-            assert msg.role != "tool"

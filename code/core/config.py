@@ -2,6 +2,8 @@ import os
 from typing import Dict, Any
 from pydantic import BaseModel
 
+from .env_utils import env_bool, env_int, env_float
+
 
 class Config(BaseModel):
     """HelloAgents配置类"""
@@ -44,7 +46,9 @@ class Config(BaseModel):
     auto_save_interval: int = 10  # 自动保存间隔（每N条消息）
 
     # 子代理机制配置
-    subagent_max_steps: int = 15   # 子代理默认最大步数
+    # (步数上限由各角色 RoleConfig.max_steps 内置: explorer=20 / reviewer=30 / tester=25)
+    subagent_task_enabled: bool = True  # SUBAGENT_TASK_ENABLED（Task 工具：主循环内子代理动态派生）
+    subagent_timeout_seconds: float = 300.0  # SUBAGENT_TIMEOUT_SECONDS（单个子代理放弃等待超时；<=0 不限时）
 
     # TodoWrite 进度管理配置
     todowrite_enabled: bool = True  # 是否启用 TodoWrite 工具
@@ -56,12 +60,15 @@ class Config(BaseModel):
 
     # 沙箱 / 网络 / 工具安全（建议-6：集中登记；工具/适配器目前从同名环境变量读取，
     # 这里作为单一事实来源与文档，便于多环境切换与审计）
+    # 资源限制默认值与 BashTool 类安全默认（DEFAULT_MAX_*，见 tools/builtin/bash.py）
+    # 保持一致；设为 0 表示显式禁用该维度限制（改进项 7/F1：此前默认 0 导致主路径
+    # 恒覆盖 BashTool 的安全默认，16GiB 内存 / 512 进程 / 4GiB 文件 / 300s 硬超时全部失效）
     bash_allow_network: bool = False            # BASH_ALLOW_NETWORK
     bash_max_cpu_seconds: int = 3600            # BASH_MAX_CPU_SECONDS（严重-2）
-    bash_max_memory_bytes: int = 0              # BASH_MAX_MEMORY_BYTES（0=不限，严重-2 修复后默认由 BashTool 控制）
-    bash_max_processes: int = 4096              # BASH_MAX_PROCESSES（fork bomb 防护）
-    bash_max_file_size_bytes: int = 0           # BASH_MAX_FILE_SIZE_BYTES（0=不限）
-    bash_max_execution_ms: int = 0              # BASH_MAX_EXECUTION_MS（硬超时，0=不强杀）
+    bash_max_memory_bytes: int = 16 * 1024 * 1024 * 1024   # BASH_MAX_MEMORY_BYTES（严重-2；16 GiB；0=不限制）
+    bash_max_processes: int = 512               # BASH_MAX_PROCESSES（严重-2 fork bomb 防护；0=不限制）
+    bash_max_file_size_bytes: int = 4 * 1024 * 1024 * 1024  # BASH_MAX_FILE_SIZE_BYTES（磁盘填充防护；4 GiB；0=不限制）
+    bash_max_execution_ms: int = 300_000        # BASH_MAX_EXECUTION_MS（硬超时 5 分钟；0=不强杀）
     web_tools_enabled: bool = True              # WEB_TOOLS_ENABLED
     web_fetch_allow_private: bool = False       # WEBFETCH_ALLOW_PRIVATE（严重-3 SSRF 放行）
     git_tools_enabled: bool = True              # GIT_TOOLS_ENABLED（Git 原生工具注册开关）
@@ -88,11 +95,6 @@ class Config(BaseModel):
     bench_eval_network: bool = False
     bench_eval_artifact_retention: int = 200
 
-    # 多智能体编排配置（Agent Orchestra）
-    orchestra_enabled: bool = True              # ORCHESTRA_ENABLED
-    orchestra_max_parallel: int = 2             # ORCHESTRA_MAX_PARALLEL
-    subagent_timeout_seconds: float = 300.0     # SUBAGENT_TIMEOUT_SECONDS
-
     # Code Review 配置
     review_max_files: int = 50                  # REVIEW_MAX_FILES
     review_max_findings: int = 30               # REVIEW_MAX_FINDINGS
@@ -113,35 +115,11 @@ class Config(BaseModel):
             WHALE_BENCH_EVAL_MEMORY_BYTES, WHALE_BENCH_EVAL_MAX_PROCESSES,
             WHALE_BENCH_EVAL_FILE_SIZE_BYTES, WHALE_BENCH_EVAL_NETWORK,
             WHALE_BENCH_EVAL_ARTIFACT_RETENTION,
-            ORCHESTRA_ENABLED, ORCHESTRA_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS,
+            SUBAGENT_TASK_ENABLED, SUBAGENT_TIMEOUT_SECONDS,
             REVIEW_MAX_FILES, REVIEW_MAX_FINDINGS, REVIEW_GH_CLI_ENABLED
         """
-        def _bool(name: str, default: bool) -> bool:
-            raw = os.getenv(name)
-            if raw is None or not raw.strip():
-                return default
-            return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-        def _int(name: str, default: int) -> int:
-            raw = os.getenv(name)
-            if raw is None or not str(raw).strip():
-                return default
-            try:
-                return int(str(raw).strip())
-            except (TypeError, ValueError):
-                return default
-
-        def _float(name: str, default: float) -> float:
-            raw = os.getenv(name)
-            if raw is None or not str(raw).strip():
-                return default
-            try:
-                return float(str(raw).strip())
-            except (TypeError, ValueError):
-                return default
-
         kwargs: Dict[str, Any] = {
-            "debug": os.getenv("DEBUG", "false").lower() == "true",
+            "debug": env_bool("DEBUG", cls.model_fields["debug"].default),
         }
 
         if os.getenv("CONTEXT_WINDOW"):
@@ -158,38 +136,31 @@ class Config(BaseModel):
             kwargs["circuit_recovery_timeout"] = int(os.getenv("CIRCUIT_RECOVERY_TIMEOUT"))
 
         # 建议-6: sandbox / network / retry / step-limit switches.
-        kwargs["bash_allow_network"] = _bool("BASH_ALLOW_NETWORK", cls.model_fields["bash_allow_network"].default)
-        kwargs["bash_max_cpu_seconds"] = _int("BASH_MAX_CPU_SECONDS", cls.model_fields["bash_max_cpu_seconds"].default)
-        kwargs["bash_max_memory_bytes"] = _int("BASH_MAX_MEMORY_BYTES", cls.model_fields["bash_max_memory_bytes"].default)
-        kwargs["bash_max_processes"] = _int("BASH_MAX_PROCESSES", cls.model_fields["bash_max_processes"].default)
-        kwargs["bash_max_file_size_bytes"] = _int("BASH_MAX_FILE_SIZE_BYTES", cls.model_fields["bash_max_file_size_bytes"].default)
-        kwargs["bash_max_execution_ms"] = _int("BASH_MAX_EXECUTION_MS", cls.model_fields["bash_max_execution_ms"].default)
-        kwargs["web_tools_enabled"] = _bool("WEB_TOOLS_ENABLED", cls.model_fields["web_tools_enabled"].default)
-        kwargs["web_fetch_allow_private"] = _bool("WEBFETCH_ALLOW_PRIVATE", cls.model_fields["web_fetch_allow_private"].default)
-        kwargs["git_tools_enabled"] = _bool("GIT_TOOLS_ENABLED", cls.model_fields["git_tools_enabled"].default)
-        kwargs["llm_max_retries"] = _int("LLM_MAX_RETRIES", cls.model_fields["llm_max_retries"].default)
-        kwargs["llm_retry_base_delay"] = _float("LLM_RETRY_BASE_DELAY", cls.model_fields["llm_retry_base_delay"].default)
-        kwargs["llm_retry_max_delay"] = _float("LLM_RETRY_MAX_DELAY", cls.model_fields["llm_retry_max_delay"].default)
-        kwargs["code_agent_max_steps"] = _int("CODE_AGENT_MAX_STEPS", cls.model_fields["code_agent_max_steps"].default)
-        kwargs["bench_eval_cpu_seconds"] = _int("WHALE_BENCH_EVAL_CPU_SECONDS", cls.model_fields["bench_eval_cpu_seconds"].default)
-        kwargs["bench_eval_memory_bytes"] = _int("WHALE_BENCH_EVAL_MEMORY_BYTES", cls.model_fields["bench_eval_memory_bytes"].default)
-        kwargs["bench_eval_max_processes"] = _int("WHALE_BENCH_EVAL_MAX_PROCESSES", cls.model_fields["bench_eval_max_processes"].default)
-        kwargs["bench_eval_file_size_bytes"] = _int("WHALE_BENCH_EVAL_FILE_SIZE_BYTES", cls.model_fields["bench_eval_file_size_bytes"].default)
-        kwargs["bench_eval_network"] = _bool("WHALE_BENCH_EVAL_NETWORK", cls.model_fields["bench_eval_network"].default)
-        kwargs["bench_eval_artifact_retention"] = _int("WHALE_BENCH_EVAL_ARTIFACT_RETENTION", cls.model_fields["bench_eval_artifact_retention"].default)
+        kwargs["bash_allow_network"] = env_bool("BASH_ALLOW_NETWORK", cls.model_fields["bash_allow_network"].default)
+        kwargs["bash_max_cpu_seconds"] = env_int("BASH_MAX_CPU_SECONDS", cls.model_fields["bash_max_cpu_seconds"].default)
+        kwargs["bash_max_memory_bytes"] = env_int("BASH_MAX_MEMORY_BYTES", cls.model_fields["bash_max_memory_bytes"].default)
+        kwargs["bash_max_processes"] = env_int("BASH_MAX_PROCESSES", cls.model_fields["bash_max_processes"].default)
+        kwargs["bash_max_file_size_bytes"] = env_int("BASH_MAX_FILE_SIZE_BYTES", cls.model_fields["bash_max_file_size_bytes"].default)
+        kwargs["bash_max_execution_ms"] = env_int("BASH_MAX_EXECUTION_MS", cls.model_fields["bash_max_execution_ms"].default)
+        kwargs["web_tools_enabled"] = env_bool("WEB_TOOLS_ENABLED", cls.model_fields["web_tools_enabled"].default)
+        kwargs["web_fetch_allow_private"] = env_bool("WEBFETCH_ALLOW_PRIVATE", cls.model_fields["web_fetch_allow_private"].default)
+        kwargs["git_tools_enabled"] = env_bool("GIT_TOOLS_ENABLED", cls.model_fields["git_tools_enabled"].default)
+        kwargs["llm_max_retries"] = env_int("LLM_MAX_RETRIES", cls.model_fields["llm_max_retries"].default)
+        kwargs["llm_retry_base_delay"] = env_float("LLM_RETRY_BASE_DELAY", cls.model_fields["llm_retry_base_delay"].default)
+        kwargs["llm_retry_max_delay"] = env_float("LLM_RETRY_MAX_DELAY", cls.model_fields["llm_retry_max_delay"].default)
+        kwargs["code_agent_max_steps"] = env_int("CODE_AGENT_MAX_STEPS", cls.model_fields["code_agent_max_steps"].default)
+        kwargs["bench_eval_cpu_seconds"] = env_int("WHALE_BENCH_EVAL_CPU_SECONDS", cls.model_fields["bench_eval_cpu_seconds"].default)
+        kwargs["bench_eval_memory_bytes"] = env_int("WHALE_BENCH_EVAL_MEMORY_BYTES", cls.model_fields["bench_eval_memory_bytes"].default)
+        kwargs["bench_eval_max_processes"] = env_int("WHALE_BENCH_EVAL_MAX_PROCESSES", cls.model_fields["bench_eval_max_processes"].default)
+        kwargs["bench_eval_file_size_bytes"] = env_int("WHALE_BENCH_EVAL_FILE_SIZE_BYTES", cls.model_fields["bench_eval_file_size_bytes"].default)
+        kwargs["bench_eval_network"] = env_bool("WHALE_BENCH_EVAL_NETWORK", cls.model_fields["bench_eval_network"].default)
+        kwargs["bench_eval_artifact_retention"] = env_int("WHALE_BENCH_EVAL_ARTIFACT_RETENTION", cls.model_fields["bench_eval_artifact_retention"].default)
 
-        # Orchestra / Review
-        kwargs["orchestra_enabled"] = _bool("ORCHESTRA_ENABLED", cls.model_fields["orchestra_enabled"].default)
-        kwargs["orchestra_max_parallel"] = _int("ORCHESTRA_MAX_PARALLEL", cls.model_fields["orchestra_max_parallel"].default)
-        kwargs["subagent_timeout_seconds"] = _float("SUBAGENT_TIMEOUT_SECONDS", cls.model_fields["subagent_timeout_seconds"].default)
-        kwargs["review_max_files"] = _int("REVIEW_MAX_FILES", cls.model_fields["review_max_files"].default)
-        kwargs["review_max_findings"] = _int("REVIEW_MAX_FINDINGS", cls.model_fields["review_max_findings"].default)
-        kwargs["review_gh_cli_enabled"] = _bool("REVIEW_GH_CLI_ENABLED", cls.model_fields["review_gh_cli_enabled"].default)
+        # Subagent Task / Review
+        kwargs["subagent_task_enabled"] = env_bool("SUBAGENT_TASK_ENABLED", cls.model_fields["subagent_task_enabled"].default)
+        kwargs["subagent_timeout_seconds"] = env_float("SUBAGENT_TIMEOUT_SECONDS", cls.model_fields["subagent_timeout_seconds"].default)
+        kwargs["review_max_files"] = env_int("REVIEW_MAX_FILES", cls.model_fields["review_max_files"].default)
+        kwargs["review_max_findings"] = env_int("REVIEW_MAX_FINDINGS", cls.model_fields["review_max_findings"].default)
+        kwargs["review_gh_cli_enabled"] = env_bool("REVIEW_GH_CLI_ENABLED", cls.model_fields["review_gh_cli_enabled"].default)
 
         return cls(**kwargs)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        if hasattr(self, "model_dump"):
-            return self.model_dump()
-        return self.dict()

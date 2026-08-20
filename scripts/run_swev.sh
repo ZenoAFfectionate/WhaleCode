@@ -19,7 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-/home/kemove/CodeingAgent/data}"
+BENCH_DATA_ROOT="${WHALE_BENCH_DATA_ROOT:-$PROJECT_ROOT/data}"
 
 # Load environment variables
 if [ -f "$PROJECT_ROOT/.env" ]; then

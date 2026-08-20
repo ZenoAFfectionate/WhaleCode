@@ -3,7 +3,7 @@
 角色 (Role) 是对子 Agent 的静态定义: 专用 system prompt + 工具访问策略 +
 步数预算。通过 ``Role.create_subagent()`` 创建的子 Agent 完全隔离:
 独立 Config 深拷贝 / 独立 ToolRegistry / 独立 HistoryManager,
-可安全并发执行 (区别于 ``Agent.run_as_subagent()`` 的同实例串行模式)。
+可安全并发执行 (Task 工具即走此路径)。
 """
 
 from __future__ import annotations
@@ -92,6 +92,7 @@ class Role(ABC):
             max_steps=role_cfg.max_steps,
             register_default_tools=True,
             enable_task_tool=False,
+            enable_subagent_task=False,
             interactive=False,
         )
 
@@ -138,4 +139,5 @@ class Role(ABC):
         config.session_enabled = False
         config.skills_enabled = False
         config.todowrite_enabled = False
+        config.subagent_task_enabled = False  # 防递归双保险: 子代理不得再派生子代理
         return config

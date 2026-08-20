@@ -68,11 +68,10 @@ tool_b: 正常运行 → 可用 🟢
 框架默认启用熔断器，无需任何配置：
 
 ```python
-from hello_agents import ToolRegistry, ReActAgent
-from hello_agents.llm import OpenAILLM
+from hello_agents import ToolRegistry, ReActAgent, HelloAgentsLLM
 
-# 创建 LLM
-llm = OpenAILLM(model="gpt-4")
+# 创建 LLM（多 provider 自动检测：OpenAI 兼容 / Anthropic / Gemini）
+llm = HelloAgentsLLM()
 
 # 创建工具注册表（默认启用熔断器）
 registry = ToolRegistry()
@@ -279,7 +278,7 @@ registry.circuit_breaker.close("problematic_tool")
 
 ### 错误判断
 
-熔断器基于 `ToolResponse.status` 判断错误：
+熔断器基于 `ToolResponse.status` **与错误码的 `is_fault` 属性**判断错误（`circuit_breaker.py` 的 `_is_fault_response`）：
 
 ```python
 # 工具返回
@@ -288,13 +287,16 @@ response = ToolResponse.error(
     message="执行失败"
 )
 
-# 熔断器判断
-if response.status == ToolStatus.ERROR:
+# 熔断器判断（伪代码）
+if response.status == ToolStatus.ERROR and response.error_info.code.is_fault:
     failure_count += 1  # 增加失败计数
 ```
 
+**关键细节**：并非所有 ERROR 都计入失败——`INVALID_PARAM`（调用方传参错误）、`NOT_FOUND`（文件不存在）等**非故障错误码不计入**，只有 `is_fault=True` 的故障码（如 `EXECUTION_ERROR`、`CIRCUIT_OPEN`）才会累计，避免用户误用导致正常工具被熔断。
+
 **优势**：
 - 精确判断（不依赖字符串匹配）
+- 区分"工具坏了"与"参数传错了"
 - 支持所有工具类型
 - 与 ToolResponse 协议完美集成
 

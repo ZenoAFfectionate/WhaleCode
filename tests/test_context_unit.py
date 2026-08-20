@@ -342,6 +342,25 @@ class TestHistoryManagerSerialization:
         hm2 = HistoryManager()
         hm2.load_from_dict(hm.to_dict())
         assert hm2.get_usage_snapshot()["prompt_tokens"] == 100
+        assert hm2.get_usage_snapshot()["cached_tokens"] == 0  # 未显式记录时为 0
+
+    def test_restores_usage_with_cached_tokens(self):
+        """A9: cached_tokens 随会话持久化 round-trip 保留."""
+        hm = HistoryManager()
+        hm.record_usage(prompt_tokens=100, completion_tokens=50, cached_tokens=80)
+        hm2 = HistoryManager()
+        hm2.load_from_dict(hm.to_dict())
+        assert hm2.get_usage_snapshot()["cached_tokens"] == 80
+
+    def test_load_usage_without_cached_field(self):
+        """旧会话文件 usage 无 cached_tokens 字段 → 安全回退为 0."""
+        hm = HistoryManager()
+        hm.record_usage(prompt_tokens=10, completion_tokens=5)
+        data = hm.to_dict()
+        data["usage"].pop("cached_tokens")  # 模拟旧版本保存的会话
+        hm2 = HistoryManager()
+        hm2.load_from_dict(data)
+        assert hm2.get_usage_snapshot()["cached_tokens"] == 0
 
     def test_to_dict_empty(self):
         data = HistoryManager().to_dict()
@@ -384,7 +403,22 @@ class TestHistoryManagerMessages:
         hm.record_usage(prompt_tokens=42, completion_tokens=10)
         snap = hm.get_usage_snapshot()
         assert snap["prompt_tokens"] == 42 and snap["total_tokens"] == 52
+        assert snap["cached_tokens"] == 0  # A9: 默认为 0
         assert hm.get_last_api_prompt_tokens() == 42
+
+    def test_record_usage_with_cached_tokens(self):
+        """A9: 显式记录 cached_tokens 后快照可读."""
+        hm = HistoryManager()
+        hm.record_usage(prompt_tokens=42, completion_tokens=10, cached_tokens=30)
+        snap = hm.get_usage_snapshot()
+        assert snap["prompt_tokens"] == 42
+        assert snap["cached_tokens"] == 30
+
+    def test_record_usage_negative_cached_guarded(self):
+        """A9: 非法值经 int() 归一, 不产生负缓存计数."""
+        hm = HistoryManager()
+        hm.record_usage(prompt_tokens=10, completion_tokens=5, cached_tokens=0)
+        assert hm.get_usage_snapshot()["cached_tokens"] == 0
 
     def test_stale_on_append(self):
         hm = HistoryManager()

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .io_utils import atomic_write
 from .token_counter import TokenCounter
 
 
@@ -437,7 +438,7 @@ class ObservationTruncator:
             "metadata": metadata or {},
         }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
-        self._atomic_write(filepath, serialized)
+        atomic_write(filepath, serialized)
         return str(filepath.resolve())
 
     @staticmethod
@@ -464,13 +465,6 @@ class ObservationTruncator:
                 continue
 
         self._last_cleanup_ts = now
-
-    @staticmethod
-    def _atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-        temp_path.write_text(content, encoding=encoding)
-        os.replace(temp_path, path)
 
     @staticmethod
     def _text_metrics(text: str) -> Tuple[List[str], int]:

@@ -138,13 +138,16 @@ sse_text = event.to_sse()
 
 ### 1. 完整的 FastAPI 示例
 
+> 注：FastAPI/uvicorn 为**第三方依赖**（不在本框架依赖中，`pip install fastapi uvicorn` 后可用）。本仓库自带的 Web 控制台（`web/server.py`）为纯标准库实现，不依赖 FastAPI。
+> Note: FastAPI/uvicorn are third-party deps (not part of this framework's dependencies). The bundled web console (`web/server.py`) is pure std-lib and does not use FastAPI.
+
 ```python
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from hello_agents import ReActAgent, HelloAgentsLLM, ToolRegistry
-from hello_agents.tools.builtin import ReadTool, SearchTool
+from hello_agents.tools.builtin import ReadTool, WebSearchTool
 import asyncio
 
 app = FastAPI()
@@ -164,7 +167,7 @@ class ChatRequest(BaseModel):
 # 创建 Agent（全局单例）
 registry = ToolRegistry()
 registry.register_tool(ReadTool(project_root="./"))
-registry.register_tool(SearchTool())
+registry.register_tool(WebSearchTool())
 
 agent = ReActAgent("assistant", HelloAgentsLLM(), tool_registry=registry)
 
@@ -393,7 +396,7 @@ async def analyze_project():
 # 服务端
 @app.post("/chat/stream")
 async def chat_stream(message: str):
-    agent = SimpleAgent("assistant", llm)
+    agent = ReActAgent("assistant", llm)
     
     async def event_generator():
         async for event in agent.arun_stream(message):

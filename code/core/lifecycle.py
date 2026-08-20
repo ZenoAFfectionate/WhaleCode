@@ -109,36 +109,3 @@ class AgentEvent:
 # 类型别名：生命周期钩子
 LifecycleHook = Optional[Callable[[AgentEvent], Awaitable[None]]]
 
-
-@dataclass
-class ExecutionContext:
-    """Agent 执行上下文
-    
-    在异步执行过程中传递的上下文信息，包含：
-    - 输入文本
-    - 当前步骤
-    - 累计 token 数
-    - 自定义元数据
-    """
-    
-    input_text: str
-    current_step: int = 0
-    total_tokens: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    
-    def increment_step(self):
-        """步骤计数器 +1"""
-        self.current_step += 1
-    
-    def add_tokens(self, tokens: int):
-        """累加 token 数"""
-        self.total_tokens += tokens
-    
-    def set_metadata(self, key: str, value: Any):
-        """设置元数据"""
-        self.metadata[key] = value
-    
-    def get_metadata(self, key: str, default: Any = None) -> Any:
-        """获取元数据"""
-        return self.metadata.get(key, default)
-

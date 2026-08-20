@@ -4,9 +4,6 @@ All library code that historically called ``print`` directly should route
 through ``agent_print`` / ``agent_eprint`` so integrators can redirect output
 without monkey-patching ``sys.stdout``. The default sinks are plain ``print``,
 preserving backward compatibility.
-
-CLI entry points call ``set_agent_print`` / ``set_agent_eprint`` at startup
-to pipe messages into the Rich-based render layer.
 """
 
 from __future__ import annotations
@@ -18,18 +15,6 @@ _AgentPrintFn = Callable[..., None]
 
 _agent_print_fn: _AgentPrintFn = lambda *a, **kw: print(*a, file=sys.stdout, flush=kw.get("flush", False) or kw.pop("flush", False))
 _agent_eprint_fn: _AgentPrintFn = lambda *a, **kw: print(*a, file=sys.stderr, flush=kw.get("flush", False) or kw.pop("flush", False))
-
-
-def set_agent_print(fn: _AgentPrintFn) -> None:
-    """Replace the default stdout sink for agent-level messages."""
-    global _agent_print_fn
-    _agent_print_fn = fn
-
-
-def set_agent_eprint(fn: _AgentPrintFn) -> None:
-    """Replace the default stderr sink."""
-    global _agent_eprint_fn
-    _agent_eprint_fn = fn
 
 
 def agent_print(*args: Any, **kwargs: Any) -> None:

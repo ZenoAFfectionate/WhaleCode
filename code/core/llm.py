@@ -2,12 +2,11 @@
 
 import os
 import asyncio
-from typing import Optional, Iterator, List, Dict, Union, Any, AsyncIterator
+from typing import Optional, List, Dict, Union, Any
 
 from .exceptions import HelloAgentsException
 from .llm_response import LLMResponse, StreamStats
 from .llm_adapters import create_adapter, BaseLLMAdapter
-from .logging import agent_print, agent_eprint
 
 
 class HelloAgentsLLM:
@@ -78,55 +77,6 @@ class HelloAgentsLLM:
         # 最后一次调用的统计信息（用于流式调用）
         self.last_call_stats: Optional[StreamStats] = None
 
-    def think(self, messages: List[Dict[str, str]], temperature: Optional[float] = None) -> Iterator[str]:
-        """
-        调用大语言模型进行思考，并返回流式响应。
-        这是主要的调用方法，默认使用流式响应以获得更好的用户体验。
-
-        Args:
-            messages: 消息列表
-            temperature: 温度参数，如果未提供则使用初始化时的值
-
-        Yields:
-            str: 流式响应的文本片段
-
-        Note:
-            流式调用结束后，可通过 llm.last_call_stats 获取统计信息
-        """
-        # 建议-7: keep IO out of the library path by default-configurable console
-        # output. Set HELLOAGENTS_QUIET=1 to suppress the decorative prints while
-        # still yielding chunks (callers that want console echo can print them).
-        verbose = os.getenv("HELLOAGENTS_QUIET", "").strip().lower() not in {"1", "true", "yes", "on"}
-
-        if verbose:
-            agent_print(f"🧠 Calling {self.model}...")
-
-        # 准备参数
-        kwargs = {
-            "temperature": temperature if temperature is not None else self.temperature,
-        }
-        if self.max_tokens:
-            kwargs["max_tokens"] = self.max_tokens
-
-        try:
-            if verbose:
-                agent_print("✅ LLM response:")
-            for chunk in self._adapter.stream_invoke(messages, **kwargs):
-                if verbose:
-                    agent_print(chunk, end="", flush=True)
-                yield chunk
-            if verbose:
-                agent_print()  # 换行
-
-            # 保存统计信息
-            if hasattr(self._adapter, 'last_stats'):
-                self.last_call_stats = self._adapter.last_stats
-
-        except Exception as e:
-            if verbose:
-                agent_eprint(f"❌ LLM API call failed: {e}")
-            raise
-
     def invoke(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
         """
         非流式调用LLM，返回完整响应对象。
@@ -155,36 +105,6 @@ class HelloAgentsLLM:
         call_kwargs.update(kwargs)
 
         return self._adapter.invoke(messages, **call_kwargs)
-
-    def stream_invoke(self, messages: List[Dict[str, str]], **kwargs) -> Iterator[str]:
-        """
-        流式调用LLM的别名方法，与think方法功能相同。
-        保持向后兼容性。
-
-        Args:
-            messages: 消息列表
-            **kwargs: 其他参数
-
-        Yields:
-            str: 流式响应的文本片段
-
-        Note:
-            流式调用结束后，可通过 llm.last_call_stats 获取统计信息
-        """
-        temperature = kwargs.pop("temperature", None)
-
-        # 准备参数
-        call_kwargs = {}
-        if self.max_tokens:
-            call_kwargs["max_tokens"] = kwargs.pop("max_tokens", self.max_tokens)
-        call_kwargs.update(kwargs)
-
-        for chunk in self._adapter.stream_invoke(messages, temperature=temperature, **call_kwargs):
-            yield chunk
-
-        # 保存统计信息
-        if hasattr(self._adapter, 'last_stats'):
-            self.last_call_stats = self._adapter.last_stats
 
     def invoke_with_tools(
         self,
@@ -226,56 +146,6 @@ class HelloAgentsLLM:
         return self._adapter.invoke_with_tools(messages, tools, **call_kwargs)
 
     # ==================== 异步方法 ====================
-
-    async def ainvoke(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
-        """
-        异步非流式调用 LLM
-
-        在线程池中运行同步 invoke 方法，避免阻塞事件循环
-
-        Args:
-            messages: 消息列表
-            **kwargs: 其他参数（temperature, max_tokens等）
-
-        Returns:
-            LLMResponse: 包含内容、统计信息的响应对象
-
-        Example:
-            response = await llm.ainvoke([{"role": "user", "content": "你好"}])
-            print(response.content)
-        """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.invoke(messages, **kwargs)
-        )
-
-    async def astream_invoke(
-        self,
-        messages: List[Dict[str, str]],
-        **kwargs
-    ) -> AsyncIterator[str]:
-        """
-        真正的异步流式调用 LLM（使用 adapter 的异步实现）
-
-        Args:
-            messages: 消息列表
-            **kwargs: 其他参数
-
-        Yields:
-            str: 流式响应的文本片段（实时返回）
-
-        Example:
-            async for chunk in llm.astream_invoke(messages):
-                print(chunk, end="", flush=True)
-        """
-        # 使用 adapter 的异步流式方法
-        async for chunk in self._adapter.astream_invoke(messages, **kwargs):
-            yield chunk
-
-        # 保存统计信息
-        if hasattr(self._adapter, 'last_stats'):
-            self.last_call_stats = self._adapter.last_stats
 
     async def ainvoke_with_tools(
         self,

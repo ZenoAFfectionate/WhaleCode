@@ -16,6 +16,8 @@
 > **Whale Code** is a from-scratch implementation of an autonomous coding agent that operates inside a local repository. It follows the **ReAct (Reasoning + Acting)** paradigm, powered by OpenAI-compatible function calling, and ships with a full suite of atomized programming tools, a multi-layer context management engine, and a persistent task scheduling system.
 >
 > The goal is to replicate — and deeply understand — the core architecture behind tools like Claude Code, Cursor Agent, and similar AI coding assistants.
+>
+> **Naming**: project brand **WhaleCode** · PyPI distribution `hello-agents` · Python package `hello_agents`.
 
 <div align="center">
 
@@ -33,7 +35,7 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
 |---------|-------------|
 | 🧠 **ReAct Loop** | Structured Think → Act → Observe → Re-think cycle via OpenAI function calling — no fragile text parsing |
 | 🔧 **Atomized Tools** | 23 specialized tools across 8 categories — Git, LSP, file ops, search, execution — all with typed `ToolResponse` |
-| 🎭 **Multi-Agent Orchestra** | LLM-driven task decomposition → role-based parallel sub-agents → structured result aggregation |
+| 🎭 **Multi-Agent Delegation** | LLM-callable `Task` tool spawns role-specialized sub-agents (explorer/reviewer/tester) mid-loop — parallel dispatch, full isolation |
 | 🔍 **Code Review Agent** | Automated PR/code review with multi-lens verification, severity ranking, and structured findings |
 | 🗜️ **Three-Layer Compact** | micro / auto / manual context compaction keeps long sessions manageable |
 | 📋 **Persistent Task System** | TodoWrite with atomic JSON snapshots — plans survive compaction and session resume |
@@ -50,8 +52,8 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
   - [Slash Commands](#slash-commands)
 - [🏗️ Architecture Overview](#️-architecture-overview)
 - [🤖 CodeAgent Implementation Details](#-codeagent-implementation-details)
-- [🎭 Multi-Agent Orchestration](#-multi-agent-orchestration)
-  - [AgentOrchestra — Decompose & Execute](#agentorchestra--decompose--execute)
+- [🎭 Multi-Agent Delegation: Task Tool](#-multi-agent-delegation-task-tool)
+  - [Task Tool — Spawn Sub-Agents Mid-Loop](#task-tool--spawn-sub-agents-mid-loop)
   - [Role System — Explorer / Reviewer / Tester](#role-system--explorer--reviewer--tester)
   - [Code Review with Structured Findings](#code-review-with-structured-findings)
 - [🗜️ Context Management](#️-context-management)
@@ -79,8 +81,8 @@ The agent follows a strict **Think → Act → Observe → Re-think** loop imple
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ZenoAFfectionate/Coding_Agent.git
-cd Whale_Code
+git clone https://github.com/ZenoAFfectionate/WhaleCode.git
+cd WhaleCode
 
 # 2. Create and activate a conda virtual environment
 conda create -n WhaleCode python=3.12 -y
@@ -116,8 +118,10 @@ CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
 
 ```bash
 # Launch the interactive CLI
-python run_cli.py --workspace /working/space
+python main.py cli -- --workspace /working/space
 ```
+
+> **Naming note**: this project is branded **WhaleCode** (repo name), published on PyPI as `hello-agents`, and imported in code as `hello_agents`. The three names refer to the same framework — see `pyproject.toml` for the `hello_agents` → `code/` package mapping.
 
 The CLI provides an interactive loop where you can issue coding tasks:
 
@@ -192,7 +196,7 @@ CodeAgent adds **repository awareness** and **coding-specific behavior** to the 
 | 📝 **Coding system prompt** | `code/prompts/system_prompt.md` teaches the model to inspect before editing, prefer specialized tools over raw shell commands, use TodoWrite for multi-step work, and verify changes when possible. |
 | 🔧 **Default tool registration** | `CodeAgent.register_default_tools()` wires the core coding tools into one `ToolRegistry`. |
 | ⏱️ **Finite step budget** | The default coding loop is bounded, preventing runaway tool-call loops. |
-| 🔒 **Sub-agent isolation** | Sub-agents receive separate registries and history, with interactive `AskUser` disabled for delegated work. Read-only tools (`GitStatus`, `GitDiff`, `GitBlame`, `GitLog`, `Glob`, `Grep`) are auto-filtered for explore/plan/review sub-agents via category-based `ToolFilter`. |
+| 🔒 **Sub-agent isolation** | Sub-agents receive separate registries and history, with interactive `AskUser` disabled for delegated work. Read-only tools (`GitStatus`, `GitDiff`, `GitBlame`, `GitLog`, `Glob`, `Grep`) are auto-selected for explore/plan/review sub-agents via per-role tool whitelists. |
 
 **A typical coding task flow:**
 
@@ -220,38 +224,44 @@ Agent returns a concise engineering handoff
 
 ---
 
-## 🎭 Multi-Agent Orchestration
+## 🎭 Multi-Agent Delegation: Task Tool
 
-> **Source**: `code/agents/orchestra.py`, `code/agents/roles/`, `code/agents/review_agent.py`
+> **Source**: `code/tools/builtin/task_tool.py`, `code/agents/roles/`, `code/agents/review_agent.py`
 
-The single CodeAgent excels at focused tasks, but real-world engineering work often spans **exploration → implementation → review → testing** — phases with different skill requirements and safety constraints. Whale Code introduces an **orchestrator-worker** pattern to decompose complex tasks and execute them through role-specialized sub-agents in parallel.
+The single CodeAgent excels at focused tasks, but real-world engineering work often spans **exploration → implementation → review → testing** — phases with different skill requirements and safety constraints. Whale Code exposes this through an **LLM-callable `Task` tool**: inside the main ReAct loop, the model can spawn role-specialized sub-agents on demand and get back their distilled reports.
 
-### AgentOrchestra — Decompose & Execute
-
-The orchestra pipeline has four stages:
+### Task Tool — Spawn Sub-Agents Mid-Loop
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐
-│  Decompose   │ →  │    Plan      │ →  │  Parallel Exec   │ →  │  Aggregate   │
-│  (LLM)       │    │  (topo sort) │    │  (Semaphore N)   │    │  (LLM)       │
-└──────────────┘    └──────────────┘    └──────────────────┘    └──────────────┘
+Main Agent (ReAct loop)
+│
+├─ round 1:  Task(role="explorer", task="map the auth module")   ┐
+│            Task(role="reviewer", task="audit login flow")       ├─ run in parallel
+│                                                                  ┘
+├─ round 2:  (LLM sees both distilled reports, decides next step)
+│
+└─ round 3:  Task(role="tester", task="verify the fix")  ← dependent, waits for round-2 results
 ```
 
-| Stage | Description |
-|:------|:------------|
-| 🔀 **Decompose** | LLM breaks the user task into subtasks with role assignments (`explorer` / `reviewer` / `tester`) and dependency edges. |
-| 📊 **Plan** | Topological sort resolves execution stages. Subtasks with satisfied dependencies run concurrently within each stage. |
-| ⚡ **Execute** | Role-specialized sub-agents run in parallel with `asyncio.Semaphore` throttling. Upstream results are injected as `context_hint` into dependent subtasks. |
-| 🧩 **Aggregate** | LLM synthesizes all sub-agent outputs into a coherent final response. |
+| Property | Behavior |
+|:---------|:---------|
+| 🔀 **Parallel dispatch** | Independent subtasks are issued as **multiple Task calls in the same response** — the main loop's tool executor runs them concurrently. |
+| 🔗 **Serial ordering** | Dependent subtasks simply wait for the upstream Task result to return (the ReAct observe→think→act cycle enforces this naturally). |
+| 🧱 **Full isolation** | Each sub-agent gets a cloned `Config`, a fresh `ToolRegistry`, separate history, and interactive prompts disabled — safe to run concurrently. |
+| 🚫 **No recursion** | Sub-agents are created with the Task tool disabled; delegation does not nest by default. |
+| ⏱️ **Timeout → graceful degrade** | Timed-out sub-agents are abandoned (threads can't be killed in Python); the failure is reported back to the LLM instead of crashing the run. |
+| 📉 **Distilled results** | Sub-agent output passes through the shared truncator: full text saved to disk, bounded preview returned to the main loop. |
 
-Key design decisions:
+Quick usage:
 
-| Decision | Rationale |
-|:---------|:----------|
-| **Stage-parallel, not fully-parallel** | Dependencies matter — exploration must complete before code changes; reviews must see final diffs. Topological staging lets independent work fan out while respecting order. |
-| **Semaphore throttling** | Prevents explosion of concurrent LLM calls when the task DAG has high fan-out. |
-| **Timeout → graceful degrade** | Python thread-pool tasks can't be killed; timed-out sub-agents are discarded and their results excluded from aggregation rather than crashing the whole run. |
-| **Full isolation** | Each sub-agent gets a cloned `ToolRegistry`, separate history, and `AskUser` disabled. This prevents accidental cross-contamination and keeps interactive prompts contained. |
+```python
+agent = CodeAgent("main", llm, project_root=".")
+answer = agent.run("Analyze the architecture of this project")
+# The LLM may decide: Task(explorer, "map module structure"),
+# then Task(reviewer, "audit the entry points") — without any orchestration code.
+```
+
+Configuration switches: `Config(subagent_task_enabled=False)` or env `SUBAGENT_TASK_ENABLED=0` disable the tool; `subagent_timeout_seconds` (env `SUBAGENT_TIMEOUT_SECONDS`) bounds each delegation.
 
 ### Role System — Explorer / Reviewer / Tester
 
@@ -263,7 +273,19 @@ Roles are pre-configured sub-agent profiles that control **system prompt**, **to
 | 📝 **Reviewer** | `readonly` | Glob, Grep, Read, LS, GitDiff, GitLog, GitBlame, Bash (restricted) | Multi-lens code review: correctness, security, performance, idiomatic style |
 | 🧪 **Tester** | `write` | Read, Write, Edit, Bash, GitDiff | Write and run tests, verify fixes |
 
-> 💡 **Why roles instead of one generic sub-agent?** Different phases have different safety profiles. An explorer should never edit files; a reviewer needs structured output templates; a tester needs write access. Role-based dispatch keeps these boundaries explicit and enforceable via `ToolFilter` rather than relying on prompt instructions alone.
+> 💡 **Why roles instead of one generic sub-agent?** Different phases have different safety profiles. An explorer should never edit files; a reviewer needs structured output templates; a tester needs write access. Role-based dispatch keeps these boundaries explicit and enforceable via per-role tool whitelists rather than relying on prompt instructions alone.
+
+### Role System — Explorer / Reviewer / Tester
+
+Roles are pre-configured sub-agent profiles that control **system prompt**, **tool availability**, and **behavior**:
+
+| Role | Category | Tools | Purpose |
+|:-----|:---------|:------|:--------|
+| 🔍 **Explorer** | `readonly` | Glob, Grep, Read, LS, GitStatus, GitDiff, GitLog, GitBlame, Bash (restricted) | Understand codebase structure, trace dependencies, locate relevant code |
+| 📝 **Reviewer** | `readonly` | Glob, Grep, Read, LS, GitDiff, GitLog, GitBlame, Bash (restricted) | Multi-lens code review: correctness, security, performance, idiomatic style |
+| 🧪 **Tester** | `write` | Read, Write, Edit, Bash, GitDiff | Write and run tests, verify fixes |
+
+> 💡 **Why roles instead of one generic sub-agent?** Different phases have different safety profiles. An explorer should never edit files; a reviewer needs structured output templates; a tester needs write access. Role-based dispatch keeps these boundaries explicit and enforceable via per-role tool whitelists rather than relying on prompt instructions alone.
 
 ### Code Review with Structured Findings
 

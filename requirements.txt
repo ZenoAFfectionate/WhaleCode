@@ -1,4 +1,13 @@
-# Core dependencies
+# WhaleCode quick-install manifest.
+#
+# The authoritative dependency declaration lives in pyproject.toml
+# ([project.dependencies] + [project.optional-dependencies]); this file is a
+# convenience mirror for `pip install -r requirements.txt`. Keep both in sync
+# (see IMPROVEMENT.md D5). Equivalent extras-based install:
+#   pip install -e ".[dev]"          # runtime + tests
+#   pip install -e ".[tokenizer]"    # + local tokenizer counting
+#
+# Core dependencies (mirrors [project.dependencies])
 openai>=1.0.0
 huggingface_hub>=0.25.0
 pydantic>=2.0.0
@@ -8,27 +17,24 @@ pyyaml>=6.0.0
 requests>=2.25.0
 numpy>=2.0.0          # benchmark (hevp_bench) 计算 pass@k 等指标必需
 
-# CLI interface
+# CLI / Web / 工具链运行时依赖（D5 起与 pyproject [project.dependencies] 同步）
 rich>=13.0.0
 prompt-toolkit>=3.0.0
+ddgs>=7.0.0           # WebSearchTool
+python-lsp-server>=1.11.0  # LSP 工具的 Python 语言服务器（其他语言服务器需另行安装）
 
-# Web search (used by WebSearchTool, optional but recommended)
-ddgs>=7.0.0
-
-# Testing (pyproject.toml 的 pytest addopts 引用 --cov，缺 pytest-cov 会导致 pytest 无法启动)
+# Testing — extras "dev"（pyproject [tool.pytest] addopts 引用 --cov，缺 pytest-cov 会导致 pytest 无法启动）
 pytest>=8.0.0
 pytest-cov>=5.0.0
+hypothesis>=6.100.0       # B4 property-based 测试（test_properties.py，未装则跳过）
+pytest-benchmark>=5.0.0   # B5 性能基准（test_benchmarks.py，未装则跳过）
 
-# Optional: local tokenizer counting (token_counter 使用本地模型目录时启用)
-transformers>=4.40.0
+# Optional: local tokenizer counting — extras "tokenizer"（token_counter 使用本地模型目录时启用，有降级）
+# transformers>=4.40.0
 
-# LSP (Language Server Protocol) — 提供 LSPDefinition/LSPHover/LSPReferences/LSPDiagnostics 工具
-# Python 语言服务器；其他语言需另行安装对应服务器 (typescript-language-server / rust-analyzer / gopls)
-python-lsp-server>=1.11.0
-
-# Optional: web UI 测试辅助 (web/_test_ui.py 使用)
+# Optional: web UI 测试辅助 — extras "ui-tests"（web/_test_ui.py 使用）
 # playwright>=1.40.0
 
-# Optional: provider-specific SDKs (install only if you use the provider)
+# Optional: provider-specific SDKs — extras "anthropic" / "gemini"（按需安装）
 # anthropic>=0.40.0        # For Anthropic Claude models
 # google-generativeai>=0.3 # For Google Gemini models

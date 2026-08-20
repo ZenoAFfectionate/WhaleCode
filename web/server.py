@@ -84,6 +84,7 @@ from hello_agents.agents.code_agent import CodeAgent  # noqa: E402
 from hello_agents.core.config import Config  # noqa: E402
 from hello_agents.core.llm import HelloAgentsLLM  # noqa: E402
 from hello_agents.tools.registry import ToolRegistry  # noqa: E402
+from hello_agents.tools.builtin.file_tools import ListFilesTool, ReadTool  # noqa: E402
 
 
 MODEL_SCAN_ROOTS = [
@@ -798,6 +799,78 @@ class WebCodeAgent(CodeAgent):
             self._web_event_sink(event_type, payload)
 
 
+def _maybe_test_llm():
+    """测试钩子 (B2): ``WHALE_WEB_TEST_LLM=stub`` 时返回确定性 stub LLM.
+
+    仅用于 pytest 子进程中的 job 生命周期 / SSE / AskUser 契约测试
+    (tests/test_web_jobs.py); 生产环境不设置该变量时返回 None,
+    对真实行为零影响.
+
+    行为契约:
+        - 默认: 每轮返回 Finish 工具调用 (answer 固定为 stub 标记)
+        - ``WHALE_WEB_TEST_LLM_ASKUSER=1``: 第一轮返回 AskUser 工具调用,
+          之后把工具结果 (测试提交的答案) 原样带回 Finish.answer
+    """
+    if os.getenv("WHALE_WEB_TEST_LLM") != "stub":
+        return None
+
+    from types import SimpleNamespace
+
+    ask_first = os.getenv("WHALE_WEB_TEST_LLM_ASKUSER") == "1"
+
+    class _StubLLM:
+        model = "stub-test-model"
+
+        def __init__(self) -> None:
+            self._asked = False
+
+        @staticmethod
+        def _usage(p: int = 10, c: int = 5) -> SimpleNamespace:
+            return SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
+
+        def invoke_with_tools(self, messages, tools=None, tool_choice="auto", **kwargs):
+            tool_result_text = ""
+            for msg in reversed(messages):
+                # messages 兼容 dict (ReAct 主循环) 与对象 (其他适配层) 两种形态
+                if isinstance(msg, dict):
+                    if msg.get("role") == "tool":
+                        tool_result_text = str(msg.get("content") or "")
+                        break
+                elif getattr(msg, "role", "") == "tool":
+                    tool_result_text = str(getattr(msg, "content", "") or "")
+                    break
+
+            def _call(call_id: str, name: str, arguments: dict) -> SimpleNamespace:
+                # OpenAI 风格两层结构: tool_call.function.{name, arguments(JSON str)}
+                function = SimpleNamespace(
+                    name=name, arguments=json.dumps(arguments, ensure_ascii=False)
+                )
+                return SimpleNamespace(id=call_id, function=function)
+
+            if ask_first and not self._asked and not tool_result_text:
+                self._asked = True
+                call = _call(
+                    "stub_call_1",
+                    "AskUser",
+                    {"questions": [{"id": "q1", "text": "Stub question for tests", "type": "text"}]},
+                )
+                message = SimpleNamespace(content=None, tool_calls=[call])
+            else:
+                answer = "stub-finish"
+                if tool_result_text:
+                    answer = f"stub-finish: {tool_result_text[:200]}"
+                call = _call("stub_call_fin", "Finish", {"answer": answer})
+                message = SimpleNamespace(content=None, tool_calls=[call])
+
+            choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+            return SimpleNamespace(choices=[choice], model=self.model, usage=self._usage())
+
+        async def ainvoke_with_tools(self, messages, tools=None, tool_choice="auto", **kwargs):
+            return self.invoke_with_tools(messages, tools, tool_choice, **kwargs)
+
+    return _StubLLM()
+
+
 def create_web_agent(
     *,
     workspace: Path,
@@ -829,7 +902,8 @@ def create_web_agent(
     if temperature is not None:
         llm_kwargs["temperature"] = temperature
 
-    llm = HelloAgentsLLM(**llm_kwargs)
+    # B2 测试钩子: 测试子进程注入确定性 stub, 生产路径零影响
+    llm = _maybe_test_llm() or HelloAgentsLLM(**llm_kwargs)
     registry = ToolRegistry(config=config, verbose=False)
     agent = WebCodeAgent(
         name="web-code-agent",
@@ -840,7 +914,8 @@ def create_web_agent(
         config=config,
         max_steps=max_steps or config.code_agent_max_steps,
         register_default_tools=True,
-        enable_task_tool=True,
+        enable_task_tool=True,        # TodoWrite (命名历史遗留, 与 Task 工具无关)
+        enable_subagent_task=True,    # Task 工具: LLM 子代理动态派生 (A1)
         interactive=False,
         event_sink=event_sink,
     )
@@ -869,9 +944,16 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
         if not prompt:
             raise ValueError("prompt is required")
 
+        agent_holder: dict[str, Any] = {"agent": None}
+
         def sink(event_type: str, event_payload: dict[str, Any]) -> None:
             if jobs.is_cancel_requested(job.id):
                 raise JobCancelled(job.cancel_reason or "用户取消运行")
+            # C5: 每个事件附带当前累计 tokens，前端据此绘制 sparkline 与汇总。
+            agent = agent_holder.get("agent")
+            total = getattr(agent, "_total_tokens", 0)
+            if isinstance(total, int) and total > 0:
+                event_payload = {**event_payload, "tokens": total}
             jobs.emit(job.id, event_type, event_payload)
 
         def ask_user_provider(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -906,6 +988,7 @@ def run_agent_job(job: Job, payload: dict[str, Any]) -> None:
             event_sink=sink,
             answer_provider=ask_user_provider,
         )
+        agent_holder["agent"] = agent
 
         resume_path = payload.get("resume_path")
         if resume_path:
@@ -1333,6 +1416,85 @@ def load_benchmark_trajectory(task_id: str, benchmark: str | None = None) -> dic
     }
 
 
+# ── C1: 工作区浏览（复用 ListFilesTool/ReadTool 的路径安全与截断逻辑）─────
+
+
+def _resolve_workspace_root(root_value: str | None) -> Path:
+    """校验工作区根与 run_agent_job 的边界约束一致（PROJECT_ROOT.parent 之下）。"""
+    root = Path(root_value or PROJECT_ROOT).expanduser()
+    root = root.resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"workspace root not found: {root}")
+    root.relative_to(PROJECT_ROOT.parent)  # 越界时抛 ValueError
+    return root
+
+
+def _run_workspace_tool(tool_cls, root: Path, params: dict[str, Any]) -> dict[str, Any]:
+    """实例化文件工具并执行，把 ToolResponse 三态转换为 API 响应。
+
+    工具自身的 ``_resolve_path`` 已做"项目根内"校验，这里 root 即项目根，
+    双重校验防止越界访问。
+    """
+    response = tool_cls(project_root=str(root), working_dir=str(root)).run(params)
+    payload = {"status": response.status.value if hasattr(response.status, "value") else str(response.status)}
+    if response.status.value == "error":
+        code = getattr(getattr(response, "error_info", None), "code", None)
+        payload["error"] = f"{code}: {response.text}" if code else response.text
+        return payload
+    payload["text"] = response.text
+    payload["data"] = response.data or {}
+    return payload
+
+
+def list_workspace_tree(root_value: str | None, path: str, offset: int, limit: int) -> dict[str, Any]:
+    root = _resolve_workspace_root(root_value)
+    return _run_workspace_tool(ListFilesTool, root, {"path": path or ".", "offset": offset, "limit": limit})
+
+
+def read_workspace_file(root_value: str | None, path: str, offset: int, limit: int) -> dict[str, Any]:
+    if not path:
+        raise ValueError("path is required")
+    root = _resolve_workspace_root(root_value)
+    return _run_workspace_tool(ReadTool, root, {"path": path, "offset": offset, "limit": limit})
+
+
+# ── C8: Trace 报告（TraceLogger 已产出 HTML，直接服务）──────────────────
+
+
+TRACE_DIR = WEB_ROOT / "runtime" / "traces"
+
+
+def list_trace_reports() -> list[dict[str, Any]]:
+    """列出可用的 trace HTML 报告（按 mtime 倒序，最多 50 个）。"""
+    if not TRACE_DIR.exists():
+        return []
+    reports = []
+    for path in TRACE_DIR.glob("*.html"):
+        stat = path.stat()
+        reports.append({
+            "name": path.name,
+            "url": f"/traces/{path.name}",
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        })
+    reports.sort(key=lambda item: item["modified_at"], reverse=True)
+    return reports[:50]
+
+
+def read_trace_html(name: str) -> bytes | None:
+    """读取 trace HTML 文件内容（路径穿越防护：basename 提取 + 目录内校验）。"""
+    target = (TRACE_DIR / Path(name).name).resolve()
+    try:
+        target.relative_to(TRACE_DIR.resolve())
+    except ValueError:
+        return None
+    if target.suffix != ".html" or not target.is_file():
+        return None
+    if target.stat().st_size > 20 * 1024 * 1024:
+        return None
+    return target.read_bytes()
+
+
 def parse_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length") or 0)
     if length <= 0:
@@ -1405,6 +1567,45 @@ class WhaleWebHandler(SimpleHTTPRequestHandler):
             return self.send_json({"session": detail})
         if path == "/api/benchmarks/history":
             return self.send_json({"history": load_benchmark_history()})
+        if path == "/api/workspace/tree":
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                result = list_workspace_tree(
+                    (params.get("root") or [None])[0],
+                    (params.get("path") or ["."])[0],
+                    int((params.get("offset") or ["0"])[0] or 0),
+                    min(int((params.get("limit") or ["400"])[0] or 400), 1000),
+                )
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            status = HTTPStatus.OK if result.get("status") != "error" else HTTPStatus.BAD_REQUEST
+            return self.send_json(result, status)
+        if path == "/api/workspace/file":
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                result = read_workspace_file(
+                    (params.get("root") or [None])[0],
+                    (params.get("path") or [""])[0],
+                    int((params.get("offset") or ["0"])[0] or 0),
+                    min(int((params.get("limit") or ["2000"])[0] or 2000), 5000),
+                )
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            status = HTTPStatus.OK if result.get("status") != "error" else HTTPStatus.BAD_REQUEST
+            return self.send_json(result, status)
+        if path == "/api/traces":
+            return self.send_json({"traces": list_trace_reports()})
+        if path.startswith("/traces/"):
+            content = read_trace_html(path.split("/", 2)[-1])
+            if content is None:
+                return self.send_json({"error": "trace report not found"}, HTTPStatus.NOT_FOUND)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
+            return
         if path == "/api/benchmarks/trajectory":
             params = urllib.parse.parse_qs(parsed.query)
             task_id = (params.get("task_id") or [""])[0]

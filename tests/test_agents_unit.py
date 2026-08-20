@@ -6,7 +6,7 @@ Covers:
 - ReActAgent: Thought/Finish tools, _build_structured_output_tool_schema,
   stagnation detection, tool execution
 - CodeAgent: construction, register_default_tools, set_working_dir,
-  _get_context_system_prompt, _create_subagent, compact
+  _get_context_system_prompt, compact
 """
 
 import tempfile
@@ -315,12 +315,6 @@ class TestCodeAgent:
             if hasattr(t, "working_dir"):
                 assert t.working_dir == sub.resolve()
 
-    def test_create_subagent(self, tmp):
-        a = CodeAgent("main", _mock_llm(), project_root=tmp, register_default_tools=False)
-        sub = a._create_subagent("x")
-        assert sub.name == "main-x-subagent"
-        assert sub.project_root == a.project_root
-
     def test_compact_empty(self, tmp):
         assert CodeAgent("c", _mock_llm(), project_root=tmp, register_default_tools=False).compact() == "Nothing to compact."
 
@@ -409,30 +403,6 @@ class TestReActAgentToolExecution:
 
     def test_execute_response_no_registry(self, agent):
         assert agent._execute_tool_response("any", {}).status == ToolStatus.ERROR
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Subagent & tool filter
-# ────────────────────────────────────────────────────────────────────────────
-
-
-class TestReActAgentSubagent:
-
-    def test_tool_filter_swaps_and_restores(self):
-        agent = ReActAgent("test", _mock_llm(), config=Config())
-        agent.tool_registry = _registry()
-        agent.tool_registry.register_tool(_SimpleTool(name="a"))
-        agent.tool_registry.register_tool(_SimpleTool(name="b"))
-        agent.tool_registry.register_tool(_SimpleTool(name="c"))
-
-        from hello_agents.tools.tool_filter import CustomFilter
-
-        f = CustomFilter(allowed=["a", "b"], mode="whitelist")
-        orig = agent._apply_tool_filter(f)
-        assert orig is not None and "a" in agent.tool_registry._tools
-        assert "c" not in agent.tool_registry._tools
-        agent._restore_tools(orig)
-        assert "c" in agent.tool_registry._tools
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -576,13 +546,31 @@ class TestAgentSubagentHelpers:
         a = self._agent()
         history = [
             Message(
-                "Action: Read[/tmp/x.py]\nAction: Write[/tmp/y.py]",
+                "",
                 "assistant",
+                metadata={
+                    "tool_calls": [
+                        {"id": "c1", "function": {"name": "Read", "arguments": "{}"}},
+                        {"id": "c2", "function": {"name": "Write", "arguments": "{}"}},
+                    ],
+                },
             ),
         ]
         tools = a._extract_tools_from_history(history)
         assert "Read" in tools
         assert "Write" in tools
+
+    def test_extract_tools_ignores_legacy_action_text(self):
+        """Q1: 旧 ReAct 文本协议（"Action: Tool[...]"）解析分支已删除。
+
+        现行协议为 tool_calls 结构化调用；纯文本 "Action:" 不再产生工具。
+        """
+        a = self._agent()
+        history = [
+            Message("Action: Read[/tmp/x.py]\nAction: Write[/tmp/y.py]", "assistant"),
+        ]
+        tools = a._extract_tools_from_history(history)
+        assert tools == []
 
     def test_extract_tools_from_history_react_format(self):
         a = self._agent()

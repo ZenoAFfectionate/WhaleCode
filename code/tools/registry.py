@@ -376,6 +376,3 @@ class ToolRegistry:
             self.read_metadata_cache.pop(file_path, None)
         else:
             self.read_metadata_cache.clear()
-
-# Global tool registry
-global_registry = ToolRegistry()

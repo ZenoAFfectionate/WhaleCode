@@ -1,9 +1,14 @@
 """LSP server lifecycle manager — one per workspace.
 
-An ``LSPManager`` instance is created once per agent workspace and owns
-the LSP server subprocesses for all languages used during that session.
-Servers are started lazily (on first access to that language) and shut
-down together.
+An ``LSPManager`` instance owns the LSP server subprocesses for all
+languages used during a session.  Servers are started lazily (on first
+access to that language) and shut down together.
+
+Use :func:`get_shared_manager` instead of constructing ``LSPManager``
+directly when several agents (main agent + dynamically spawned
+sub-agents) share the same workspace root — it caches one manager per
+resolved root per process so a single language-server subprocess set
+is reused instead of being re-launched per agent (改进项 9/F3).
 """
 
 from __future__ import annotations
@@ -101,6 +106,35 @@ def _check_executable(command: List[str]) -> Optional[str]:
         return resolved
     env_bin = Path(sys.executable).parent / command[0]
     return str(env_bin) if env_bin.is_file() else None
+
+
+# ---------------------------------------------------------------------------
+# Per-process shared manager cache (改进项 9/F3)
+#
+# Every CodeAgent used to construct its own LSPManager, so each dynamically
+# spawned sub-agent re-launched a full set of language-server subprocesses
+# (hundreds of MB each).  Language servers are keyed by workspace root and
+# safe to share process-wide, so we cache one manager per resolved root.
+# Nothing in production calls ``manager.shutdown()`` today (servers live
+# until process exit by design), so sharing has no premature-teardown risk.
+# ---------------------------------------------------------------------------
+_SHARED_MANAGERS: Dict[str, "LSPManager"] = {}
+_SHARED_MANAGERS_LOCK = threading.Lock()
+
+
+def get_shared_manager(workspace_root: Path) -> "LSPManager":
+    """Return the process-wide ``LSPManager`` for *workspace_root*.
+
+    Creates the manager on first call for a given (resolved) root and
+    reuses it afterwards.  Thread-safe.
+    """
+    key = str(Path(workspace_root).resolve())
+    with _SHARED_MANAGERS_LOCK:
+        manager = _SHARED_MANAGERS.get(key)
+        if manager is None:
+            manager = LSPManager(Path(workspace_root))
+            _SHARED_MANAGERS[key] = manager
+        return manager
 
 
 class LSPManager:

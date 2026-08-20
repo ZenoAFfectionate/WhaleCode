@@ -530,13 +530,34 @@ def _node_attr_blob(node: _HTMLNode) -> str:
 def _node_metrics(node: _HTMLNode) -> Dict[str, Any]:
     text = _collect_text(node)
     text_len = len(text)
-    tag_count = sum(1 for _ in node.iter_nodes()) - 1
-    paragraph_count = sum(1 for child in node.iter_nodes() if child.tag == "p")
-    heading_count = sum(1 for child in node.iter_nodes() if child.tag in {"h1", "h2", "h3", "h4", "h5", "h6"})
-    list_item_count = sum(1 for child in node.iter_nodes() if child.tag == "li")
-    code_block_count = sum(1 for child in node.iter_nodes() if child.tag == "pre")
-    block_count = sum(1 for child in node.iter_nodes() if child.tag in _CONTENT_BLOCK_TAGS)
-    link_text_len = sum(len(_collect_text(child)) for child in node.iter_nodes() if child.tag == "a")
+    # Q3-2: single iter_nodes() traversal — previously seven separate subtree
+    # walks per candidate during main-content scoring. Semantics preserved:
+    # iter_nodes() yields the node itself first; tag_count excludes it while
+    # the per-tag counters include it, exactly as before.
+    _heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    tag_count = 0
+    paragraph_count = 0
+    heading_count = 0
+    list_item_count = 0
+    code_block_count = 0
+    block_count = 0
+    link_text_len = 0
+    for sub in node.iter_nodes():
+        if sub is not node:
+            tag_count += 1
+        tag = sub.tag
+        if tag == "p":
+            paragraph_count += 1
+        elif tag in _heading_tags:
+            heading_count += 1
+        elif tag == "li":
+            list_item_count += 1
+        elif tag == "pre":
+            code_block_count += 1
+        if tag in _CONTENT_BLOCK_TAGS:
+            block_count += 1
+        if tag == "a":
+            link_text_len += len(_collect_text(sub))
     return {
         "text": text,
         "text_len": text_len,

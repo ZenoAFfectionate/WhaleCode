@@ -913,32 +913,6 @@ class TestToolCategories:
         assert GitBlameTool(project_root=root).category == "readonly"
         assert GitCommitTool(project_root=root).category == "write"
 
-    def test_readonly_filter_allows_read_tools_denies_commit(self, git_repo):
-        from hello_agents.tools.tool_filter import ReadOnlyFilter
-
-        root = str(git_repo)
-        tools = [
-            GitStatusTool(project_root=root),
-            GitDiffTool(project_root=root),
-            GitLogTool(project_root=root),
-            GitBlameTool(project_root=root),
-            GitCommitTool(project_root=root),
-        ]
-        categories = {tool.name: tool.category for tool in tools}
-        filt = ReadOnlyFilter(tool_categories=categories)
-        allowed = filt.filter([tool.name for tool in tools])
-        assert set(allowed) == {"GitStatus", "GitDiff", "GitLog", "GitBlame"}
-        assert filt.is_allowed("GitCommit") is False
-
-    def test_full_access_filter_allows_all_git_tools(self, git_repo):
-        from hello_agents.tools.tool_filter import FullAccessFilter
-
-        root = str(git_repo)
-        tools = [GitStatusTool(project_root=root), GitCommitTool(project_root=root)]
-        categories = {tool.name: tool.category for tool in tools}
-        filt = FullAccessFilter(tool_categories=categories)
-        assert all(filt.is_allowed(tool.name) for tool in tools)
-
 
 class TestAgentRegistration:
     GIT_TOOL_NAMES = {"GitStatus", "GitDiff", "GitLog", "GitBlame", "GitCommit"}

@@ -4,7 +4,6 @@ Covers:
     1. Syntax highlighting — diff lexer detection + Markdown code theme
     2. Turn spinner — status routing + context-manager lifecycle
     3. Auto-completion — slash commands / paths / session names
-    4. SubAgent (orchestra) rendering — plan table, subtask start/finish
 
 All tests run without a TTY; Rich and prompt_toolkit paths skip gracefully
 when the optional dependencies are missing.
@@ -16,8 +15,7 @@ import io
 import sys
 import types
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -264,111 +262,3 @@ class TestWhaleCompleter:
         for name, _ in cli.SLASH_COMMANDS:
             assert name in out
         assert "exit" in out
-
-
-# ===========================================================================
-# 4. SubAgent (orchestra) rendering
-# ===========================================================================
-
-
-def _plan(subtasks, stages=None, mode="parallel"):
-    return SimpleNamespace(
-        subtasks=subtasks,
-        stages=stages or [],
-        mode=SimpleNamespace(value=mode),
-    )
-
-
-def _subtask(sid, role, description):
-    return SimpleNamespace(id=sid, role=role, description=description)
-
-
-def _result(success=True, summary="found 3 entry points", metadata=None):
-    return SimpleNamespace(
-        success=success,
-        summary=summary,
-        full_result=summary + "\nfull details",
-        metadata=metadata if metadata is not None else {"duration_seconds": 2.5},
-    )
-
-
-class TestOrchestraPlanRendering:
-    def test_rich_plan_table_contains_roles_and_stages(self):
-        ui, buf = _rich_ui()
-        subs = [
-            _subtask("t1", "explorer", "map the codebase"),
-            _subtask("t2", "reviewer", "review the diff"),
-        ]
-        cli._render_orchestra_plan(ui, _plan(subs, stages=[["t1"], ["t2"]], mode="pipeline"))
-        out = buf.getvalue()
-        assert "explorer" in out and "reviewer" in out
-        assert "t1" in out and "t2" in out
-        assert "pipeline" in out
-        assert "map the codebase" in out
-
-    def test_plain_plan_keeps_text_contract(self, capsys):
-        ui = _plain_ui()
-        subs = [_subtask("t1", "explorer", "map")]
-        cli._render_orchestra_plan(ui, _plan(subs, stages=[["t1"]], mode="pipeline"))
-        out = capsys.readouterr().out
-        assert "Mode: pipeline" in out
-        assert "Stage 1:" in out
-        assert "[explorer] t1: map" in out
-
-
-class TestSubtaskRendering:
-    def test_start_line_with_index_and_total(self):
-        ui, buf = _rich_ui()
-        cli._render_subtask_start(ui, _subtask("t1", "explorer", "map code"), index=1, total=3)
-        out = buf.getvalue()
-        assert "[1/3]" in out
-        assert "explorer" in out
-        assert "map code" in out
-
-    def test_start_line_without_position(self, capsys):
-        ui = _plain_ui()
-        cli._render_subtask_start(ui, _subtask("t1", "tester", "run tests"))
-        out = capsys.readouterr().out
-        assert "[tester] t1" in out
-        assert "run tests" in out
-
-    def test_finish_card_shows_preview_and_marker(self):
-        ui, buf = _rich_ui()
-        cli._render_subtask_finish(ui, _subtask("t1", "explorer", "map"), _result())
-        out = buf.getvalue()
-        assert "found 3 entry points" in out
-        assert "subagent" in out
-        assert "✓" in out
-
-    def test_finish_card_error_marker(self):
-        ui, buf = _rich_ui()
-        cli._render_subtask_finish(
-            ui, _subtask("t2", "tester", "run"), _result(success=False, summary="pytest failed")
-        )
-        out = buf.getvalue()
-        assert "✗" in out
-        assert "pytest failed" in out
-
-    def test_finish_plain_contract(self, capsys):
-        ui = _plain_ui()
-        cli._render_subtask_finish(ui, _subtask("t1", "reviewer", "check"), _result())
-        out = capsys.readouterr().out
-        assert "✓ [reviewer] t1" in out
-        assert "2.5s" in out
-        assert "found 3 entry points" in out
-
-    def test_finish_uses_elapsed_when_metadata_missing(self, capsys):
-        ui = _plain_ui()
-        result = _result(metadata={})
-        cli._render_subtask_finish(ui, _subtask("t1", "reviewer", "check"), result, elapsed=1.25)
-        out = capsys.readouterr().out
-        assert "1.2s" in out or "1.3s" in out
-
-    def test_finish_long_preview_truncated(self):
-        ui, buf = _rich_ui()
-        long_summary = "\n".join(f"line {i} " + "x" * 100 for i in range(10))
-        cli._render_subtask_finish(
-            ui, _subtask("t1", "explorer", "map"), _result(summary=long_summary)
-        )
-        out = buf.getvalue()
-        assert "line 9" not in out  # only first 4 non-empty lines shown

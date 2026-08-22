@@ -712,10 +712,10 @@ bash scripts/run_swev_eval.sh data/_results/swev_predictions_YYYYMMDD_HHMMSS.jso
 | **AIME 26** | 30 | 28 | **93.3%** | 142s | 2026-07-27 |
 | **HumanEval+** | 164 | 162 | **98.8%** | 25s | 2026-07-27 |
 | **ClassEval** | 100 | 91 | **91.0%** | 233s | 2026-07-27 |
-| **LiveCodeBench** | 175 | 122 | **69.7** | 742s | 2026-07-27 |
+| **LiveCodeBench** | 175 | 122 | **69.7%** | 742s | 2026-07-27 |
 | **SWE-verified** | 500 | — | — | — | — |
 
-> 🤖 **Model**: Deepseek-v4-flash-0731 &nbsp;|&nbsp; **Speed**: xx tokens/s from API
+> 🤖 **Model**: Deepseek-v4-flash &nbsp;|&nbsp; **Speed**: very fast
 
 | Benchmark | Tasks | Passed | Pass Rate | Avg Time | Date |
 |:----------|------:|-------:|----------:|---------:|:-----|
